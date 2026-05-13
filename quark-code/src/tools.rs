@@ -1,9 +1,8 @@
 //! Extended tool set for Quark Code (beyond basic MCP tools).
 //! Adds git operations, code search, project context, and shell execution.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use anyhow::Result;
 
 use quark_core::mcp::{execute_tool, McpConfig, ToolCall, ToolResult};
 
@@ -226,7 +225,7 @@ fn write_file_checked(cfg: &McpConfig, path: &str, content: &str) -> ToolResult 
     }
 }
 
-fn apply_patch(_cfg: &McpConfig, path: &str, patch: &str) -> ToolResult {
+fn apply_patch(_cfg: &McpConfig, path: &str, _patch: &str) -> ToolResult {
     // Very simple line-based patch: lines starting with '+' are additions,
     // '-' are removals, everything else is context.  Not full unified diff —
     // just best-effort for small model-generated patches.
@@ -256,13 +255,11 @@ pub fn err_result(tool: &str, msg: &str) -> ToolResult {
 pub fn expand_mentions(input: &str, working_dir: &Path) -> String {
     let mut result = String::with_capacity(input.len() + 512);
     for word in input.split_whitespace() {
-        if word.starts_with('@') {
-            let path = working_dir.join(&word[1..]);
+        if let Some(rel) = word.strip_prefix('@') {
+            let path = working_dir.join(rel);
             if let Ok(content) = std::fs::read_to_string(&path) {
                 result.push_str(&format!(
-                    "\n<file path=\"{}\">\n{}\n</file>\n",
-                    &word[1..],
-                    content
+                    "\n<file path=\"{rel}\">\n{content}\n</file>\n"
                 ));
             } else {
                 result.push_str(word);

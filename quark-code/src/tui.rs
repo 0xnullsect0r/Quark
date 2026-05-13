@@ -10,13 +10,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Margin},
-    style::{Color, Modifier, Style, Stylize},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
 
@@ -121,12 +118,8 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
         }
 
         match event::read()? {
-            Event::Key(key) => {
-                if handle_key(app, key, &mut stream) {
-                    break; // should_quit
-                }
-            }
-            Event::Resize(_, _) => {}
+            Event::Key(key) if handle_key(app, key, &mut stream) => break,
+            Event::Key(_) | Event::Resize(_, _) => {}
             _ => {}
         }
 
@@ -164,8 +157,8 @@ fn handle_key(
         }
 
         // Scroll
-        (Mod::NONE, PageUp)   | (Mod::CONTROL, Char('u')) => app.scroll_up(),
-        (Mod::NONE, PageDown) | (Mod::CONTROL, Char('d')) => app.scroll_down(),
+        (Mod::NONE, PageUp)   => app.scroll_up(),
+        (Mod::NONE, PageDown) => app.scroll_down(),
 
         // Send message / run command
         (Mod::NONE, Enter) => {
@@ -175,9 +168,9 @@ fn handle_key(
             if text.starts_with('/') {
                 handle_slash_command(app, &text);
             } else if !app.generating {
-                // Expand @file mentions
+                // Expand @file mentions before sending to model
                 let expanded = crate::tools::expand_mentions(&text, &app.project_root);
-                app.messages.push(Message::user(text));
+                app.messages.push(Message::user(if expanded == text { text } else { expanded }));
                 app.scroll_to_bottom();
                 app.generating = true;
                 app.stream_buf.clear();
@@ -195,17 +188,10 @@ fn handle_key(
         (Mod::NONE, Backspace)                 => app.backspace(),
         (Mod::NONE, Char(c))                   => app.insert_char(c),
         (Mod::SHIFT, Char(c))                  => app.insert_char(c),
-        // Allow common special chars that crossterm maps with ALT
-        (Mod::NONE, Left)                      => {
-            if app.cursor_pos > 0 {
-                app.cursor_pos -= 1;
-            }
-        }
-        (Mod::NONE, Right)                     => {
-            if app.cursor_pos < app.input.len() {
-                app.cursor_pos += 1;
-            }
-        }
+        // Cursor movement with bounds guards
+        (Mod::NONE, Left)  if app.cursor_pos > 0              => app.cursor_pos -= 1,
+        (Mod::NONE, Right) if app.cursor_pos < app.input.len() => app.cursor_pos += 1,
+        (Mod::NONE, Left) | (Mod::NONE, Right) => {}
         (Mod::CONTROL, Char('w'))              => delete_last_word(app),
         (Mod::CONTROL, Char('u'))              => { app.input.clear(); app.cursor_pos = 0; }
 

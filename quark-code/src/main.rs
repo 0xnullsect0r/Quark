@@ -8,15 +8,15 @@
 //! no model is found.
 //!
 //! Features:
-//!   - Full TUI (ratatui + crossterm) with Plan/Build mode toggle
-//!   - Slash commands: /init /plan /build /undo /redo /diff /mcp /help /exit
-//!   - MCP tools: read_file, write_file, list_dir, search_files, run_shell
-//!   - Extended tools: git_status, git_diff, git_log, git_add, git_commit,
-//!                     grep_code, find_files, read_lines, write_lines
-//!   - @file context injection
-//!   - Undo/redo stack for all file changes
-//!   - Project context scanner + AGENTS.md writer (/init)
-//!   - Streaming token output
+//! - Full TUI (ratatui + crossterm) with Plan/Build mode toggle
+//! - Slash commands: /init /plan /build /undo /redo /diff /mcp /help /exit
+//! - MCP tools: read_file, write_file, list_dir, search_files, run_shell
+//! - Extended tools: git_status, git_diff, git_log, git_add, git_commit,
+//!   grep_code, find_files, read_lines, write_lines
+//! - @file context injection
+//! - Undo/redo stack for all file changes
+//! - Project context scanner + AGENTS.md writer (/init)
+//! - Streaming token output
 
 #![allow(dead_code)]
 

@@ -9,24 +9,13 @@ struct CkptEntry {
     modified: Option<SystemTime>,
 }
 
+#[derive(Default)]
 pub struct CheckpointsPanel {
     dir: Option<PathBuf>,
     entries: Vec<CkptEntry>,
     loaded: Option<PathBuf>,
     confirm_delete: Option<usize>,
     status: String,
-}
-
-impl Default for CheckpointsPanel {
-    fn default() -> Self {
-        Self {
-            dir: None,
-            entries: vec![],
-            loaded: None,
-            confirm_delete: None,
-            status: String::new(),
-        }
-    }
 }
 
 impl CheckpointsPanel {
@@ -40,7 +29,7 @@ impl CheckpointsPanel {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for entry in rd.flatten() {
                     let p = entry.path();
-                    if p.extension().map_or(false, |e| e == "safetensors") {
+                    if p.extension().is_some_and(|e| e == "safetensors") {
                         let meta = std::fs::metadata(&p).ok();
                         self.entries.push(CkptEntry {
                             size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -49,7 +38,7 @@ impl CheckpointsPanel {
                         });
                     }
                 }
-                self.entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+                self.entries.sort_by_key(|a| std::cmp::Reverse(a.modified));
             }
         }
     }

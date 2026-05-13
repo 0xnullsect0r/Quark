@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::cmp::Reverse;
 
 /// Summary of a project's structure.
 #[derive(Debug, Default)]
@@ -40,10 +41,10 @@ impl ProjectContext {
 
         // Walk directory tree
         let mut notable: Vec<(PathBuf, u64)> = Vec::new();
-        walk(root, root, &mut ctx.languages, &mut notable, 0);
+        walk(root, &mut ctx.languages, &mut notable, 0);
 
         // Sort by size desc, take top 20
-        notable.sort_by(|a, b| b.1.cmp(&a.1));
+        notable.sort_by_key(|a| Reverse(a.1));
         ctx.top_files = notable.into_iter().take(20).map(|(p, _)| p).collect();
 
         ctx
@@ -112,7 +113,6 @@ impl ProjectContext {
 }
 
 fn walk(
-    root:  &Path,
     dir:   &Path,
     langs: &mut HashMap<String, usize>,
     files: &mut Vec<(PathBuf, u64)>,
@@ -128,7 +128,7 @@ fn walk(
             }
         }
         if path.is_dir() {
-            walk(root, &path, langs, files, depth + 1);
+            walk(&path, langs, files, depth + 1);
         } else {
             let ext = path.extension()
                 .and_then(|e| e.to_str())

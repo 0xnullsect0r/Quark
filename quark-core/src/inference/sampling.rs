@@ -28,7 +28,7 @@ impl Default for SamplingParams {
 
 /// Apply temperature scaling to logits in-place.
 /// A temperature of 0.0 or 1.0 is a no-op (greedy / unchanged).
-pub fn apply_temperature(logits: &mut Vec<f32>, temperature: f32) {
+pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
     if temperature <= 0.0 || (temperature - 1.0).abs() < 1e-6 {
         return;
     }
@@ -121,7 +121,7 @@ fn sample_from_probs(probs: &[f32], rng: &mut impl Rng) -> u32 {
 
 impl SamplingParams {
     /// Apply temperature then dispatch to the configured sampling strategy.
-    pub fn sample(&self, logits: &mut Vec<f32>, rng: &mut impl Rng) -> u32 {
+    pub fn sample(&self, logits: &mut [f32], rng: &mut impl Rng) -> u32 {
         apply_temperature(logits, self.temperature);
 
         if self.temperature == 0.0 || self.top_k == 1 {

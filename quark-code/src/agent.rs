@@ -6,7 +6,7 @@ use std::thread;
 use quark_core::mcp::{parse_tool_calls, McpConfig, ToolCall};
 
 use crate::app::{App, FileChange, Message, Mode};
-use crate::tools::{err_result, execute_extended, expand_mentions};
+use crate::tools::execute_extended;
 
 // ─── Response token channel ───────────────────────────────────────────────────
 
@@ -109,12 +109,12 @@ fn build_prompt(app: &App) -> String {
 // ─── Agent turn execution ─────────────────────────────────────────────────────
 
 fn run_agent_turn(
-    tx:            mpsc::Sender<AgentEvent>,
-    system_prompt: String,
-    prompt:        String,
-    mcp_cfg:       McpConfig,
-    _mode:         Mode,
-    model_loaded:  bool,
+    tx:               mpsc::Sender<AgentEvent>,
+    _system_prompt:   String,
+    prompt:           String,
+    mcp_cfg:          McpConfig,
+    _mode:            Mode,
+    model_loaded:     bool,
 ) {
     // ── Generate response ────────────────────────────────────────────────────
     let response = if model_loaded {
@@ -144,7 +144,7 @@ fn run_agent_turn(
         });
 
         // Snapshot before-state for undo if write tool
-        let before = snapshot_before(&call, &mcp_cfg);
+        let before = snapshot_before(call, &mcp_cfg);
 
         let result = execute_extended(call, &mcp_cfg);
 
@@ -169,7 +169,7 @@ fn run_agent_turn(
 // ─── Inference stub ───────────────────────────────────────────────────────────
 
 /// Generate a heuristic response demonstrating tool use without a real model.
-fn generate_stub_response(prompt: &str, cfg: &McpConfig) -> String {
+fn generate_stub_response(prompt: &str, _cfg: &McpConfig) -> String {
     let prompt_lower = prompt.to_lowercase();
 
     // Try to be helpful based on keywords
@@ -213,10 +213,8 @@ I'll also check the recent commit history.
 fn extract_likely_path(prompt: &str) -> Option<String> {
     for word in prompt.split_whitespace() {
         let w = word.trim_matches(|c| c == '\'' || c == '"' || c == '`');
-        if w.contains('/') || w.contains('.') {
-            if !w.starts_with("http") {
-                return Some(w.to_owned());
-            }
+        if (w.contains('/') || w.contains('.')) && !w.starts_with("http") {
+            return Some(w.to_owned());
         }
     }
     None

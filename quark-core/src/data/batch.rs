@@ -41,14 +41,12 @@ pub fn collate_batch(sequences: Vec<Vec<u32>>, pad_id: u32) -> DataBatch {
 
         // Attention mask: 1 for real tokens, 0 for padding
         let mut mask = vec![0u8; max_len];
-        for i in 0..seq_len {
-            mask[i] = 1;
-        }
+        mask[..seq_len].fill(1);
 
         // Labels: shift left by 1; last position → pad_id (ignored)
         let mut lbl = Vec::with_capacity(max_len);
-        for i in 1..seq_len {
-            lbl.push(seq[i]);
+        for &tok in &seq[1..seq_len] {
+            lbl.push(tok);
         }
         lbl.push(pad_id); // last real position has no target
         lbl.resize(max_len, pad_id); // pad positions

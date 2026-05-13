@@ -230,7 +230,9 @@ async fn run_training_loop(
 
         let elapsed_secs = start_time.elapsed().as_secs();
         let eta_secs = if step > 0 {
-            elapsed_secs * (config.max_steps - step) / step
+            elapsed_secs.checked_mul(config.max_steps - step)
+                .and_then(|n| n.checked_div(step))
+                .unwrap_or(0)
         } else {
             0
         };
@@ -248,7 +250,7 @@ async fn run_training_loop(
             eta_secs,
         });
 
-        if step > 0 && step % config.save_every_steps == 0 {
+        if step > 0 && step.is_multiple_of(config.save_every_steps) {
             let ckpt = config.output_dir.join(format!("checkpoint-{step}"));
             std::fs::create_dir_all(&ckpt)?;
             tracing::info!("Saved checkpoint at step {step} → {}", ckpt.display());
