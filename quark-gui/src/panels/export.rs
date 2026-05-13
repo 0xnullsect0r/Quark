@@ -3,6 +3,15 @@
 use std::path::PathBuf;
 use quark_core::mcp::McpConfig;
 
+/// Which export target to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportTarget {
+    /// quark-chat: simple terminal chat REPL
+    Chat,
+    /// quark-code: full TUI coding agent (Claude Code / Copilot CLI style)
+    Code,
+}
+
 pub struct ExportPanel {
     // Source
     checkpoint_path: Option<PathBuf>,
@@ -13,6 +22,7 @@ pub struct ExportPanel {
     app_name:       String,
     system_prompt:  String,
     mcp:            McpConfig,
+    target:         ExportTarget,
 
     // Output
     output_dir: Option<PathBuf>,
@@ -28,8 +38,9 @@ impl Default for ExportPanel {
             tokenizer_path:  None,
             config_path:     None,
             app_name:        "MyQuarkApp".into(),
-            system_prompt:   "You are a helpful coding assistant with access to MCP tools for reading and writing files.".into(),
+            system_prompt:   "You are Quark Code, an expert AI coding assistant running locally on the user's machine.".into(),
             mcp:             McpConfig::default(),
+            target:          ExportTarget::Code,
             output_dir:      None,
             status:          None,
         }
@@ -53,12 +64,38 @@ impl ExportPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("📦 Export as Standalone Chat App");
+        ui.heading("📦 Export as Standalone App");
         ui.separator();
         ui.label(egui::RichText::new(
-            "Bundle your trained model into a self-contained executable chat app with MCP file tools."
+            "Bundle your trained model into a self-contained executable powered by the local Quark model."
         ).weak().italics());
         ui.add_space(8.0);
+
+        // ─── Export target selector ─────────────────────────────────────────────
+        egui::CollapsingHeader::new("🎯 Export Type").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.target, ExportTarget::Code, "💻 Quark Code (TUI coding agent)");
+                ui.selectable_value(&mut self.target, ExportTarget::Chat, "💬 Quark Chat (simple REPL)");
+            });
+            ui.add_space(4.0);
+            match self.target {
+                ExportTarget::Code => {
+                    ui.label(egui::RichText::new(
+                        "quark-code: Full terminal coding agent. Features Plan/Build modes, \
+                        git integration, file tools, /init project scanning, undo/redo, \
+                        @file context injection — similar to Claude Code or GitHub Copilot CLI."
+                    ).weak().small());
+                }
+                ExportTarget::Chat => {
+                    ui.label(egui::RichText::new(
+                        "quark-chat: Simple terminal REPL. Type messages, get responses. \
+                        MCP file tools included."
+                    ).weak().small());
+                }
+            }
+        });
+
+        ui.add_space(4.0);
 
         // ─── Source files ───────────────────────────────────────────────────────
         egui::CollapsingHeader::new("📁 Source Files").default_open(true).show(ui, |ui| {
@@ -238,29 +275,30 @@ impl ExportPanel {
         // ─── Bundle contents info ───────────────────────────────────────────────
         ui.add_space(8.0);
         ui.separator();
+        let bin_name = match self.target {
+            ExportTarget::Code => "quark-code",
+            ExportTarget::Chat => "quark-chat",
+        };
         egui::CollapsingHeader::new("ℹ Bundle layout")
             .default_open(false)
             .show(ui, |ui| {
+                let name = self.app_name.trim();
                 ui.label(
                     egui::RichText::new(format!(
-                        "
-{name}/
-├── quark-chat          (or quark-chat.exe on Windows)
-├── model/
-│   ├── checkpoint.safetensors
-│   ├── tokenizer.json
-│   ├── config.json
-│   ├── mcp.json
-│   └── system_prompt.txt
-├── run.sh              (Linux/macOS launcher)
-└── run.bat             (Windows launcher)
-
-Run the app:
-  Linux/macOS:  ./{name}/run.sh
-  Windows:      {name}\\run.bat
-  Or directly:  ./{name}/quark-chat
-",
-                        name = self.app_name.trim()
+                        "\n{name}/\n\
+                        ├── {bin_name}          (or {bin_name}.exe on Windows)\n\
+                        ├── model/\n\
+                        │   ├── checkpoint.safetensors\n\
+                        │   ├── tokenizer.json\n\
+                        │   ├── config.json\n\
+                        │   ├── mcp.json\n\
+                        │   └── system_prompt.txt\n\
+                        ├── run.sh              (Linux/macOS launcher)\n\
+                        └── run.bat             (Windows launcher)\n\
+                        \nRun the app:\n\
+                          Linux/macOS:  ./{name}/run.sh\n\
+                          Windows:      {name}\\\\run.bat\n\
+                          Or directly:  ./{name}/{bin_name}\n"
                     ))
                     .monospace()
                     .weak(),
@@ -280,7 +318,7 @@ Run the app:
         use std::fs;
 
         let name = self.app_name.trim();
-        let out_root = self.output_dir.as_ref().unwrap().join(name);
+        let out_root  = self.output_dir.as_ref().unwrap().join(name);
         let model_dir = out_root.join("model");
         fs::create_dir_all(&model_dir)?;
 
@@ -308,58 +346,65 @@ Run the app:
         // Write system prompt
         fs::write(model_dir.join("system_prompt.txt"), &self.system_prompt)?;
 
-        // Write config.json with app name if not already there
+        // Write config.json with app metadata
         let config_json_path = model_dir.join("config.json");
         if !config_json_path.exists() {
-            let meta = serde_json::json!({ "name": name });
+            let meta = serde_json::json!({
+                "name": name,
+                "export_type": match self.target {
+                    ExportTarget::Code => "quark-code",
+                    ExportTarget::Chat => "quark-chat",
+                }
+            });
             fs::write(&config_json_path, serde_json::to_string_pretty(&meta)?)?;
         }
 
-        // Copy quark-chat binary from beside our own executable
+        // Determine which binary to bundle
         let own_exe = std::env::current_exe()
             .unwrap_or_else(|_| std::path::PathBuf::from("quark-gui"));
         let exe_dir = own_exe.parent().unwrap_or(std::path::Path::new("."));
 
-        #[cfg(windows)]
-        let chat_exe_name = "quark-chat.exe";
-        #[cfg(not(windows))]
-        let chat_exe_name = "quark-chat";
+        let src_bin_name = match self.target {
+            ExportTarget::Code => {
+                if cfg!(windows) { "quark-code.exe" } else { "quark-code" }
+            }
+            ExportTarget::Chat => {
+                if cfg!(windows) { "quark-chat.exe" } else { "quark-chat" }
+            }
+        };
+        let dst_bin_name = src_bin_name;
 
-        let chat_src = exe_dir.join(chat_exe_name);
-        let chat_dst = out_root.join(chat_exe_name);
+        let bin_src = exe_dir.join(src_bin_name);
+        let bin_dst = out_root.join(dst_bin_name);
 
-        if chat_src.exists() {
-            fs::copy(&chat_src, &chat_dst)
-                .map_err(|e| anyhow::anyhow!("Failed to copy quark-chat binary: {e}"))?;
-            // Make executable on Unix
+        if bin_src.exists() {
+            fs::copy(&bin_src, &bin_dst)
+                .map_err(|e| anyhow::anyhow!("Failed to copy {} binary: {e}", src_bin_name))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&chat_dst)?.permissions();
+                let mut perms = fs::metadata(&bin_dst)?.permissions();
                 perms.set_mode(0o755);
-                fs::set_permissions(&chat_dst, perms)?;
+                fs::set_permissions(&bin_dst, perms)?;
             }
         } else {
-            // Write a note explaining how to get the binary
+            let pkg = match self.target {
+                ExportTarget::Code => "quark-code",
+                ExportTarget::Chat => "quark-chat",
+            };
             fs::write(
                 out_root.join("MISSING_BINARY.txt"),
                 format!(
-                    "quark-chat binary not found at {}\n\nBuild it with:\n  cargo build --release --package quark-chat --features backend-cpu\nThen copy target/release/quark-chat here.",
-                    chat_src.display()
+                    "{src_bin_name} not found at {}\n\nBuild it with:\n  cargo build --release --package {pkg} --features backend-cpu\nThen copy target/release/{src_bin_name} here.",
+                    bin_src.display()
                 ),
             )?;
         }
 
         // Write launcher scripts
-        let app_exe = if cfg!(windows) {
-            format!(".\\{chat_exe_name}")
-        } else {
-            format!("./{chat_exe_name}")
-        };
-
         fs::write(
             out_root.join("run.sh"),
-            format!("#!/usr/bin/env bash\ncd \"$(dirname \"$0\")\"\n{app_exe} \"$@\"\n"),
+            format!("#!/usr/bin/env bash\ncd \"$(dirname \"$0\")\"\n./{dst_bin_name} \"$@\"\n"),
         )?;
         #[cfg(unix)]
         {
@@ -371,7 +416,7 @@ Run the app:
 
         fs::write(
             out_root.join("run.bat"),
-            format!("@echo off\r\ncd /d \"%~dp0\"\r\n{chat_exe_name} %*\r\n"),
+            format!("@echo off\r\ncd /d \"%~dp0\"\r\n{dst_bin_name} %*\r\n"),
         )?;
 
         Ok(out_root)
