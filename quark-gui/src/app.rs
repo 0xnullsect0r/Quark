@@ -53,6 +53,9 @@ impl QuarkApp {
 
 impl eframe::App for QuarkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll the Pile build receiver every frame for live log updates.
+        self.dataset_panel.update(ctx);
+
         // Poll update checker
         if let Some(rx) = &self.update_rx {
             if let Ok(msg) = rx.try_recv() {
