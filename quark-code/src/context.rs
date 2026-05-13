@@ -135,7 +135,7 @@ fn walk(
                 .unwrap_or("")
                 .to_lowercase();
             if !ext.is_empty() {
-                *langs.entry(ext).or_insert(0) += 1;
+                *langs.entry(ext.clone()).or_insert(0) += 1;
             }
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             // Only track source files

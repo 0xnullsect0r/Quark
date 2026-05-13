@@ -184,7 +184,7 @@ fn handle_key(
 
                 // In plan mode, add a reminder to the last user message
                 if app.mode == Mode::Plan {
-                    app.messages.push(Message::system_msg("[Plan mode — model will suggest only]".into()));
+                    app.messages.push(Message::system_msg("[Plan mode — model will suggest only]".to_string()));
                 }
 
                 *stream = Some(start_turn(app));
@@ -233,20 +233,20 @@ fn handle_slash_command(app: &mut App, cmd: &str) {
 
         "/clear" => {
             app.messages.clear();
-            app.messages.push(Message::system_msg("Conversation cleared.".into()));
+            app.messages.push(Message::system_msg("Conversation cleared.".to_string()));
         }
 
         "/plan" => {
             app.mode = Mode::Plan;
-            app.messages.push(Message::system_msg("Switched to PLAN mode.".into()));
+            app.messages.push(Message::system_msg("Switched to PLAN mode.".to_string()));
         }
         "/build" => {
             app.mode = Mode::Build;
-            app.messages.push(Message::system_msg("Switched to BUILD mode.".into()));
+            app.messages.push(Message::system_msg("Switched to BUILD mode.".to_string()));
         }
 
         "/init" => {
-            app.messages.push(Message::system_msg("Scanning project…".into()));
+            app.messages.push(Message::system_msg("Scanning project…".to_string()));
             let ctx = crate::context::ProjectContext::scan(&app.project_root);
             let md  = ctx.to_agents_md();
             let path = app.project_root.join("AGENTS.md");
@@ -266,19 +266,19 @@ fn handle_slash_command(app: &mut App, cmd: &str) {
         "/undo" => {
             match app.undo() {
                 Some(s) => app.messages.push(Message::system_msg(format!("↩ Undid: {s}"))),
-                None    => app.messages.push(Message::system_msg("Nothing to undo.".into())),
+                None    => app.messages.push(Message::system_msg("Nothing to undo.".to_string())),
             }
         }
         "/redo" => {
             match app.redo() {
                 Some(s) => app.messages.push(Message::system_msg(format!("↪ Redid: {s}"))),
-                None    => app.messages.push(Message::system_msg("Nothing to redo.".into())),
+                None    => app.messages.push(Message::system_msg("Nothing to redo.".to_string())),
             }
         }
 
         "/diff" => {
             if app.undo_stack.is_empty() {
-                app.messages.push(Message::system_msg("No pending file changes.".into()));
+                app.messages.push(Message::system_msg("No pending file changes.".to_string()));
             } else {
                 let count: usize = app.undo_stack.iter().map(|b| b.len()).sum();
                 let files: Vec<String> = app.undo_stack.iter()
@@ -308,7 +308,7 @@ fn handle_slash_command(app: &mut App, cmd: &str) {
         }
 
         "/help" => {
-            app.messages.push(Message::system_msg(HELP_TEXT.into()));
+            app.messages.push(Message::system_msg(HELP_TEXT.to_string()));
         }
 
         _ => {
@@ -374,7 +374,7 @@ fn render_titlebar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let proj = app.project_root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "project".into());
+        .unwrap_or_else(|| "project".to_string());
 
     let line = Line::from(vec![
         Span::styled(" ◆ Quark Code ", Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
@@ -428,17 +428,17 @@ fn render_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let max_w = max_w.max(20);
 
         let content_lines = wrap_text(&msg.content, max_w);
-        for (i, line_text) in content_lines.iter().enumerate() {
+        for (i, line_text) in content_lines.into_iter().enumerate() {
             if i == 0 {
                 items.push(ListItem::new(Line::from(vec![
                     Span::styled(prefix, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                    Span::styled(line_text.as_str(), Style::default().fg(color)),
+                    Span::styled(line_text, Style::default().fg(color)),
                 ])));
             } else {
                 let pad = " ".repeat(prefix.len());
                 items.push(ListItem::new(Line::from(vec![
                     Span::raw(pad),
-                    Span::styled(line_text.as_str(), Style::default().fg(color)),
+                    Span::styled(line_text, Style::default().fg(color)),
                 ])));
             }
         }
@@ -451,16 +451,16 @@ fn render_messages(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let max_w = inner.width.saturating_sub(12) as usize;
         let max_w = max_w.max(20);
         let lines = wrap_text(&app.stream_buf, max_w);
-        for (i, l) in lines.iter().enumerate() {
+        for (i, l) in lines.into_iter().enumerate() {
             if i == 0 {
                 items.push(ListItem::new(Line::from(vec![
                     Span::styled(" Quark  ▶ ", Style::default().fg(C_ASSISTANT).add_modifier(Modifier::BOLD)),
-                    Span::styled(l.as_str(), Style::default().fg(C_ASSISTANT)),
+                    Span::styled(l, Style::default().fg(C_ASSISTANT)),
                 ])));
             } else {
                 items.push(ListItem::new(Line::from(vec![
                     Span::raw("          "),
-                    Span::styled(l.as_str(), Style::default().fg(C_ASSISTANT)),
+                    Span::styled(l, Style::default().fg(C_ASSISTANT)),
                 ])));
             }
         }

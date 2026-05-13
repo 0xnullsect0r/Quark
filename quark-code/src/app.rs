@@ -134,7 +134,7 @@ impl App {
             agents,
         )));
         self.messages.push(Message::system_msg(
-            "Tab → toggle Plan/Build mode   /help for commands   Ctrl+C to quit".into()
+            "Tab → toggle Plan/Build mode   /help for commands   Ctrl+C to quit"
         ));
     }
 
