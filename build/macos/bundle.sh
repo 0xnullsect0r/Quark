@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
 # build/macos/bundle.sh — Build Quark.app and Quark.dmg for macOS
 # Usage: bash build/macos/bundle.sh [--features "backend-cpu backend-wgpu"]
+# Assumes cargo build --release --package quark-gui has already been run.
 set -euo pipefail
 
-FEATURES="${1:-backend-cpu}"
 APP_NAME="Quark"
 VERSION="0.1.0"
 BUNDLE_ID="com.quark.lm"
 TARGET_DIR="target/release"
 APP_DIR="dist/${APP_NAME}.app"
 
-echo "==> Building Quark (features: ${FEATURES})…"
-cargo build --release --package quark-gui --features "$FEATURES"
-
 echo "==> Creating .app bundle…"
 rm -rf "$APP_DIR"
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 
-cp "${TARGET_DIR}/quark-gui" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+cp "${TARGET_DIR}/quark" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
 # Copy icon if present

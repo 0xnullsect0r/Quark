@@ -6,7 +6,7 @@
 !define APP_VERSION   "0.1.0"
 !define APP_PUBLISHER "Quark Contributors"
 !define APP_URL       "https://github.com/0xnullsect0r/Quark"
-!define APP_EXE       "quark-gui.exe"
+!define APP_EXE       "quark.exe"
 !define INSTALL_DIR   "$PROGRAMFILES64\Quark"
 
 Name "${APP_NAME} ${APP_VERSION}"
@@ -19,11 +19,8 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON      "..\..\assets\quark.ico"
-!define MUI_UNICON    "..\..\assets\quark.ico"
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH

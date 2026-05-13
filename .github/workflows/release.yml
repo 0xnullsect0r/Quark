@@ -37,7 +37,7 @@ jobs:
         run: cargo build --release --package quark-code --features backend-cpu
 
       - name: Rename binary
-        run: cp target/release/quark-gui quark-linux-amd64
+        run: cp target/release/quark quark-linux-amd64
 
       - name: Rename quark-chat binary
         run: cp target/release/quark-chat quark-chat-linux-amd64
@@ -80,7 +80,7 @@ jobs:
         run: cargo build --release --package quark-code --features "backend-cpu backend-wgpu"
 
       - name: Rename binary
-        run: cp target/release/quark-gui quark-macos-aarch64
+        run: cp target/release/quark quark-macos-aarch64
 
       - name: Rename quark-chat binary
         run: cp target/release/quark-chat quark-chat-macos-aarch64
@@ -90,7 +90,7 @@ jobs:
 
       - name: Build macOS bundle and DMG
         if: runner.os == 'macOS'
-        run: bash build/macos/bundle.sh "backend-cpu backend-wgpu"
+        run: bash build/macos/bundle.sh
 
       - name: Upload macOS DMG
         if: runner.os == 'macOS'
@@ -134,7 +134,7 @@ jobs:
         run: cargo build --release --package quark-code --features backend-cpu
 
       - name: Rename binary
-        run: cp target/release/quark-gui.exe quark-windows-amd64.exe
+        run: cp target/release/quark.exe quark-windows-amd64.exe
 
       - name: Rename quark-chat binary
         run: cp target/release/quark-chat.exe quark-chat-windows-amd64.exe
