@@ -53,28 +53,47 @@ impl ConfigPanel {
             let old_preset = self.preset;
             egui::ComboBox::from_id_salt("preset_combo")
                 .selected_text(match self.preset {
-                    ModelPreset::Quark1B => "Quark 1B",
-                    ModelPreset::Quark3B => "Quark 3B",
-                    ModelPreset::Custom => "Custom",
+                    ModelPreset::Quark1B   => "Quark 1B",
+                    ModelPreset::Quark3B   => "Quark 3B",
+                    ModelPreset::Quark7B   => "Quark 7B",
+                    ModelPreset::Quark20B  => "Quark 20B",
+                    ModelPreset::Quark30B  => "Quark 30B",
+                    ModelPreset::Quark48B  => "Quark 48B",
+                    ModelPreset::Quark74B  => "Quark 74B",
+                    ModelPreset::Quark120B => "Quark 120B",
+                    ModelPreset::Quark249B => "Quark 249B",
+                    ModelPreset::Quark300B => "Quark 300B",
+                    ModelPreset::Quark400B => "Quark 400B",
+                    ModelPreset::Custom    => "Custom",
                 })
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.preset,
-                        ModelPreset::Quark1B,
-                        "Quark 1B (~1B params, 8–16 GB RAM)",
-                    );
-                    ui.selectable_value(
-                        &mut self.preset,
-                        ModelPreset::Quark3B,
-                        "Quark 3B (~3B params, 16–32 GB RAM)",
-                    );
-                    ui.selectable_value(&mut self.preset, ModelPreset::Custom, "Custom");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark1B,   "Quark 1B   (~1B params   — 8–16 GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark3B,   "Quark 3B   (~3B params   — 16–32 GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark7B,   "Quark 7B   (~7B params   — 32–48 GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark20B,  "Quark 20B  (~20B params  — 80+ GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark30B,  "Quark 30B  (~30B params  — 120+ GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark48B,  "Quark 48B  (~48B params  — 192+ GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark74B,  "Quark 74B  (~74B params  — 300+ GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark120B, "Quark 120B (~120B params — 480+ GB RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark249B, "Quark 249B (~249B params — 1 TB+ RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark300B, "Quark 300B (~300B params — 1.2 TB+ RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Quark400B, "Quark 400B (~400B params — 1.6 TB+ RAM)");
+                    ui.selectable_value(&mut self.preset, ModelPreset::Custom,    "Custom");
                 });
             if self.preset != old_preset {
                 match self.preset {
-                    ModelPreset::Quark1B => self.config = QuarkConfig::quark_1b(),
-                    ModelPreset::Quark3B => self.config = QuarkConfig::quark_3b(),
-                    ModelPreset::Custom => {}
+                    ModelPreset::Quark1B   => self.config = QuarkConfig::quark_1b(),
+                    ModelPreset::Quark3B   => self.config = QuarkConfig::quark_3b(),
+                    ModelPreset::Quark7B   => self.config = QuarkConfig::quark_7b(),
+                    ModelPreset::Quark20B  => self.config = QuarkConfig::quark_20b(),
+                    ModelPreset::Quark30B  => self.config = QuarkConfig::quark_30b(),
+                    ModelPreset::Quark48B  => self.config = QuarkConfig::quark_48b(),
+                    ModelPreset::Quark74B  => self.config = QuarkConfig::quark_74b(),
+                    ModelPreset::Quark120B => self.config = QuarkConfig::quark_120b(),
+                    ModelPreset::Quark249B => self.config = QuarkConfig::quark_249b(),
+                    ModelPreset::Quark300B => self.config = QuarkConfig::quark_300b(),
+                    ModelPreset::Quark400B => self.config = QuarkConfig::quark_400b(),
+                    ModelPreset::Custom    => {}
                 }
             }
         });
