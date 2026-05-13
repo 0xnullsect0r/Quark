@@ -30,13 +30,24 @@ jobs:
       - name: Build
         run: cargo build --release --package quark-gui --features backend-cpu
 
+      - name: Build Quark Chat
+        run: cargo build --release --package quark-chat --features backend-cpu
+
       - name: Rename binary
         run: cp target/release/quark-gui quark-linux-amd64
+
+      - name: Rename quark-chat binary
+        run: cp target/release/quark-chat quark-chat-linux-amd64
 
       - uses: actions/upload-artifact@v4
         with:
           name: quark-linux-amd64
           path: quark-linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-chat-linux-amd64
+          path: quark-chat-linux-amd64
 
   build-macos:
     name: Build macOS (aarch64)
@@ -51,8 +62,14 @@ jobs:
       - name: Build
         run: cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"
 
+      - name: Build Quark Chat
+        run: cargo build --release --package quark-chat --features "backend-cpu backend-wgpu"
+
       - name: Rename binary
         run: cp target/release/quark-gui quark-macos-aarch64
+
+      - name: Rename quark-chat binary
+        run: cp target/release/quark-chat quark-chat-macos-aarch64
 
       - name: Build macOS bundle and DMG
         if: runner.os == 'macOS'
@@ -70,6 +87,11 @@ jobs:
           name: quark-macos-aarch64
           path: quark-macos-aarch64
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-chat-macos-aarch64
+          path: quark-chat-macos-aarch64
+
   build-windows:
     name: Build Windows (amd64)
     runs-on: windows-latest
@@ -83,8 +105,14 @@ jobs:
       - name: Build
         run: cargo build --release --package quark-gui --features backend-cpu
 
+      - name: Build Quark Chat
+        run: cargo build --release --package quark-chat --features backend-cpu
+
       - name: Rename binary
         run: cp target/release/quark-gui.exe quark-windows-amd64.exe
+
+      - name: Rename quark-chat binary
+        run: cp target/release/quark-chat.exe quark-chat-windows-amd64.exe
 
       - name: Build NSIS installer
         if: runner.os == 'Windows'
@@ -105,6 +133,11 @@ jobs:
           name: quark-windows-amd64
           path: quark-windows-amd64.exe
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-chat-windows-amd64
+          path: quark-chat-windows-amd64.exe
+
   create-release:
     name: Create GitHub Release
     needs: [build-linux, build-macos, build-windows]
@@ -120,6 +153,9 @@ jobs:
         with:
           files: |
             quark-linux-amd64
+            quark-chat-linux-amd64
             quark-macos-aarch64
+            quark-chat-macos-aarch64
             quark-windows-amd64.exe
+            quark-chat-windows-amd64.exe
           generate_release_notes: true

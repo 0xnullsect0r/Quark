@@ -1,0 +1,26 @@
+[package]
+name        = "quark-chat"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Standalone chat app exported from Quark — runs a trained Quark model with MCP tools"
+
+[[bin]]
+name = "quark-chat"
+path = "src/main.rs"
+
+[dependencies]
+quark-core  = { path = "../quark-core", features = ["backend-cpu"] }
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default       = []
+backend-cpu   = ["quark-core/backend-cpu"]
+backend-wgpu  = ["quark-core/backend-wgpu"]
+backend-cuda  = ["quark-core/backend-cuda"]

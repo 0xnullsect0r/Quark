@@ -1,8 +1,8 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 use crate::panels::{
-    ChatPanel, CheckpointsPanel, ConfigPanel, DatasetPanel, GettingStartedPanel, SettingsPanel,
-    TrainingPanel,
+    ChatPanel, CheckpointsPanel, ConfigPanel, DatasetPanel, ExportPanel, GettingStartedPanel,
+    SettingsPanel, TrainingPanel,
 };
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -15,6 +15,7 @@ enum ActivePanel {
     Chat,
     Settings,
     Help,
+    Export,
 }
 
 pub struct QuarkApp {
@@ -26,6 +27,7 @@ pub struct QuarkApp {
     chat_panel: ChatPanel,
     settings_panel: SettingsPanel,
     getting_started: GettingStartedPanel,
+    export_panel: ExportPanel,
     update_info: Option<quark_core::updater::UpdateInfo>,
     update_rx: Option<std::sync::mpsc::Receiver<Option<quark_core::updater::UpdateInfo>>>,
 }
@@ -42,6 +44,7 @@ impl QuarkApp {
             chat_panel: ChatPanel::default(),
             settings_panel: SettingsPanel::default(),
             getting_started: GettingStartedPanel::default(),
+            export_panel: ExportPanel::default(),
             update_info: None,
             update_rx,
         }
@@ -85,6 +88,7 @@ impl eframe::App for QuarkApp {
                 ui.selectable_value(&mut self.active, ActivePanel::Chat, "💬 Chat");
                 ui.selectable_value(&mut self.active, ActivePanel::Settings, "🛠 Settings");
                 ui.selectable_value(&mut self.active, ActivePanel::Help, "❓ Help");
+                ui.selectable_value(&mut self.active, ActivePanel::Export, "📦 Export");
             });
         });
 
@@ -96,6 +100,7 @@ impl eframe::App for QuarkApp {
             ActivePanel::Chat => self.chat_panel.ui(ui),
             ActivePanel::Settings => self.settings_panel.ui(ui),
             ActivePanel::Help => self.getting_started.ui(ui),
+            ActivePanel::Export => self.export_panel.ui(ui),
         });
     }
 }

@@ -3,6 +3,7 @@ members = [
     "quark-core",
     "quark-gui",
     "quark-cli",
+    "quark-chat",
 ]
 resolver = "2"
 

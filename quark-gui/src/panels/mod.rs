@@ -15,3 +15,6 @@ pub use dataset::DatasetPanel;
 pub use getting_started::GettingStartedPanel;
 pub use settings::SettingsPanel;
 pub use training::TrainingPanel;
+
+mod export;
+pub use export::ExportPanel;

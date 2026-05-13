@@ -3,6 +3,7 @@
 pub mod checkpoint;
 pub mod data;
 pub mod inference;
+pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod tokenizer;
