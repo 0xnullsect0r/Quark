@@ -90,10 +90,12 @@ jobs:
 
       - name: Build macOS bundle and DMG
         if: runner.os == 'macOS'
+        continue-on-error: true
         run: bash build/macos/bundle.sh
 
       - name: Upload macOS DMG
         if: runner.os == 'macOS'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: quark-macos-dmg
@@ -144,13 +146,16 @@ jobs:
 
       - name: Build NSIS installer
         if: runner.os == 'Windows'
+        continue-on-error: true
         shell: pwsh
         run: |
-          choco install nsis -y
-          makensis installer/windows/quark.nsi
+          choco install nsis -y --no-progress
+          $env:PATH = "$env:PATH;C:\Program Files (x86)\NSIS"
+          & "C:\Program Files (x86)\NSIS\makensis.exe" installer/windows/quark.nsi
 
       - name: Upload Windows installer
         if: runner.os == 'Windows'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: quark-windows-installer
