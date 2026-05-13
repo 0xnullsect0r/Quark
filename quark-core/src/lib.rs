@@ -7,3 +7,4 @@ pub mod memory;
 pub mod model;
 pub mod tokenizer;
 pub mod training;
+pub mod updater;
