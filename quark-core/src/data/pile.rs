@@ -51,11 +51,8 @@ pub struct PileConfig {
 
 impl Default for PileConfig {
     fn default() -> Self {
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("quark");
         Self {
-            target_dir: base,
+            target_dir: crate::paths::app_data_dir(),
             python_cmd: detect_python(),
             component: "pile_reprod".into(),
             interleave_output: 30,

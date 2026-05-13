@@ -13,10 +13,7 @@ pub struct SettingsPanel {
 
 impl Default for SettingsPanel {
     fn default() -> Self {
-        let settings_path = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("quark")
-            .join("settings.toml");
+        let settings_path = quark_core::paths::settings_path();
         let tier = if settings_path.exists() {
             TierConfig::load(&settings_path).unwrap_or_default()
         } else {

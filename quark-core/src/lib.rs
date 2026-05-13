@@ -6,6 +6,7 @@ pub mod inference;
 pub mod mcp;
 pub mod memory;
 pub mod model;
+pub mod paths;
 pub mod tokenizer;
 pub mod training;
 pub mod updater;
