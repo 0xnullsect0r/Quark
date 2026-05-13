@@ -1,0 +1,34 @@
+[package]
+name        = "quark-gui"
+description = "Desktop GUI for the Quark LLM builder"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "quark"
+path = "src/main.rs"
+
+[features]
+default = ["backend-cpu"]
+backend-cpu  = ["quark-core/backend-cpu"]
+backend-cuda = ["quark-core/backend-cuda"]
+backend-wgpu = ["quark-core/backend-wgpu"]
+
+[dependencies]
+quark-core = { path = "../quark-core", default-features = false }
+eframe     = { workspace = true }
+egui       = { workspace = true }
+egui_plot  = { workspace = true }
+rfd        = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+toml       = { workspace = true }
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs       = { workspace = true }
+sysinfo    = { workspace = true }

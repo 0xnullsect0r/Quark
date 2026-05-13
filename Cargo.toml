@@ -1,0 +1,64 @@
+[workspace]
+members = [
+    "quark-core",
+    "quark-gui",
+    "quark-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Quark Contributors"]
+license     = "MIT"
+repository  = "https://github.com/0xnullsect0r/Quark"
+
+[workspace.dependencies]
+# Deep learning
+burn           = { version = "0.16", default-features = false }
+burn-autodiff  = { version = "0.16" }
+burn-ndarray   = { version = "0.16" }
+burn-cuda      = { version = "0.16" }
+burn-wgpu      = { version = "0.16" }
+
+# Serialization / weights
+safetensors    = "0.4"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+toml           = "0.8"
+
+# Tokenizer
+tokenizers     = "0.20"
+
+# GUI
+eframe         = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+egui           = "0.31"
+egui_plot      = "0.31"
+rfd            = "0.15"
+
+# Async / concurrency
+tokio          = { version = "1", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
+
+# System info
+sysinfo        = "0.32"
+
+# Utilities
+anyhow         = "1"
+thiserror      = "1"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memmap2        = "0.9"
+bytemuck       = { version = "1", features = ["derive"] }
+half           = { version = "2", features = ["bytemuck"] }
+rand           = "0.8"
+rayon          = "1"
+dirs           = "5"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+
+[profile.dev]
+opt-level     = 1

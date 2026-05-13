@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    name: Build Linux (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev
+
+      - name: Build
+        run: cargo build --release --package quark-gui --features backend-cpu
+
+      - name: Rename binary
+        run: cp target/release/quark-gui quark-linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-linux-amd64
+          path: quark-linux-amd64
+
+  build-macos:
+    name: Build macOS (aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"
+
+      - name: Rename binary
+        run: cp target/release/quark-gui quark-macos-aarch64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-macos-aarch64
+          path: quark-macos-aarch64
+
+  build-windows:
+    name: Build Windows (amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --package quark-gui --features backend-cpu
+
+      - name: Rename binary
+        run: cp target/release/quark-gui.exe quark-windows-amd64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-windows-amd64
+          path: quark-windows-amd64.exe
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            quark-linux-amd64
+            quark-macos-aarch64
+            quark-windows-amd64.exe
+          generate_release_notes: true

@@ -1,0 +1,41 @@
+[package]
+name        = "quark-core"
+description = "Core model architecture, training engine, and inference for the Quark LLM"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[features]
+default = ["backend-cpu"]
+backend-cpu  = ["burn/ndarray",  "burn-ndarray"]
+backend-cuda = ["burn-cuda"]
+backend-wgpu = ["burn/wgpu",     "burn-wgpu"]
+
+[dependencies]
+burn          = { workspace = true, features = ["autodiff", "std"] }
+burn-autodiff = { workspace = true }
+burn-ndarray  = { workspace = true, optional = true }
+burn-cuda     = { workspace = true, optional = true }
+burn-wgpu     = { workspace = true, optional = true }
+
+safetensors   = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+toml          = { workspace = true }
+tokenizers    = { workspace = true }
+tokio         = { workspace = true }
+sysinfo       = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tracing       = { workspace = true }
+memmap2       = { workspace = true }
+bytemuck      = { workspace = true }
+half          = { workspace = true }
+rand          = { workspace = true }
+rayon         = { workspace = true }
+dirs          = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
