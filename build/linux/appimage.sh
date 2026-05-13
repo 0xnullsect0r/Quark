@@ -18,6 +18,8 @@ fi
 
 echo "==> Building Quark (${BUILD_TYPE}) …"
 cargo build --release --package quark-gui --features "$FEATURES"
+cargo build --release --package quark-chat --features "$FEATURES"
+cargo build --release --package quark-code --features "$FEATURES"
 
 APPDIR="dist/${APP_NAME}.AppDir"
 rm -rf "$APPDIR"
@@ -25,8 +27,10 @@ mkdir -p "${APPDIR}/usr/bin"
 mkdir -p "${APPDIR}/usr/share/applications"
 mkdir -p "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
 
-cp "target/release/quark-gui" "${APPDIR}/usr/bin/${APP_NAME}"
-chmod +x "${APPDIR}/usr/bin/${APP_NAME}"
+cp "target/release/quark"      "${APPDIR}/usr/bin/${APP_NAME}"
+cp "target/release/quark-chat" "${APPDIR}/usr/bin/quark-chat"
+cp "target/release/quark-code" "${APPDIR}/usr/bin/quark-code"
+chmod +x "${APPDIR}/usr/bin/${APP_NAME}" "${APPDIR}/usr/bin/quark-chat" "${APPDIR}/usr/bin/quark-code"
 
 # Desktop entry
 cat > "${APPDIR}/usr/share/applications/${APP_NAME}.desktop" << DESKTOP

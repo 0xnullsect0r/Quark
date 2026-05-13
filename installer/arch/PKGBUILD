@@ -1,0 +1,58 @@
+# Maintainer: Quark Contributors <https://github.com/0xnullsect0r/Quark>
+pkgname=quark
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Train and run your own Llama 4-style MoE coding LLM on your own hardware"
+arch=('x86_64')
+url="https://github.com/0xnullsect0r/Quark"
+license=('MIT')
+depends=('gtk3' 'openssl' 'hicolor-icon-theme')
+optdepends=(
+  'cuda: NVIDIA GPU acceleration'
+)
+provides=('quark' 'quark-chat' 'quark-code')
+conflicts=()
+options=('!strip')  # pre-stripped release binary
+
+source_x86_64=(
+  "quark-${pkgver}-linux-amd64::https://github.com/0xnullsect0r/Quark/releases/download/v${pkgver}/quark-linux-amd64"
+  "quark-chat-${pkgver}-linux-amd64::https://github.com/0xnullsect0r/Quark/releases/download/v${pkgver}/quark-chat-linux-amd64"
+  "quark-code-${pkgver}-linux-amd64::https://github.com/0xnullsect0r/Quark/releases/download/v${pkgver}/quark-code-linux-amd64"
+)
+# Update these after each release with: sha256sum <file>
+sha256sums_x86_64=(
+  'SKIP'
+  'SKIP'
+  'SKIP'
+)
+
+package() {
+  cd "$srcdir"
+
+  # Binaries
+  install -Dm755 "quark-${pkgver}-linux-amd64"      "${pkgdir}/usr/bin/quark"
+  install -Dm755 "quark-chat-${pkgver}-linux-amd64" "${pkgdir}/usr/bin/quark-chat"
+  install -Dm755 "quark-code-${pkgver}-linux-amd64" "${pkgdir}/usr/bin/quark-code"
+
+  # Desktop entry
+  install -Dm644 /dev/stdin "${pkgdir}/usr/share/applications/quark.desktop" << 'DESKTOP'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Quark LLM
+GenericName=LLM Trainer
+Comment=Train and run your own Llama 4-style MoE coding LLM
+Exec=quark %u
+Icon=quark
+Terminal=false
+Categories=Development;Science;ArtificialIntelligence;
+Keywords=llm;ai;ml;training;coding;transformer;
+StartupNotify=true
+DESKTOP
+
+  # License
+  install -Dm644 /dev/stdin "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" << 'MIT'
+MIT License — Copyright (c) 2025 Quark Contributors
+See https://github.com/0xnullsect0r/Quark/blob/main/LICENSE
+MIT
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build/macos/bundle.sh — Build Quark.app and Quark.dmg for macOS
-# Usage: bash build/macos/bundle.sh [--features "backend-cpu backend-wgpu"]
-# Assumes cargo build --release --package quark-gui has already been run.
+# Assumes all three binaries have already been built with cargo build --release.
+# Usage: bash build/macos/bundle.sh
 set -euo pipefail
 
 APP_NAME="Quark"
@@ -15,10 +15,17 @@ rm -rf "$APP_DIR"
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 
+# Main GUI binary
 cp "${TARGET_DIR}/quark" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
-# Copy icon if present
+# Bundle companion CLIs inside the app so they're co-located
+cp "${TARGET_DIR}/quark-chat" "${APP_DIR}/Contents/MacOS/quark-chat"
+chmod +x "${APP_DIR}/Contents/MacOS/quark-chat"
+cp "${TARGET_DIR}/quark-code" "${APP_DIR}/Contents/MacOS/quark-code"
+chmod +x "${APP_DIR}/Contents/MacOS/quark-code"
+
+# Icon
 if [ -f "assets/quark.icns" ]; then
   cp "assets/quark.icns" "${APP_DIR}/Contents/Resources/${APP_NAME}.icns"
 fi
@@ -50,7 +57,13 @@ STAGING="dist/dmg-staging"
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 cp -r "$APP_DIR" "$STAGING/"
-ln -s /Applications "$STAGING/Applications"
+
+# Symlink /Applications for drag-install
+ln -sf /Applications "$STAGING/Applications"
+
+# Also ship the companion CLIs as standalone binaries in the DMG root
+cp "${TARGET_DIR}/quark-chat" "$STAGING/quark-chat"
+cp "${TARGET_DIR}/quark-code" "$STAGING/quark-code"
 
 hdiutil create -volname "Quark ${VERSION}" \
   -srcfolder "$STAGING" \

@@ -45,6 +45,19 @@ jobs:
       - name: Rename quark-code binary
         run: cp target/release/quark-code quark-code-linux-amd64
 
+      - name: Build .deb package
+        run: |
+          sudo apt-get install -y dpkg-dev
+          chmod +x build/linux/deb.sh
+          bash build/linux/deb.sh
+
+      - name: Build .rpm package
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y rpm
+          chmod +x build/linux/rpm.sh
+          bash build/linux/rpm.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: quark-linux-amd64
@@ -59,6 +72,18 @@ jobs:
         with:
           name: quark-code-linux-amd64
           path: quark-code-linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-linux-deb
+          path: dist/quark_*.deb
+
+      - name: Upload .rpm artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: quark-linux-rpm
+          path: dist/quark-*.rpm
 
   build-macos:
     name: Build macOS (aarch64)
@@ -193,6 +218,8 @@ jobs:
             quark-linux-amd64
             quark-chat-linux-amd64
             quark-code-linux-amd64
+            quark_*.deb
+            quark-*.rpm
             quark-macos-aarch64
             quark-chat-macos-aarch64
             quark-code-macos-aarch64
