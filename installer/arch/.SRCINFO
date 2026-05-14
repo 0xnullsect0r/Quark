@@ -18,6 +18,7 @@ pkgbase = quark-git
 	provides = quark-code
 	conflicts = quark
 	conflicts = quark-bin
+	options = !lto
 	source = quark::git+https://github.com/0xnullsect0r/Quark.git
 	sha256sums = SKIP
 
