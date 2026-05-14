@@ -122,7 +122,14 @@ impl Default for DatasetPanel {
             .iter()
             .enumerate()
             .filter(|(_, d)| {
-                matches!(d.id, "github_code" | "wikipedia_en" | "ultrachat" | "openhermes")
+                matches!(
+                    d.id,
+                    "github_code"
+                        | "wikipedia_en"
+                        | "scientific_papers"
+                        | "ultrachat"
+                        | "openhermes"
+                )
             })
             .map(|(i, _)| i)
             .collect();
