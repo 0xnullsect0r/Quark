@@ -1,0 +1,19 @@
+fn main() {
+    let version = git_tag_version().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    println!("cargo:rustc-env=QUARK_VERSION={version}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+}
+
+fn git_tag_version() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["describe", "--tags", "--abbrev=0"])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let tag = String::from_utf8(out.stdout).ok()?;
+        Some(tag.trim().trim_start_matches('v').to_string())
+    } else {
+        None
+    }
+}

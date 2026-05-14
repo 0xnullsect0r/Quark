@@ -5,7 +5,9 @@
 set -euo pipefail
 
 APP_NAME="Quark"
-VERSION="0.1.0"
+# Prefer the VERSION env var (set by CI from the git tag), then fall back to
+# git describe so local builds also pick up the correct version.
+VERSION="${VERSION:-$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")}"
 BUNDLE_ID="com.quark.lm"
 TARGET_DIR="target/release"
 APP_DIR="dist/${APP_NAME}.app"

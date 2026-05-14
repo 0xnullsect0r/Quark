@@ -1,9 +1,13 @@
 ; Quark LLM — Windows NSIS Installer
 ; Requires NSIS 3.x  (https://nsis.sourceforge.io)
 ; Build with: makensis installer/windows/quark.nsi
+; Override version: makensis /DAPP_VERSION=1.2.3 installer/windows/quark.nsi
 
 !define APP_NAME      "Quark"
-!define APP_VERSION   "0.1.0"
+; APP_VERSION can be overridden on the makensis command line with /DAPP_VERSION=X.Y.Z
+!ifndef APP_VERSION
+  !define APP_VERSION "0.1.0"
+!endif
 !define APP_PUBLISHER "Quark Contributors"
 !define APP_URL       "https://github.com/0xnullsect0r/Quark"
 !define APP_EXE       "quark.exe"

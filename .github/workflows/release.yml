@@ -11,6 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed so git describe can find tags
+
+      - name: Set VERSION from tag
+        run: echo "VERSION=$(echo '${{ github.ref_name }}' | sed 's/^v//')" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -90,6 +95,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set VERSION from tag
+        run: echo "VERSION=$(echo '${{ github.ref_name }}' | sed 's/^v//')" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -146,6 +156,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set VERSION from tag
+        shell: pwsh
+        run: |
+          $ver = '${{ github.ref_name }}' -replace '^v', ''
+          echo "VERSION=$ver" >> $env:GITHUB_ENV
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -176,7 +194,7 @@ jobs:
         run: |
           choco install nsis -y --no-progress
           $env:PATH = "$env:PATH;C:\Program Files (x86)\NSIS"
-          & "C:\Program Files (x86)\NSIS\makensis.exe" installer/windows/quark.nsi
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /DAPP_VERSION=$env:VERSION installer/windows/quark.nsi
 
       - name: Upload Windows installer
         if: runner.os == 'Windows'

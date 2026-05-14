@@ -15,7 +15,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Quark LLM Builder")
+            .with_title(format!("Quark LLM Builder v{}", env!("QUARK_VERSION")))
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
