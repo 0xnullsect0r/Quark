@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Quark LLM
+GenericName=LLM Trainer
+Comment=Train and run your own Llama 4-style MoE coding LLM
+Exec=quark %u
+Icon=quark
+Terminal=false
+Categories=Development;Science;ArtificialIntelligence;
+Keywords=llm;ai;ml;training;coding;transformer;
+StartupNotify=true
