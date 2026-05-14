@@ -105,8 +105,9 @@ pub struct DatasetPanel {
     // ── Pile section ──────────────────────────────────────────────────────
     pile_enabled: bool,
     pile_config: PileConfig,
-    /// Selected component index into pile_components().
-    pile_component_idx: usize,
+    /// Indices into `pile_components()` that are currently checked.
+    /// Empty means "nothing selected yet"; a full set means all components.
+    pile_selected: std::collections::HashSet<usize>,
     pile_state: PileState,
     /// Whether to auto-scroll the log.
     pile_log_autoscroll: bool,
@@ -122,7 +123,7 @@ impl Default for DatasetPanel {
             status: String::new(),
             pile_enabled: false,
             pile_config: PileConfig::default(),
-            pile_component_idx: 0,
+            pile_selected: std::collections::HashSet::new(),
             pile_state: PileState::default(),
             pile_log_autoscroll: true,
         }
@@ -302,7 +303,7 @@ impl DatasetPanel {
                         egui::TextEdit::singleline(&mut dir_edit).desired_width(300.0),
                     );
                     if resp.changed() {
-                        self.pile_config.target_dir = PathBuf::from(&dir_edit);
+                        self.pile_config.target_dir = std::path::PathBuf::from(&dir_edit);
                     }
                     if ui.add_enabled(!running, egui::Button::new("📁")).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
@@ -324,22 +325,6 @@ impl DatasetPanel {
                 );
                 ui.end_row();
 
-                // Component selector
-                ui.label("Component:");
-                egui::ComboBox::from_id_salt("pile_component")
-                    .selected_text(components[self.pile_component_idx].label)
-                    .width(300.0)
-                    .show_ui(ui, |ui| {
-                        for (i, c) in components.iter().enumerate() {
-                            let label = format!(
-                                "{} ({:.0} GiB)",
-                                c.label, c.approx_size_gib
-                            );
-                            ui.selectable_value(&mut self.pile_component_idx, i, label);
-                        }
-                    });
-                ui.end_row();
-
                 // Interleave output
                 ui.label("Interleave output files:");
                 ui.add_enabled(
@@ -359,18 +344,98 @@ impl DatasetPanel {
                 ui.end_row();
             });
 
+        ui.add_space(8.0);
+
+        // ── Component checkboxes ──────────────────────────────────────────
+        ui.label(egui::RichText::new("Components to download:").strong());
+        ui.add_space(2.0);
+
+        // "Select All / None" helper row
+        let all_selected = self.pile_selected.len() == components.len();
+        let none_selected = self.pile_selected.is_empty();
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!running && !all_selected, egui::Button::new("Select All")).clicked() {
+                self.pile_selected = (0..components.len()).collect();
+            }
+            if ui.add_enabled(!running && !none_selected, egui::Button::new("Select None")).clicked() {
+                self.pile_selected.clear();
+            }
+            // Show total selected size
+            let total_gib: f32 = self
+                .pile_selected
+                .iter()
+                .map(|&i| components[i].approx_size_gib)
+                .sum();
+            if !self.pile_selected.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("≈ {total_gib:.0} GiB selected"))
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+        ui.add_space(4.0);
+
+        // Scrollable checkbox grid — two columns
+        egui::ScrollArea::vertical()
+            .id_salt("pile_components")
+            .max_height(220.0)
+            .show(ui, |ui| {
+                egui::Grid::new("pile_component_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        for (i, comp) in components.iter().enumerate() {
+                            let mut checked = self.pile_selected.contains(&i);
+                            let label = format!(
+                                "{} ({:.0} GiB)",
+                                comp.label, comp.approx_size_gib
+                            );
+                            if ui
+                                .add_enabled(!running, egui::Checkbox::new(&mut checked, label))
+                                .changed()
+                            {
+                                if checked {
+                                    self.pile_selected.insert(i);
+                                } else {
+                                    self.pile_selected.remove(&i);
+                                }
+                            }
+                            // Two columns per row
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
+                        // Close last row if odd number of components
+                        if components.len() % 2 == 1 {
+                            ui.end_row();
+                        }
+                    });
+            });
+
         ui.add_space(6.0);
 
-        // Size warning
-        let sel = &components[self.pile_component_idx];
-        ui.label(
-            egui::RichText::new(format!(
-                "⚠  Approximate download size: {:.0} GiB.  Ensure sufficient disk space.",
-                sel.approx_size_gib
-            ))
-            .color(egui::Color32::YELLOW)
-            .small(),
-        );
+        // Size / selection warning
+        if self.pile_selected.is_empty() {
+            ui.label(
+                egui::RichText::new("⚠  No components selected. Select at least one to build.")
+                    .color(egui::Color32::YELLOW)
+                    .small(),
+            );
+        } else {
+            let total_gib: f32 = self
+                .pile_selected
+                .iter()
+                .map(|&i| components[i].approx_size_gib)
+                .sum();
+            ui.label(
+                egui::RichText::new(format!(
+                    "⚠  Approximate download: {total_gib:.0} GiB.  Ensure sufficient disk space."
+                ))
+                .color(egui::Color32::YELLOW)
+                .small(),
+            );
+        }
 
         ui.add_space(6.0);
 
@@ -390,9 +455,16 @@ impl DatasetPanel {
                 } else {
                     "▶ Start Build"
                 };
-                if ui.button(label).clicked() {
+                let can_start = !self.pile_selected.is_empty();
+                if ui.add_enabled(can_start, egui::Button::new(label)).clicked() {
                     let mut cfg = self.pile_config.clone();
-                    cfg.component = components[self.pile_component_idx].id.to_owned();
+                    // Collect selected component ids in a stable order.
+                    let mut sorted: Vec<usize> = self.pile_selected.iter().copied().collect();
+                    sorted.sort_unstable();
+                    cfg.components = sorted
+                        .iter()
+                        .map(|&i| components[i].id.to_owned())
+                        .collect();
                     self.pile_state.start(cfg);
                 }
             }

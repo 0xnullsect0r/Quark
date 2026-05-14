@@ -39,9 +39,11 @@ pub struct PileConfig {
     pub target_dir: PathBuf,
     /// Python executable to use (`"python3"`, `"python"`, …).
     pub python_cmd: String,
-    /// Value passed to `pile.py --using` (e.g. `"pile_reprod"` for the full
-    /// pile, or a single component id).
-    pub component: String,
+    /// One or more component ids passed to `pile.py --using`.
+    /// Use `["pile_reprod"]` to download the full Pile in a single pass.
+    /// Specify individual component ids to download a subset; the pipeline
+    /// will invoke `pile.py` once per component in sequence.
+    pub components: Vec<String>,
     /// `--interleave_output` argument (default 30).
     pub interleave_output: u32,
     /// If `true`, skip the `git clone` step when the repo directory already
@@ -54,7 +56,7 @@ impl Default for PileConfig {
         Self {
             target_dir: crate::paths::app_data_dir(),
             python_cmd: detect_python(),
-            component: "pile_reprod".into(),
+            components: vec!["pile_reprod".into()],
             interleave_output: 30,
             skip_clone_if_exists: true,
         }
@@ -185,10 +187,35 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
         log!("✔  Repository cloned.");
     }
 
-    // ── 3. Install Python deps ────────────────────────────────────────────
+    // ── 3. Create / reuse virtual environment ────────────────────────────
+    let venv_dir = cfg.target_dir.join("pile-venv");
+    #[cfg(target_os = "windows")]
+    let venv_python = venv_dir.join("Scripts").join("python.exe");
+    #[cfg(not(target_os = "windows"))]
+    let venv_python = venv_dir.join("bin").join("python");
+
+    if venv_dir.exists() {
+        log!("ℹ  Virtual environment already at {}; reusing.", venv_dir.display());
+    } else {
+        phase!(0.10, "Creating Python virtual environment…");
+        log!("Creating venv at {} …", venv_dir.display());
+        let ok = stream_command(
+            Command::new(&cfg.python_cmd).args(["-m", "venv", venv_dir.to_str().unwrap_or("pile-venv")]),
+            &tx,
+            0.10,
+            0.12,
+        );
+        if !ok {
+            bail!("python -m venv failed — see log above.");
+        }
+        log!("✔  Virtual environment created.");
+    }
+
+    // ── 4. Install Python deps into the venv ─────────────────────────────
     phase!(0.12, "Installing Python dependencies (pip install -e .)…");
+    log!("Using venv Python: {}", venv_python.display());
     let ok = stream_command(
-        Command::new(&cfg.python_cmd)
+        Command::new(&venv_python)
             .args(["-m", "pip", "install", "-e", "."])
             .current_dir(&repo_dir),
         &tx,
@@ -200,32 +227,62 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
     }
     log!("✔  Python dependencies installed.");
 
-    // ── 4. Download / generate pile ───────────────────────────────────────
-    phase!(0.20, "Downloading & building The Pile — this can take many hours…");
-    log!(
-        "Running: {} the_pile/pile.py --interleave_output {} --using {}",
-        cfg.python_cmd,
-        cfg.interleave_output,
-        cfg.component,
-    );
-    log!("⚠  The full Pile is ~825 GiB compressed. Make sure you have enough disk space.");
+    // ── 4. Download / generate pile components ────────────────────────────
+    let components = if cfg.components.is_empty() {
+        vec!["pile_reprod".to_owned()]
+    } else {
+        cfg.components.clone()
+    };
+    let n_components = components.len();
 
-    let ok = stream_command(
-        Command::new(&cfg.python_cmd)
-            .args([
-                "the_pile/pile.py",
-                "--interleave_output",
-                &cfg.interleave_output.to_string(),
-                "--using",
-                &cfg.component,
-            ])
-            .current_dir(&repo_dir),
-        &tx,
-        0.20,
-        0.90,
-    );
-    if !ok {
-        bail!("pile.py failed — see log above.");
+    // Divide the 0.20 → 0.90 band evenly across each component.
+    let band_start = 0.20_f32;
+    let band_end = 0.90_f32;
+    let band = band_end - band_start;
+    let step = band / n_components as f32;
+
+    for (idx, component) in components.iter().enumerate() {
+        let p_start = band_start + idx as f32 * step;
+        let p_end = p_start + step;
+
+        if n_components > 1 {
+            phase!(
+                p_start,
+                "Downloading component {}/{}: {}…",
+                idx + 1,
+                n_components,
+                component
+            );
+        } else {
+            phase!(p_start, "Downloading & building The Pile — this can take many hours…");
+        }
+
+        log!(
+            "Running: {} the_pile/pile.py --interleave_output {} --using {}",
+            venv_python.display(), cfg.interleave_output, component,
+        );
+        if component == "pile_reprod" {
+            log!("⚠  The full Pile is ~825 GiB compressed. Make sure you have enough disk space.");
+        }
+
+        let ok = stream_command(
+            Command::new(&venv_python)
+                .args([
+                    "the_pile/pile.py",
+                    "--interleave_output",
+                    &cfg.interleave_output.to_string(),
+                    "--using",
+                    component,
+                ])
+                .current_dir(&repo_dir),
+            &tx,
+            p_start,
+            p_end,
+        );
+        if !ok {
+            bail!("pile.py failed for component '{}' — see log above.", component);
+        }
+        log!("✔  Component '{}' complete ({}/{}).", component, idx + 1, n_components);
     }
     log!("✔  Pile data generation complete.");
 
@@ -233,9 +290,9 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
     let pass2 = repo_dir.join("processing_scripts").join("pass2.py");
     if pass2.exists() {
         phase!(0.90, "Running pass-2 shuffle script…");
-        log!("Running: {} {}", cfg.python_cmd, pass2.display());
+        log!("Running: {} {}", venv_python.display(), pass2.display());
         let ok = stream_command(
-            Command::new(&cfg.python_cmd)
+            Command::new(&venv_python)
                 .arg(&pass2)
                 .current_dir(&repo_dir),
             &tx,
