@@ -1,13 +1,13 @@
 # Maintainer: Quark Contributors <https://github.com/0xnullsect0r/Quark>
 pkgname=quark-git
-pkgver=1.0.8.r0.gebf858f  # replaced at build time by pkgver()
+pkgver=1.0.9.r1.g523d390  # replaced at build time by pkgver()
 pkgrel=1
 pkgdesc="Train and run your own Llama 4-style MoE coding LLM on your own hardware"
 arch=('x86_64')
 url="https://github.com/0xnullsect0r/Quark"
 license=('MIT')
 depends=('gtk3' 'openssl' 'hicolor-icon-theme')
-makedepends=('git' 'rust' 'cargo' 'gcc')
+makedepends=('git' 'rust' 'cargo')
 optdepends=(
   'cuda: NVIDIA GPU acceleration'
 )
@@ -36,14 +36,18 @@ build() {
   cd "$srcdir/quark"
   # ring 0.17 ships hand-written C/ASM that ring's build.rs compiles via the
   # `cc` crate.  If CFLAGS contain -flto (injected by Arch's system LTO even
-  # after options=('!lto') as a safety net), the resulting objects are LTO
-  # bitcode and the linker cannot resolve ring's symbols at final link time.
+  # after options=('!lto') as a safety net), the resulting objects are GCC LTO
+  # bitcode which neither gcc nor rust-lld can resolve at final link time.
   # Strip any remaining -flto flags from the C/C++ compiler flags.
   export CFLAGS="$(echo "${CFLAGS:-}" | sed 's/-flto[^ ]*//g; s/  */ /g; s/^ //; s/ $//')"
   export CXXFLAGS="$(echo "${CXXFLAGS:-}" | sed 's/-flto[^ ]*//g; s/  */ /g; s/^ //; s/ $//')"
-  # Use the gcc linker (not rust-lld which can't handle ring's asm objects) and
-  # explicitly disable Rust LTO as belt-and-suspenders.
-  export RUSTFLAGS="-C linker=gcc -C lto=off"
+  # Disable Rust LTO explicitly.  We deliberately do NOT override the linker:
+  # the default rust-lld can handle both the regular GCC objects produced by
+  # ring's build.rs (now that -flto is stripped) and any LLVM-bitcode .rlib
+  # files that may be cached from a previous build.  Forcing -C linker=gcc
+  # causes gcc to fail on LLVM-bitcode .rlib files with "file format not
+  # recognised".
+  export RUSTFLAGS="-C lto=off"
   # Use the CPU backend; the cuda feature requires the CUDA toolkit at
   # build time (available on machines with an NVIDIA GPU + drivers).
   cargo build --release --workspace --features backend-cpu
