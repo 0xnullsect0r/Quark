@@ -514,14 +514,21 @@ impl DatasetPanel {
 
         // ── Scrolling log ─────────────────────────────────────────────────
         if !self.pile_state.log.is_empty() || running {
-            ui.label(
-                egui::RichText::new(format!(
-                    "Build log ({} lines):",
-                    self.pile_state.log.len()
-                ))
-                .small()
-                .weak(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Build log ({} lines):",
+                        self.pile_state.log.len()
+                    ))
+                    .small()
+                    .weak(),
+                );
+                // Copy All button — puts the full log on the clipboard.
+                if ui.small_button("📋 Copy All").on_hover_text("Copy entire log to clipboard").clicked() {
+                    let full = self.pile_state.log.join("\n");
+                    ui.ctx().copy_text(full);
+                }
+            });
 
             let log_ref = &self.pile_state.log;
             let autoscroll = self.pile_log_autoscroll;
@@ -552,19 +559,26 @@ impl DatasetPanel {
                             } else {
                                 egui::Color32::from_rgb(200, 200, 200)
                             };
-                            ui.label(
-                                egui::RichText::new(line)
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(color),
+                            // selectable(true) lets the user drag-select and Ctrl+C any portion.
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(color),
+                                )
+                                .selectable(true),
                             );
                         }
                         if running {
-                            ui.label(
-                                egui::RichText::new("▋")
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(egui::Color32::LIGHT_GRAY),
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new("▋")
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(egui::Color32::LIGHT_GRAY),
+                                )
+                                .selectable(false),
                             );
                         }
                     });
