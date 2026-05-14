@@ -213,7 +213,7 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
 
     // Track whether deps have already been installed so re-runs are fast.
     // Bump this string whenever the required Python deps change.
-    const DEPS_VERSION: &str = "v3"; // added pytablewriter
+    const DEPS_VERSION: &str = "v4"; // dynamic requirements-dev.txt install
     let deps_stamp = venv_dir.join(".quark-deps-installed");
 
     // ── 4. Install Python deps into the venv ─────────────────────────────
@@ -237,31 +237,110 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
         }
         log!("✔  Base Python dependencies installed.");
 
-        // The Pile imports fasttext unconditionally but doesn't list it as a dep.
-        // Try fasttext from PyPI first; if the C++ extension fails to compile
-        // (common on Python 3.13+ / new g++ versions), fall back to a pure-Python
-        // stub that always predicts English — enough for downloading data.
-        phase!(0.16, "Installing fasttext + supplemental dependencies…");
-        log!("pip install fasttext zstandard datasets pytablewriter …");
-        let fasttext_ok = stream_command(
+        // Build the supplemental package list dynamically:
+        //   1. Read the-pile's requirements-dev.txt (the authoritative upstream list).
+        //   2. Skip packages that are system tools or managed externally.
+        //   3. Add extras that the-pile uses but doesn't list in requirements-dev.txt.
+        //   4. Remove fasttext — handled separately below (needs stub fallback on Python 3.13+).
+        //
+        // This way any new dep the-pile adds to requirements-dev.txt is automatically
+        // installed on the next run without requiring a Quark code change.
+        let skip_packages: &[&str] = &[
+            "gsutil",     // Google Cloud Storage CLI — not needed inside our venv
+            "virtualenv", // we already manage the venv ourselves
+        ];
+        let extras: &[&str] = &[
+            "zstandard",  // used by Quark's own pile streaming, not in requirements-dev.txt
+            "datasets",   // HuggingFace datasets API
+            "jsonlines",  // some pile datasets use jsonlines directly
+            "parse",      // text parsing helpers used by the-pile utilities
+        ];
+
+        let req_file = repo_dir.join("requirements-dev.txt");
+        let mut supp_packages: Vec<String> = if req_file.exists() {
+            match std::fs::read_to_string(&req_file) {
+                Ok(contents) => {
+                    log!("ℹ  Reading supplemental deps from {}.", req_file.display());
+                    contents
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .filter(|pkg| {
+                            let lower = pkg.to_lowercase();
+                            !skip_packages.iter().any(|s| lower.starts_with(s))
+                        })
+                        .collect()
+                }
+                Err(e) => {
+                    log!("⚠  Could not read requirements-dev.txt ({e}); using fallback list.");
+                    vec![
+                        "lm_dataformat".into(), "tqdm".into(), "gdown".into(),
+                        "concurrent_iterator".into(), "pytablewriter".into(),
+                        "gitpython".into(), "best-download".into(),
+                    ]
+                }
+            }
+        } else {
+            log!("⚠  requirements-dev.txt not found; using fallback list.");
+            vec![
+                "lm_dataformat".into(), "tqdm".into(), "gdown".into(),
+                "concurrent_iterator".into(), "pytablewriter".into(),
+                "gitpython".into(), "best-download".into(),
+            ]
+        };
+
+        // Add extras not already in the list.
+        for extra in extras {
+            let name = extra.to_lowercase().replace('-', "_");
+            if !supp_packages.iter().any(|p| p.to_lowercase().replace('-', "_") == name) {
+                supp_packages.push(extra.to_string());
+            }
+        }
+
+        // Fasttext is in requirements-dev.txt but needs its own install + stub fallback.
+        supp_packages.retain(|p| p.to_lowercase() != "fasttext");
+
+        // Install all supplemental packages in one pip call.
+        phase!(0.16, "Installing supplemental dependencies…");
+        let pkg_list = supp_packages.join(" ");
+        log!("pip install {pkg_list} …");
+        let mut pip_args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
+        pip_args.extend(supp_packages.iter().cloned());
+        let supp_ok = stream_command(
             Command::new(&venv_python)
-                .args(["-m", "pip", "install", "fasttext", "zstandard", "datasets", "pytablewriter"])
+                .args(&pip_args)
                 .current_dir(&repo_dir),
             &tx,
             0.16,
             0.19,
         );
+        if supp_ok {
+            log!("✔  Supplemental dependencies installed.");
+        } else {
+            log!("⚠  Some supplemental deps failed; some components may not work.");
+        }
+
+        // ── Fasttext: try real build first; fall back to pure-Python stub ──
+        // fasttext ships hand-written C++ that fails to compile on Python 3.13+
+        // with newer g++ versions. The stub returns __label__en always, which
+        // disables language filtering but does not block data downloading.
+        phase!(0.19, "Installing fasttext (C++ build; may take a moment)…");
+        log!("pip install fasttext …");
+        let fasttext_ok = stream_command(
+            Command::new(&venv_python)
+                .args(["-m", "pip", "install", "fasttext"])
+                .current_dir(&repo_dir),
+            &tx,
+            0.19,
+            0.20,
+        );
         if fasttext_ok {
-            log!("✔  fasttext + supplemental dependencies installed.");
+            log!("✔  fasttext installed.");
         } else {
             log!("⚠  fasttext pip install failed (likely C++ build error on Python 3.13+).");
             log!("ℹ  Writing pure-Python fasttext stub — language filtering disabled, download unaffected.");
-            // Locate site-packages inside the venv.
             let site_packages = find_venv_site_packages(&venv_dir);
             let stub = site_packages.join("fasttext.py");
-            // Stub implements only what pile.py uses: load_model() + predict().
-            // Returning __label__en / 1.0 disables language filtering so all
-            // text passes through — the only effect is no lang-ID filtering.
             let stub_src = "\
 # Auto-generated by Quark: pure-Python fasttext stub.\n\
 # The real fasttext C extension could not be compiled on this Python version.\n\
@@ -276,22 +355,6 @@ def load_model(path):\n\
             match std::fs::write(&stub, stub_src) {
                 Ok(_) => { log!("✔  fasttext stub written to {}.", stub.display()); }
                 Err(e) => { log!("⚠  Could not write fasttext stub: {e}"); }
-            }
-
-            // Still install zstandard + datasets (pure Python / has wheels).
-            log!("pip install zstandard datasets pytablewriter …");
-            let ok2 = stream_command(
-                Command::new(&venv_python)
-                    .args(["-m", "pip", "install", "zstandard", "datasets", "pytablewriter"])
-                    .current_dir(&repo_dir),
-                &tx,
-                0.19,
-                0.20,
-            );
-            if ok2 {
-                log!("✔  zstandard + datasets installed.");
-            } else {
-                log!("⚠  zstandard/datasets install failed; some components may not work.");
             }
         }
 
