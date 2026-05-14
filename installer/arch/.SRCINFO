@@ -8,6 +8,7 @@ pkgbase = quark-git
 	makedepends = git
 	makedepends = rust
 	makedepends = cargo
+	makedepends = gcc
 	depends = gtk3
 	depends = openssl
 	depends = hicolor-icon-theme
