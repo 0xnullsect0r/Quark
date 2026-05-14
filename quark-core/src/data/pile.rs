@@ -212,10 +212,14 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
     }
 
     // Track whether deps have already been installed so re-runs are fast.
+    // Bump this string whenever the required Python deps change.
+    const DEPS_VERSION: &str = "v3"; // added pytablewriter
     let deps_stamp = venv_dir.join(".quark-deps-installed");
 
     // ── 4. Install Python deps into the venv ─────────────────────────────
-    if deps_stamp.exists() {
+    let stamp_ok = deps_stamp.exists()
+        && std::fs::read_to_string(&deps_stamp).unwrap_or_default().trim() == DEPS_VERSION;
+    if stamp_ok {
         log!("ℹ  Dependencies already installed ({}); skipping.", deps_stamp.display());
     } else {
         phase!(0.12, "Installing Python dependencies (pip install -e .)…");
@@ -238,10 +242,10 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
         // (common on Python 3.13+ / new g++ versions), fall back to a pure-Python
         // stub that always predicts English — enough for downloading data.
         phase!(0.16, "Installing fasttext + supplemental dependencies…");
-        log!("pip install fasttext zstandard datasets …");
+        log!("pip install fasttext zstandard datasets pytablewriter …");
         let fasttext_ok = stream_command(
             Command::new(&venv_python)
-                .args(["-m", "pip", "install", "fasttext", "zstandard", "datasets"])
+                .args(["-m", "pip", "install", "fasttext", "zstandard", "datasets", "pytablewriter"])
                 .current_dir(&repo_dir),
             &tx,
             0.16,
@@ -275,10 +279,10 @@ def load_model(path):\n\
             }
 
             // Still install zstandard + datasets (pure Python / has wheels).
-            log!("pip install zstandard datasets …");
+            log!("pip install zstandard datasets pytablewriter …");
             let ok2 = stream_command(
                 Command::new(&venv_python)
-                    .args(["-m", "pip", "install", "zstandard", "datasets"])
+                    .args(["-m", "pip", "install", "zstandard", "datasets", "pytablewriter"])
                     .current_dir(&repo_dir),
                 &tx,
                 0.19,
@@ -292,7 +296,7 @@ def load_model(path):\n\
         }
 
         // Write the stamp so subsequent runs skip reinstallation.
-        let _ = std::fs::write(&deps_stamp, "ok");
+        let _ = std::fs::write(&deps_stamp, DEPS_VERSION);
     }
 
     // ── 4. Download / generate pile components ────────────────────────────
