@@ -22,6 +22,14 @@ struct HfState {
     log: Vec<String>,
     progress: f32,
     phase: String,
+    /// Download speed in bytes/s (from SPEED: protocol line).
+    speed_bps: f32,
+    /// Cumulative bytes downloaded.
+    bytes_downloaded: u64,
+    /// Estimated total bytes across all shards.
+    bytes_total: u64,
+    /// Basename of the file currently being downloaded.
+    current_file: String,
     is_running: bool,
     finished: bool,
     error: Option<String>,
@@ -36,6 +44,10 @@ impl Default for HfState {
             log: Vec::new(),
             progress: 0.0,
             phase: String::new(),
+            speed_bps: 0.0,
+            bytes_downloaded: 0,
+            bytes_total: 0,
+            current_file: String::new(),
             is_running: false,
             finished: false,
             error: None,
@@ -63,13 +75,23 @@ impl HfState {
                         }
                         HfMessage::Progress(p) => self.progress = p,
                         HfMessage::Phase(s) => self.phase = s,
+                        HfMessage::Speed(bps) => self.speed_bps = bps,
+                        HfMessage::ByteProgress { downloaded, total } => {
+                            self.bytes_downloaded = downloaded;
+                            if total > 0 {
+                                self.bytes_total = total;
+                            }
+                        }
+                        HfMessage::CurrentFile(f) => self.current_file = f,
                         HfMessage::Done => {
                             self.is_running = false;
                             self.finished = true;
+                            self.speed_bps = 0.0;
                         }
                         HfMessage::Error(e) => {
                             self.is_running = false;
                             self.error = Some(e);
+                            self.speed_bps = 0.0;
                         }
                     }
                 }
@@ -88,6 +110,10 @@ impl HfState {
         self.log.clear();
         self.progress = 0.0;
         self.phase = "Starting…".into();
+        self.speed_bps = 0.0;
+        self.bytes_downloaded = 0;
+        self.bytes_total = 0;
+        self.current_file = String::new();
         self.error = None;
         self.finished = false;
         self.is_running = true;
@@ -376,6 +402,28 @@ impl DatasetPanel {
                     );
                 });
                 ui.end_row();
+
+                // Parallel workers (download accelerator)
+                ui.label("Parallel connections:");
+                ui.horizontal(|ui| {
+                    let mut w = self.hf_config.parallel_workers as u32;
+                    ui.add_enabled(
+                        !running,
+                        egui::Slider::new(&mut w, 1u32..=20)
+                            .suffix(" workers")
+                            .step_by(1.0),
+                    );
+                    self.hf_config.parallel_workers = w as u8;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "splits each file into {} chunks downloaded simultaneously",
+                            self.hf_config.parallel_workers
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                });
+                ui.end_row();
             });
 
         ui.add_space(8.0);
@@ -550,10 +598,75 @@ impl DatasetPanel {
                         self.hf_state.phase,
                     )),
             );
+
+            // ── Speed / bytes / ETA / current file ────────────────────────
+            if running || self.hf_state.bytes_downloaded > 0 {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    // Speed badge
+                    let speed = self.hf_state.speed_bps;
+                    let speed_color = if speed >= 5.0 * 1024.0 * 1024.0 {
+                        egui::Color32::from_rgb(80, 220, 80)
+                    } else if speed >= 1024.0 * 1024.0 {
+                        egui::Color32::YELLOW
+                    } else {
+                        egui::Color32::from_rgb(255, 140, 0)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("⬇ {}", fmt_speed(speed)))
+                            .monospace()
+                            .strong()
+                            .color(speed_color),
+                    );
+
+                    ui.separator();
+
+                    // Bytes counter
+                    let dl = self.hf_state.bytes_downloaded;
+                    let tot = self.hf_state.bytes_total;
+                    if tot > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} / {}",
+                                fmt_bytes(dl),
+                                fmt_bytes(tot)
+                            ))
+                            .monospace(),
+                        );
+
+                        // ETA
+                        if speed > 0.0 && dl < tot {
+                            let remaining = (tot - dl) as f32;
+                            let eta_secs = remaining / speed;
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!("ETA: {}", fmt_eta(eta_secs)))
+                                    .weak(),
+                            );
+                        }
+                    } else if dl > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("{} downloaded", fmt_bytes(dl)))
+                                .monospace(),
+                        );
+                    }
+
+                    // Current file
+                    if running && !self.hf_state.current_file.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("📄 {}", self.hf_state.current_file))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+            }
+
             ui.add_space(4.0);
         } else {
             ui.label(
-                egui::RichText::new("Press ▶ Start Download to begin streaming datasets.")
+                egui::RichText::new("Press ▶ Start Download to begin.")
                     .weak()
                     .italics(),
             );
@@ -709,4 +822,24 @@ fn fmt_bytes(b: u64) -> String {
         (b as f64 / 1024.0, "KiB")
     };
     format!("{val:.1} {unit}")
+}
+
+fn fmt_speed(bps: f32) -> String {
+    if bps >= 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", bps / (1024.0 * 1024.0))
+    } else if bps >= 1024.0 {
+        format!("{:.0} KB/s", bps / 1024.0)
+    } else {
+        format!("{bps:.0} B/s")
+    }
+}
+
+fn fmt_eta(secs: f32) -> String {
+    if secs > 3600.0 {
+        format!("~{:.0}h {:.0}m", secs / 3600.0, (secs % 3600.0) / 60.0)
+    } else if secs > 60.0 {
+        format!("~{:.0}m {:.0}s", secs / 60.0, secs % 60.0)
+    } else {
+        format!("~{secs:.0}s")
+    }
 }

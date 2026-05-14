@@ -31,6 +31,12 @@ pub enum HfMessage {
     Progress(f32),
     /// Short description of the current phase for the status bar.
     Phase(String),
+    /// Current download speed in bytes per second.
+    Speed(f32),
+    /// Cumulative bytes downloaded and estimated total bytes.
+    ByteProgress { downloaded: u64, total: u64 },
+    /// Basename of the file currently being downloaded.
+    CurrentFile(String),
     /// All selected datasets downloaded successfully.
     Done,
     /// Download failed; contains a human-readable description.
@@ -266,6 +272,8 @@ pub struct HfConfig {
     pub selected_ids: Vec<String>,
     /// Maximum GB to download per dataset (0 = unlimited / stream cap).
     pub max_gb_per_dataset: f32,
+    /// Number of parallel HTTP connections per file (1–20, default 10).
+    pub parallel_workers: u8,
     /// Optional HuggingFace API token for gated datasets.
     /// Not persisted to disk.
     pub hf_token: String,
@@ -284,6 +292,7 @@ impl Default for HfConfig {
                 "openhermes".into(),
             ],
             max_gb_per_dataset: 10.0,
+            parallel_workers: 10,
             hf_token: String::new(),
         }
     }
@@ -470,6 +479,7 @@ fn run_pipeline(cfg: HfConfig, tx: Sender<HfMessage>) {
         if !cfg.hf_token.is_empty() {
             cmd.args(["--hf-token", &cfg.hf_token]);
         }
+        cmd.args(["--workers", &cfg.parallel_workers.to_string()]);
 
         let ok = stream_command(&mut cmd, &tx, p_start, p_end);
         if !ok {
@@ -518,6 +528,18 @@ fn stream_command(cmd: &mut Command, tx: &Sender<HfMessage>, p_start: f32, p_end
                 let mapped = p_start + p * (p_end - p_start);
                 let _ = tx.send(HfMessage::Progress(mapped));
             }
+        } else if let Some(rest) = line.strip_prefix("SPEED:") {
+            if let Ok(bps) = rest.trim().parse::<f32>() {
+                let _ = tx.send(HfMessage::Speed(bps));
+            }
+        } else if let Some(rest) = line.strip_prefix("BYTES:") {
+            if let Some((d, t)) = rest.trim().split_once('/') {
+                if let (Ok(dl), Ok(tot)) = (d.parse::<u64>(), t.parse::<u64>()) {
+                    let _ = tx.send(HfMessage::ByteProgress { downloaded: dl, total: tot });
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("FILE:") {
+            let _ = tx.send(HfMessage::CurrentFile(rest.trim().to_owned()));
         } else if let Some(rest) = line.strip_prefix("LOG:") {
             let _ = tx.send(HfMessage::Log(rest.to_owned()));
         } else if line.trim() == "DONE" {

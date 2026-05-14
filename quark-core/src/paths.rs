@@ -55,3 +55,8 @@ pub fn pile_data_dir() -> PathBuf {
 pub fn checkpoints_dir() -> PathBuf {
     app_data_dir().join("checkpoints")
 }
+
+/// Convenience: `<app_data_dir>/datasets` — where downloaded JSONL files live.
+pub fn datasets_dir() -> PathBuf {
+    app_data_dir().join("datasets")
+}
