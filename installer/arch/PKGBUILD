@@ -1,42 +1,45 @@
 # Maintainer: Quark Contributors <https://github.com/0xnullsect0r/Quark>
-pkgname=quark-bin
-pkgver=0  # replaced at build time by pkgver()
+pkgname=quark-git
+pkgver=r1.HEAD  # replaced at build time by pkgver()
 pkgrel=1
 pkgdesc="Train and run your own Llama 4-style MoE coding LLM on your own hardware"
 arch=('x86_64')
 url="https://github.com/0xnullsect0r/Quark"
 license=('MIT')
 depends=('gtk3' 'openssl' 'hicolor-icon-theme')
-makedepends=('curl')
+makedepends=('git' 'rust' 'cargo')
 optdepends=(
   'cuda: NVIDIA GPU acceleration'
 )
 provides=('quark' 'quark-chat' 'quark-code')
-conflicts=('quark')
-options=('!strip')  # pre-stripped release binary
+conflicts=('quark' 'quark-bin')
 
-# GitHub's /releases/latest/download/ always redirects to the newest release asset.
-source_x86_64=(
-  "quark::https://github.com/0xnullsect0r/Quark/releases/latest/download/quark-linux-amd64"
-  "quark-chat::https://github.com/0xnullsect0r/Quark/releases/latest/download/quark-chat-linux-amd64"
-  "quark-code::https://github.com/0xnullsect0r/Quark/releases/latest/download/quark-code-linux-amd64"
-)
-sha256sums_x86_64=('SKIP' 'SKIP' 'SKIP')
+source=("quark::git+https://github.com/0xnullsect0r/Quark.git")
+sha256sums=('SKIP')
 
-# Resolve the version from the GitHub redirect (no API token needed).
+# Use the latest git tag as version; fall back to commit count + hash.
 pkgver() {
-  curl -sI "https://github.com/0xnullsect0r/Quark/releases/latest" \
-    | grep -i "^location:" \
-    | sed 's|.*/v||; s/[[:space:]]//g; s/\r//'
+  cd "$srcdir/quark"
+  # If a vX.Y.Z tag exists on this commit, use it (strip the 'v' prefix).
+  git describe --long --tags 2>/dev/null \
+    | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g' \
+    || printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$srcdir/quark"
+  # Use the CPU backend; the cuda feature requires the CUDA toolkit at
+  # build time (available on machines with an NVIDIA GPU + drivers).
+  cargo build --release --workspace --features backend-cpu
 }
 
 package() {
-  cd "$srcdir"
+  cd "$srcdir/quark"
 
   # Binaries
-  install -Dm755 quark      "${pkgdir}/usr/bin/quark"
-  install -Dm755 quark-chat "${pkgdir}/usr/bin/quark-chat"
-  install -Dm755 quark-code "${pkgdir}/usr/bin/quark-code"
+  install -Dm755 target/release/quark      "${pkgdir}/usr/bin/quark"
+  install -Dm755 target/release/quark-chat "${pkgdir}/usr/bin/quark-chat"
+  install -Dm755 target/release/quark-code "${pkgdir}/usr/bin/quark-code"
 
   # Desktop entry
   install -Dm644 /dev/stdin "${pkgdir}/usr/share/applications/quark.desktop" << 'DESKTOP'
@@ -55,8 +58,12 @@ StartupNotify=true
 DESKTOP
 
   # License
-  install -Dm644 /dev/stdin "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" << 'MIT'
+  if [[ -f LICENSE ]]; then
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  else
+    install -Dm644 /dev/stdin "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" << 'MIT'
 MIT License — Copyright (c) 2025 Quark Contributors
 See https://github.com/0xnullsect0r/Quark/blob/main/LICENSE
 MIT
+  fi
 }
