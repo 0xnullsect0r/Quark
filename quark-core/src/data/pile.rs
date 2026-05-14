@@ -211,21 +211,52 @@ fn run_pipeline(cfg: PileConfig, tx: Sender<PileMessage>) {
         log!("✔  Virtual environment created.");
     }
 
+    // Track whether deps have already been installed so re-runs are fast.
+    let deps_stamp = venv_dir.join(".quark-deps-installed");
+
     // ── 4. Install Python deps into the venv ─────────────────────────────
-    phase!(0.12, "Installing Python dependencies (pip install -e .)…");
-    log!("Using venv Python: {}", venv_python.display());
-    let ok = stream_command(
-        Command::new(&venv_python)
-            .args(["-m", "pip", "install", "-e", "."])
-            .current_dir(&repo_dir),
-        &tx,
-        0.12,
-        0.20,
-    );
-    if !ok {
-        bail!("pip install failed — see log above.");
+    if deps_stamp.exists() {
+        log!("ℹ  Dependencies already installed ({}); skipping.", deps_stamp.display());
+    } else {
+        phase!(0.12, "Installing Python dependencies (pip install -e .)…");
+        log!("Using venv Python: {}", venv_python.display());
+        let ok = stream_command(
+            Command::new(&venv_python)
+                .args(["-m", "pip", "install", "-e", "."])
+                .current_dir(&repo_dir),
+            &tx,
+            0.12,
+            0.16,
+        );
+        if !ok {
+            bail!("pip install failed — see log above.");
+        }
+        log!("✔  Base Python dependencies installed.");
+
+        // The Pile imports fasttext unconditionally but doesn't list it in
+        // setup.py.  fasttext-wheel is a pre-built binary wheel that satisfies
+        // the import without needing a C++ compiler.  Also install zstandard
+        // and datasets which are needed by several components.
+        phase!(0.16, "Installing supplemental dependencies (fasttext-wheel, zstandard, datasets)…");
+        log!("pip install fasttext-wheel zstandard datasets …");
+        let ok = stream_command(
+            Command::new(&venv_python)
+                .args(["-m", "pip", "install", "fasttext-wheel", "zstandard", "datasets"])
+                .current_dir(&repo_dir),
+            &tx,
+            0.16,
+            0.20,
+        );
+        if !ok {
+            // Non-fatal: log a warning but carry on — some components may not need fasttext.
+            log!("⚠  Supplemental dep install returned non-zero; continuing (some components may fail).");
+        } else {
+            log!("✔  Supplemental dependencies installed.");
+        }
+
+        // Write the stamp so subsequent runs skip reinstallation.
+        let _ = std::fs::write(&deps_stamp, "ok");
     }
-    log!("✔  Python dependencies installed.");
 
     // ── 4. Download / generate pile components ────────────────────────────
     let components = if cfg.components.is_empty() {
