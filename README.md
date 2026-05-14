@@ -76,7 +76,11 @@ cd installer/arch
 makepkg -si
 ```
 
-> Once Quark is on the AUR, you can also use an AUR helper: `yay -S quark`
+`makepkg` will automatically resolve the **latest GitHub release** at build time — no
+manual version bumping required. The package is named `quark-bin` (AUR convention for
+pre-built binaries).
+
+> Once Quark is on the AUR, you can also use an AUR helper: `yay -S quark-bin`
 
 ### Linux — Raw binary
 
