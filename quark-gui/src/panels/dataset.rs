@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
-use quark_core::data::{pile_components, start_pile_build, PileConfig, PileMessage};
+use quark_core::data::{
+    detect_python, hf_datasets, start_hf_build, HfConfig, HfDataset, HfDatasetCategory,
+    HfMessage,
+};
 
 // ─── File list entry ──────────────────────────────────────────────────────────
 
@@ -12,9 +15,9 @@ struct FileEntry {
     size_bytes: u64,
 }
 
-// ─── Pile download state ──────────────────────────────────────────────────────
+// ─── HF download state ────────────────────────────────────────────────────────
 
-struct PileState {
+struct HfState {
     /// Received log lines (capped at MAX_LOG_LINES).
     log: Vec<String>,
     progress: f32,
@@ -22,12 +25,12 @@ struct PileState {
     is_running: bool,
     finished: bool,
     error: Option<String>,
-    receiver: Option<Receiver<PileMessage>>,
+    receiver: Option<Receiver<HfMessage>>,
 }
 
 const MAX_LOG_LINES: usize = 2000;
 
-impl Default for PileState {
+impl Default for HfState {
     fn default() -> Self {
         Self {
             log: Vec::new(),
@@ -41,7 +44,7 @@ impl Default for PileState {
     }
 }
 
-impl PileState {
+impl HfState {
     /// Drain the channel and update state.  Returns `true` if any message
     /// arrived (so the caller knows to request a repaint).
     fn poll(&mut self) -> bool {
@@ -52,19 +55,19 @@ impl PileState {
                 Ok(msg) => {
                     changed = true;
                     match msg {
-                        PileMessage::Log(s) => {
+                        HfMessage::Log(s) => {
                             self.log.push(s);
                             if self.log.len() > MAX_LOG_LINES {
                                 self.log.drain(0..MAX_LOG_LINES / 4);
                             }
                         }
-                        PileMessage::Progress(p) => self.progress = p,
-                        PileMessage::Phase(s) => self.phase = s,
-                        PileMessage::Done => {
+                        HfMessage::Progress(p) => self.progress = p,
+                        HfMessage::Phase(s) => self.phase = s,
+                        HfMessage::Done => {
                             self.is_running = false;
                             self.finished = true;
                         }
-                        PileMessage::Error(e) => {
+                        HfMessage::Error(e) => {
                             self.is_running = false;
                             self.error = Some(e);
                         }
@@ -81,14 +84,14 @@ impl PileState {
         changed
     }
 
-    fn start(&mut self, cfg: PileConfig) {
+    fn start(&mut self, cfg: HfConfig) {
         self.log.clear();
         self.progress = 0.0;
         self.phase = "Starting…".into();
         self.error = None;
         self.finished = false;
         self.is_running = true;
-        self.receiver = Some(start_pile_build(cfg));
+        self.receiver = Some(start_hf_build(cfg));
     }
 }
 
@@ -102,30 +105,38 @@ pub struct DatasetPanel {
     vocab_size_input: usize,
     status: String,
 
-    // ── Pile section ──────────────────────────────────────────────────────
-    pile_enabled: bool,
-    pile_config: PileConfig,
-    /// Indices into `pile_components()` that are currently checked.
-    /// Empty means "nothing selected yet"; a full set means all components.
-    pile_selected: std::collections::HashSet<usize>,
-    pile_state: PileState,
+    // ── HuggingFace datasets section ──────────────────────────────────────
+    hf_enabled: bool,
+    hf_config: HfConfig,
+    /// Indices into `hf_datasets()` that are currently checked.
+    hf_selected: std::collections::HashSet<usize>,
+    hf_state: HfState,
     /// Whether to auto-scroll the log.
-    pile_log_autoscroll: bool,
+    hf_log_autoscroll: bool,
 }
 
 impl Default for DatasetPanel {
     fn default() -> Self {
+        // Pre-select a reasonable starter set.
+        let defaults: std::collections::HashSet<usize> = hf_datasets()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| {
+                matches!(d.id, "github_code" | "wikipedia_en" | "ultrachat" | "openhermes")
+            })
+            .map(|(i, _)| i)
+            .collect();
         Self {
             files: vec![],
             max_seq_len: 2048,
             tokenizer_path: None,
             vocab_size_input: 32000,
             status: String::new(),
-            pile_enabled: false,
-            pile_config: PileConfig::default(),
-            pile_selected: std::collections::HashSet::new(),
-            pile_state: PileState::default(),
-            pile_log_autoscroll: true,
+            hf_enabled: false,
+            hf_config: HfConfig::default(),
+            hf_selected: defaults,
+            hf_state: HfState::default(),
+            hf_log_autoscroll: true,
         }
     }
 }
@@ -137,10 +148,10 @@ impl DatasetPanel {
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
-    /// Returns the Pile repo `the-pile/` directory if a successful build exists.
-    pub fn pile_output_dir(&self) -> Option<PathBuf> {
-        if self.pile_state.finished {
-            Some(self.pile_config.target_dir.join("the-pile"))
+    /// Returns the JSONL datasets directory if a successful download exists.
+    pub fn hf_output_dir(&self) -> Option<PathBuf> {
+        if self.hf_state.finished {
+            Some(self.hf_config.target_dir.join("datasets"))
         } else {
             None
         }
@@ -148,7 +159,7 @@ impl DatasetPanel {
 
     /// Must be called every frame so the live log updates.
     pub fn update(&mut self, ctx: &egui::Context) {
-        if self.pile_state.poll() {
+        if self.hf_state.poll() {
             ctx.request_repaint();
         }
     }
@@ -159,33 +170,33 @@ impl DatasetPanel {
 
         // ── Manual files ──────────────────────────────────────────────────
         egui::CollapsingHeader::new("📄 Manual Files")
-            .default_open(!self.pile_enabled)
+            .default_open(!self.hf_enabled)
             .show(ui, |ui| {
                 self.manual_files_ui(ui);
             });
 
         ui.add_space(8.0);
 
-        // ── The Pile ──────────────────────────────────────────────────────
+        // ── HuggingFace Datasets ──────────────────────────────────────────
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut self.pile_enabled, "📦 Use The Pile (EleutherAI)");
-            if self.pile_enabled {
+            ui.toggle_value(&mut self.hf_enabled, "🤗 HuggingFace Datasets");
+            if self.hf_enabled {
                 ui.label(
-                    egui::RichText::new("~825 GiB — requires Python 3 & git")
+                    egui::RichText::new("streams directly to JSONL — no full pre-download required")
                         .weak()
                         .small(),
                 );
             }
         });
 
-        if self.pile_enabled {
+        if self.hf_enabled {
             ui.add_space(4.0);
             egui::Frame::new()
                 .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
-                    self.pile_ui(ui);
+                    self.hf_ui(ui);
                 });
         }
 
@@ -282,35 +293,35 @@ impl DatasetPanel {
         }
     }
 
-    // ── The Pile sub-UI ───────────────────────────────────────────────────────
+    // ── HuggingFace datasets sub-UI ───────────────────────────────────────────
 
-    fn pile_ui(&mut self, ui: &mut egui::Ui) {
-        let running = self.pile_state.is_running;
-        let components = pile_components();
+    fn hf_ui(&mut self, ui: &mut egui::Ui) {
+        let running = self.hf_state.is_running;
+        let datasets = hf_datasets();
 
-        // ── Config row ────────────────────────────────────────────────────
-        egui::Grid::new("pile_cfg")
+        // ── Config grid ───────────────────────────────────────────────────
+        egui::Grid::new("hf_cfg")
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 // Target directory
                 ui.label("Data directory:");
                 ui.horizontal(|ui| {
-                    let dir_str = self.pile_config.target_dir.to_string_lossy().to_string();
+                    let dir_str = self.hf_config.target_dir.to_string_lossy().to_string();
                     let mut dir_edit = dir_str.clone();
                     let resp = ui.add_enabled(
                         !running,
                         egui::TextEdit::singleline(&mut dir_edit).desired_width(300.0),
                     );
                     if resp.changed() {
-                        self.pile_config.target_dir = std::path::PathBuf::from(&dir_edit);
+                        self.hf_config.target_dir = std::path::PathBuf::from(&dir_edit);
                     }
                     if ui.add_enabled(!running, egui::Button::new("📁")).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
                             .set_title("Select data directory")
                             .pick_folder()
                         {
-                            self.pile_config.target_dir = p;
+                            self.hf_config.target_dir = p;
                         }
                     }
                 });
@@ -320,120 +331,157 @@ impl DatasetPanel {
                 ui.label("Python command:");
                 ui.add_enabled(
                     !running,
-                    egui::TextEdit::singleline(&mut self.pile_config.python_cmd)
+                    egui::TextEdit::singleline(&mut self.hf_config.python_cmd)
                         .desired_width(160.0),
                 );
                 ui.end_row();
 
-                // Interleave output
-                ui.label("Interleave output files:");
-                ui.add_enabled(
-                    !running,
-                    egui::DragValue::new(&mut self.pile_config.interleave_output)
-                        .range(1u32..=128)
-                        .speed(1.0),
-                );
+                // Max GB per dataset
+                ui.label("Max GB per dataset:");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        !running,
+                        egui::Slider::new(&mut self.hf_config.max_gb_per_dataset, 0.0f32..=200.0)
+                            .suffix(" GB")
+                            .step_by(1.0),
+                    );
+                    if self.hf_config.max_gb_per_dataset == 0.0 {
+                        ui.label(egui::RichText::new("(unlimited)").weak().small());
+                    }
+                });
                 ui.end_row();
 
-                // Skip-if-exists checkbox
-                ui.label("Skip clone if repo exists:");
-                ui.add_enabled(
-                    !running,
-                    egui::Checkbox::without_text(&mut self.pile_config.skip_clone_if_exists),
-                );
+                // HuggingFace token
+                ui.label("HF Token (optional):");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(
+                        !running,
+                        egui::TextEdit::singleline(&mut self.hf_config.hf_token)
+                            .password(true)
+                            .hint_text("hf_xxxxxxxxxxxxxxxx — required for 🔑 datasets")
+                            .desired_width(300.0),
+                    );
+                    ui.label(
+                        egui::RichText::new("not saved to disk")
+                            .weak()
+                            .small()
+                            .italics(),
+                    );
+                });
                 ui.end_row();
             });
 
         ui.add_space(8.0);
 
-        // ── Component checkboxes ──────────────────────────────────────────
-        ui.label(egui::RichText::new("Components to download:").strong());
-        ui.add_space(2.0);
+        // ── Dataset checkboxes grouped by category ────────────────────────
+        let categories = [
+            HfDatasetCategory::Code,
+            HfDatasetCategory::Knowledge,
+            HfDatasetCategory::Instructions,
+        ];
 
-        // "Select All / None" helper row
-        let all_selected = self.pile_selected.len() == components.len();
-        let none_selected = self.pile_selected.is_empty();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!running && !all_selected, egui::Button::new("Select All")).clicked() {
-                self.pile_selected = (0..components.len()).collect();
-            }
-            if ui.add_enabled(!running && !none_selected, egui::Button::new("Select None")).clicked() {
-                self.pile_selected.clear();
-            }
-            // Show total selected size
-            let total_gib: f32 = self
-                .pile_selected
+        for category in &categories {
+            let group: Vec<(usize, &HfDataset)> = datasets
                 .iter()
-                .map(|&i| components[i].approx_size_gib)
-                .sum();
-            if !self.pile_selected.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("≈ {total_gib:.0} GiB selected"))
-                        .weak()
-                        .small(),
-                );
-            }
-        });
-        ui.add_space(4.0);
+                .enumerate()
+                .filter(|(_, d)| &d.category == category)
+                .collect();
 
-        // Scrollable checkbox grid — two columns
-        egui::ScrollArea::vertical()
-            .id_salt("pile_components")
-            .max_height(220.0)
+            let group_indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+            let all_in_group = group_indices.iter().all(|i| self.hf_selected.contains(i));
+            let none_in_group = group_indices.iter().all(|i| !self.hf_selected.contains(i));
+
+            egui::CollapsingHeader::new(
+                egui::RichText::new(category.label()).strong(),
+            )
+            .default_open(true)
             .show(ui, |ui| {
-                egui::Grid::new("pile_component_grid")
-                    .num_columns(2)
-                    .spacing([16.0, 4.0])
-                    .show(ui, |ui| {
-                        for (i, comp) in components.iter().enumerate() {
-                            let mut checked = self.pile_selected.contains(&i);
-                            let label = format!(
-                                "{} ({:.0} GiB)",
-                                comp.label, comp.approx_size_gib
-                            );
-                            if ui
-                                .add_enabled(!running, egui::Checkbox::new(&mut checked, label))
-                                .changed()
-                            {
-                                if checked {
-                                    self.pile_selected.insert(i);
-                                } else {
-                                    self.pile_selected.remove(&i);
-                                }
-                            }
-                            // Two columns per row
-                            if i % 2 == 1 {
-                                ui.end_row();
-                            }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!running && !all_in_group, egui::Button::new("Select All"))
+                        .clicked()
+                    {
+                        for i in &group_indices {
+                            self.hf_selected.insert(*i);
                         }
-                        // Close last row if odd number of components
-                        if components.len() % 2 == 1 {
-                            ui.end_row();
+                    }
+                    if ui
+                        .add_enabled(!running && !none_in_group, egui::Button::new("Select None"))
+                        .clicked()
+                    {
+                        for i in &group_indices {
+                            self.hf_selected.remove(i);
                         }
-                    });
+                    }
+                    let group_gib: f32 = group_indices
+                        .iter()
+                        .filter(|i| self.hf_selected.contains(i))
+                        .map(|&i| datasets[i].approx_size_gib)
+                        .sum();
+                    if group_gib > 0.0 {
+                        let limit = self.hf_config.max_gb_per_dataset;
+                        let effective = if limit > 0.0 {
+                            (limit * group_indices
+                                .iter()
+                                .filter(|i| self.hf_selected.contains(i))
+                                .count() as f32)
+                                .min(group_gib)
+                        } else {
+                            group_gib
+                        };
+                        let label = if limit > 0.0 {
+                            format!("≈ {effective:.0} GB (capped at {limit:.0} GB/dataset)")
+                        } else {
+                            format!("≈ {group_gib:.0} GB total")
+                        };
+                        ui.label(egui::RichText::new(label).weak().small());
+                    }
+                });
+
+                ui.add_space(2.0);
+
+                for (i, ds) in &group {
+                    let mut checked = self.hf_selected.contains(i);
+                    let label = format!(
+                        "{}  (~{:.0} GB)",
+                        ds.label,
+                        ds.approx_size_gib
+                    );
+                    let resp = ui.add_enabled(!running, egui::Checkbox::new(&mut checked, label));
+                    if resp.changed() {
+                        if checked {
+                            self.hf_selected.insert(*i);
+                        } else {
+                            self.hf_selected.remove(i);
+                        }
+                    }
+                }
             });
 
-        ui.add_space(6.0);
+            ui.add_space(4.0);
+        }
 
-        // Size / selection warning
-        if self.pile_selected.is_empty() {
+        // ── Warnings ──────────────────────────────────────────────────────
+        let needs_token = self
+            .hf_selected
+            .iter()
+            .any(|&i| datasets[i].hf_token_required);
+        if needs_token && self.hf_config.hf_token.is_empty() {
             ui.label(
-                egui::RichText::new("⚠  No components selected. Select at least one to build.")
-                    .color(egui::Color32::YELLOW)
-                    .small(),
-            );
-        } else {
-            let total_gib: f32 = self
-                .pile_selected
-                .iter()
-                .map(|&i| components[i].approx_size_gib)
-                .sum();
-            ui.label(
-                egui::RichText::new(format!(
-                    "⚠  Approximate download: {total_gib:.0} GiB.  Ensure sufficient disk space."
-                ))
+                egui::RichText::new(
+                    "⚠  One or more selected datasets require a HuggingFace token.  \
+                     Enter your token above or those datasets will be skipped.",
+                )
                 .color(egui::Color32::YELLOW)
                 .small(),
+            );
+        }
+
+        if self.hf_selected.is_empty() {
+            ui.label(
+                egui::RichText::new("⚠  No datasets selected.")
+                    .color(egui::Color32::YELLOW)
+                    .small(),
             );
         }
 
@@ -443,39 +491,32 @@ impl DatasetPanel {
         ui.horizontal(|ui| {
             if running {
                 if ui.button("⏹ Cancel").clicked() {
-                    // Drop the receiver — the background thread's next send
-                    // will fail and it will stop gracefully.
-                    self.pile_state.receiver = None;
-                    self.pile_state.is_running = false;
-                    self.pile_state.log.push("⏹  Build cancelled by user.".into());
+                    self.hf_state.receiver = None;
+                    self.hf_state.is_running = false;
+                    self.hf_state.log.push("⏹  Download cancelled by user.".into());
                 }
             } else {
-                let label = if self.pile_state.finished {
-                    "🔄 Rebuild"
-                } else {
-                    "▶ Start Build"
-                };
-                let can_start = !self.pile_selected.is_empty();
+                let label = if self.hf_state.finished { "🔄 Re-download" } else { "▶ Start Download" };
+                let can_start = !self.hf_selected.is_empty();
                 if ui.add_enabled(can_start, egui::Button::new(label)).clicked() {
-                    let mut cfg = self.pile_config.clone();
-                    // Collect selected component ids in a stable order.
-                    let mut sorted: Vec<usize> = self.pile_selected.iter().copied().collect();
+                    let mut cfg = self.hf_config.clone();
+                    let mut sorted: Vec<usize> = self.hf_selected.iter().copied().collect();
                     sorted.sort_unstable();
-                    cfg.components = sorted
+                    cfg.selected_ids = sorted
                         .iter()
-                        .map(|&i| components[i].id.to_owned())
+                        .map(|&i| datasets[i].id.to_owned())
                         .collect();
-                    self.pile_state.start(cfg);
+                    self.hf_state.start(cfg);
                 }
             }
 
-            if self.pile_state.finished {
+            if self.hf_state.finished {
                 ui.label(
-                    egui::RichText::new("✅ Build complete")
+                    egui::RichText::new("✅ Download complete")
                         .color(egui::Color32::GREEN)
                         .strong(),
                 );
-            } else if let Some(err) = &self.pile_state.error.clone() {
+            } else if let Some(err) = &self.hf_state.error.clone() {
                 ui.label(
                     egui::RichText::new(format!("❌ {err}"))
                         .color(egui::Color32::RED)
@@ -484,28 +525,28 @@ impl DatasetPanel {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.checkbox(&mut self.pile_log_autoscroll, "Auto-scroll");
+                ui.checkbox(&mut self.hf_log_autoscroll, "Auto-scroll");
             });
         });
 
         ui.add_space(4.0);
 
         // ── Progress bar + phase label ────────────────────────────────────
-        if running || self.pile_state.progress > 0.0 {
+        if running || self.hf_state.progress > 0.0 {
             ui.add(
-                egui::ProgressBar::new(self.pile_state.progress)
+                egui::ProgressBar::new(self.hf_state.progress)
                     .desired_width(ui.available_width())
                     .animate(running)
                     .text(format!(
                         "{:.0}%  {}",
-                        self.pile_state.progress * 100.0,
-                        self.pile_state.phase,
+                        self.hf_state.progress * 100.0,
+                        self.hf_state.phase,
                     )),
             );
             ui.add_space(4.0);
         } else {
             ui.label(
-                egui::RichText::new("Press ▶ Start Build to begin downloading The Pile.")
+                egui::RichText::new("Press ▶ Start Download to begin streaming datasets.")
                     .weak()
                     .italics(),
             );
@@ -513,76 +554,72 @@ impl DatasetPanel {
         }
 
         // ── Scrolling log ─────────────────────────────────────────────────
-        if !self.pile_state.log.is_empty() || running {
+        if !self.hf_state.log.is_empty() || running {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "Build log ({} lines):",
-                        self.pile_state.log.len()
+                        "Download log ({} lines):",
+                        self.hf_state.log.len()
                     ))
                     .small()
                     .weak(),
                 );
-                // Copy All button — puts the full log on the clipboard.
                 if ui.small_button("📋 Copy All").on_hover_text("Copy entire log to clipboard").clicked() {
-                    let full = self.pile_state.log.join("\n");
+                    let full = self.hf_state.log.join("\n");
                     ui.ctx().copy_text(full);
                 }
             });
 
-            let log_ref = &self.pile_state.log;
-            let autoscroll = self.pile_log_autoscroll;
+            let log_ref = &self.hf_state.log;
+            let autoscroll = self.hf_log_autoscroll;
 
-            let scroll_area = egui::ScrollArea::vertical()
-                .id_salt("pile_log")
+            egui::ScrollArea::vertical()
+                .id_salt("hf_log")
                 .max_height(280.0)
                 .stick_to_bottom(autoscroll)
-                .auto_shrink([false, false]);
-
-            scroll_area.show(ui, |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(18, 18, 20))
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::same(6))
-                    .show(ui, |ui| {
-                        // Render last 500 lines for performance.
-                        let start = log_ref.len().saturating_sub(500);
-                        for line in &log_ref[start..] {
-                            let color = if line.starts_with("❌") || line.contains("[err]") {
-                                egui::Color32::from_rgb(255, 100, 100)
-                            } else if line.starts_with("✔") || line.starts_with("✅") {
-                                egui::Color32::from_rgb(100, 220, 100)
-                            } else if line.starts_with("⚠") {
-                                egui::Color32::YELLOW
-                            } else if line.starts_with("ℹ") {
-                                egui::Color32::from_rgb(100, 180, 255)
-                            } else {
-                                egui::Color32::from_rgb(200, 200, 200)
-                            };
-                            // selectable(true) lets the user drag-select and Ctrl+C any portion.
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(line)
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(color),
-                                )
-                                .selectable(true),
-                            );
-                        }
-                        if running {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new("▋")
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(egui::Color32::LIGHT_GRAY),
-                                )
-                                .selectable(false),
-                            );
-                        }
-                    });
-            });
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(18, 18, 20))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            let start = log_ref.len().saturating_sub(500);
+                            for line in &log_ref[start..] {
+                                let color = if line.starts_with("❌") || line.contains("[err]") {
+                                    egui::Color32::from_rgb(255, 100, 100)
+                                } else if line.starts_with("✔") || line.starts_with("✅") {
+                                    egui::Color32::from_rgb(100, 220, 100)
+                                } else if line.starts_with("⚠") {
+                                    egui::Color32::YELLOW
+                                } else if line.starts_with("ℹ") {
+                                    egui::Color32::from_rgb(100, 180, 255)
+                                } else {
+                                    egui::Color32::from_rgb(200, 200, 200)
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(color),
+                                    )
+                                    .selectable(true),
+                                );
+                            }
+                            if running {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("▋")
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(egui::Color32::LIGHT_GRAY),
+                                    )
+                                    .selectable(false),
+                                );
+                            }
+                        });
+                });
         }
     }
 
