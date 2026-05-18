@@ -1,11 +1,11 @@
 format = 2
 pkgname = quark-git
 pkgbase = quark-git
-pkgver = 1.0.14.r0.ga20f373-1
+pkgver = 1.0.15.r0.g4d8fb05-1
 pkgarch = x86_64
-pkgbuild_sha256sum = e7e60b5b1136690a962e7db6aa5b0c44aef884fa45d67a40c99aa2ea9570dacf
+pkgbuild_sha256sum = c9e25ae0052698232069514e1adb30cc167b52f31f06ec489bb70f9f3aebbc02
 packager = Unknown Packager
-builddate = 1778794357
+builddate = 1778797396
 builddir = /home/aric/Documents/GitHub/Quark/installer/arch
 startdir = /home/aric/Documents/GitHub/Quark/installer/arch
 buildtool = makepkg
