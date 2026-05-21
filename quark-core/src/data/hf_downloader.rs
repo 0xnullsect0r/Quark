@@ -41,6 +41,8 @@ pub enum HfMessage {
     Done,
     /// Download failed; contains a human-readable description.
     Error(String),
+    /// Download paused cleanly by user request; progress has been saved to disk.
+    Paused(String),
 }
 
 // ─── Dataset catalogue ────────────────────────────────────────────────────────
@@ -51,6 +53,7 @@ pub enum HfDatasetCategory {
     Code,
     Knowledge,
     Instructions,
+    Security,
 }
 
 impl HfDatasetCategory {
@@ -59,6 +62,7 @@ impl HfDatasetCategory {
             Self::Code => "🖥  Code",
             Self::Knowledge => "📚  Knowledge",
             Self::Instructions => "💬  Instructions",
+            Self::Security => "🔐  Cybersecurity",
         }
     }
 }
@@ -256,6 +260,73 @@ pub fn hf_datasets() -> Vec<HfDataset> {
             split: "train",
             text_field: Some("conversations"),
         },
+        // ── Cybersecurity ─────────────────────────────────────────────────
+        HfDataset {
+            id: "cognitive_hacking",
+            hf_id: "ebowwa/cognitive-hacking",
+            label: "Cognitive Hacking — social engineering & manipulation tactics",
+            category: HfDatasetCategory::Security,
+            approx_size_gib: 0.1,
+            hf_token_required: false,
+            subset: None,
+            split: "train",
+            text_field: None,
+        },
+        HfDataset {
+            id: "hacking_tricks",
+            hf_id: "tandevllc/hacking-tricks",
+            label: "Hacking Tricks — offensive techniques & CTF writeups",
+            category: HfDatasetCategory::Security,
+            approx_size_gib: 0.05,
+            hf_token_required: false,
+            subset: None,
+            split: "train",
+            text_field: None,
+        },
+        HfDataset {
+            id: "hacking_dataset",
+            hf_id: "Devilishcode/hacking",
+            label: "Hacking Dataset — security exploit examples",
+            category: HfDatasetCategory::Security,
+            approx_size_gib: 0.1,
+            hf_token_required: false,
+            subset: None,
+            split: "train",
+            text_field: None,
+        },
+        HfDataset {
+            id: "nist_cybersecurity",
+            hf_id: "ethanolivertroy/nist-cybersecurity-training",
+            label: "NIST Cybersecurity Training — framework-aligned Q&A",
+            category: HfDatasetCategory::Security,
+            approx_size_gib: 0.1,
+            hf_token_required: false,
+            subset: None,
+            split: "train",
+            text_field: None,
+        },
+        HfDataset {
+            id: "cybermetric",
+            hf_id: "cybermetric/CyberMetric",
+            label: "CyberMetric — cybersecurity benchmark & knowledge base",
+            category: HfDatasetCategory::Security,
+            approx_size_gib: 0.05,
+            hf_token_required: false,
+            subset: None,
+            split: "train",
+            text_field: None,
+        },
+        HfDataset {
+            id: "fenrir_cybersecurity",
+            hf_id: "AlicanKiraz0/Cybersecurity-Dataset-Fenrir-v2.1",
+            label: "Cybersecurity Fenrir v2.1 — comprehensive security training data",
+            category: HfDatasetCategory::Security,
+            approx_size_gib: 0.5,
+            hf_token_required: false,
+            subset: None,
+            split: "train",
+            text_field: None,
+        },
     ]
 }
 
@@ -299,6 +370,14 @@ impl Default for HfConfig {
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
+
+/// Returns the path of the pause/stop signal file for a given target directory.
+///
+/// The GUI creates this file to request a pause; the Python script deletes it
+/// after acknowledging the signal and exits cleanly.
+pub fn hf_stop_file(target_dir: &std::path::Path) -> PathBuf {
+    target_dir.join(".quark_stop")
+}
 
 /// Spawn the download pipeline in a background thread.
 ///
@@ -462,11 +541,16 @@ fn run_pipeline(cfg: HfConfig, tx: Sender<HfMessage>) {
             continue;
         }
 
+        let stop_file = hf_stop_file(&cfg.target_dir);
+
         let mut cmd = Command::new(&venv_python);
         cmd.arg(script_path.to_str().unwrap_or("hf_download.py"));
         cmd.args(["--dataset-id", ds.hf_id]);
         cmd.args(["--output-dir", out_dir.to_str().unwrap_or("datasets")]);
         cmd.args(["--split", ds.split]);
+        if let Some(stop_str) = stop_file.to_str() {
+            cmd.args(["--stop-file", stop_str]);
+        }
         if cfg.max_gb_per_dataset > 0.0 {
             cmd.args(["--max-gb", &format!("{:.2}", cfg.max_gb_per_dataset)]);
         }
@@ -483,8 +567,22 @@ fn run_pipeline(cfg: HfConfig, tx: Sender<HfMessage>) {
 
         let ok = stream_command(&mut cmd, &tx, p_start, p_end);
         if !ok {
+            // stream_command returns false on non-zero exit; but PAUSED exits 0 and
+            // sends HfMessage::Paused through the channel, so we stop iterating here.
+            if stop_file.exists() {
+                // Python exited before seeing the stop file for this dataset.
+                // Treat as a pause — the progress file covers completed shards.
+                let _ = std::fs::remove_file(&stop_file);
+                let _ = tx.send(HfMessage::Paused("Paused — progress saved.".into()));
+                return;
+            }
             log!("⚠  '{}' failed — skipping and continuing with next dataset.", ds.hf_id);
         } else {
+            // Check if Python exited 0 because it saw the stop file (PAUSED protocol
+            // line already sent through the channel — we just stop the loop).
+            if tx.send(HfMessage::Log(String::new())).is_err() {
+                return; // channel closed, GUI gone
+            }
             log!("✔  '{}' done ({}/{}).", ds.label, idx + 1, n);
         }
     }
@@ -542,6 +640,8 @@ fn stream_command(cmd: &mut Command, tx: &Sender<HfMessage>, p_start: f32, p_end
             let _ = tx.send(HfMessage::CurrentFile(rest.trim().to_owned()));
         } else if let Some(rest) = line.strip_prefix("LOG:") {
             let _ = tx.send(HfMessage::Log(rest.to_owned()));
+        } else if let Some(rest) = line.strip_prefix("PAUSED:") {
+            let _ = tx.send(HfMessage::Paused(rest.trim().to_owned()));
         } else if line.trim() == "DONE" {
             // handled by process exit code
         } else if !line.trim().is_empty() {

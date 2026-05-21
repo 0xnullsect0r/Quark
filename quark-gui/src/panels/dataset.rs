@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use quark_core::data::{
-    detect_python, hf_datasets, start_hf_build, HfConfig, HfDataset, HfDatasetCategory,
-    HfMessage,
+    detect_python, hf_datasets, hf_stop_file, start_hf_build, HfConfig, HfDataset,
+    HfDatasetCategory, HfMessage,
 };
 
 // ─── File list entry ──────────────────────────────────────────────────────────
@@ -31,6 +31,8 @@ struct HfState {
     /// Basename of the file currently being downloaded.
     current_file: String,
     is_running: bool,
+    /// True when paused cleanly by the user; progress is saved and can be resumed.
+    paused: bool,
     finished: bool,
     error: Option<String>,
     receiver: Option<Receiver<HfMessage>>,
@@ -49,6 +51,7 @@ impl Default for HfState {
             bytes_total: 0,
             current_file: String::new(),
             is_running: false,
+            paused: false,
             finished: false,
             error: None,
             receiver: None,
@@ -86,12 +89,19 @@ impl HfState {
                         HfMessage::Done => {
                             self.is_running = false;
                             self.finished = true;
+                            self.paused = false;
                             self.speed_bps = 0.0;
                         }
                         HfMessage::Error(e) => {
                             self.is_running = false;
                             self.error = Some(e);
                             self.speed_bps = 0.0;
+                        }
+                        HfMessage::Paused(msg) => {
+                            self.is_running = false;
+                            self.paused = true;
+                            self.speed_bps = 0.0;
+                            self.log.push(format!("⏸  {msg}"));
                         }
                     }
                 }
@@ -116,7 +126,24 @@ impl HfState {
         self.current_file = String::new();
         self.error = None;
         self.finished = false;
+        self.paused = false;
         self.is_running = true;
+        self.receiver = Some(start_hf_build(cfg));
+    }
+
+    /// Resume from a pause without clearing the log (so the user can see prior output).
+    fn resume(&mut self, cfg: HfConfig) {
+        self.progress = 0.0;
+        self.phase = "Resuming…".into();
+        self.speed_bps = 0.0;
+        self.bytes_downloaded = 0;
+        self.bytes_total = 0;
+        self.current_file = String::new();
+        self.error = None;
+        self.finished = false;
+        self.paused = false;
+        self.is_running = true;
+        self.log.push("▶  Resuming download…".into());
         self.receiver = Some(start_hf_build(cfg));
     }
 }
@@ -188,6 +215,15 @@ impl DatasetPanel {
         } else {
             None
         }
+    }
+
+    /// Build an [`HfConfig`] from the current panel selections.
+    fn build_hf_cfg(&self, datasets: &[HfDataset]) -> HfConfig {
+        let mut cfg = self.hf_config.clone();
+        let mut sorted: Vec<usize> = self.hf_selected.iter().copied().collect();
+        sorted.sort_unstable();
+        cfg.selected_ids = sorted.iter().map(|&i| datasets[i].id.to_owned()).collect();
+        cfg
     }
 
     /// Must be called every frame so the live log updates.
@@ -433,6 +469,7 @@ impl DatasetPanel {
             HfDatasetCategory::Code,
             HfDatasetCategory::Knowledge,
             HfDatasetCategory::Instructions,
+            HfDatasetCategory::Security,
         ];
 
         for category in &categories {
@@ -545,22 +582,41 @@ impl DatasetPanel {
         // ── Control buttons ───────────────────────────────────────────────
         ui.horizontal(|ui| {
             if running {
-                if ui.button("⏹ Cancel").clicked() {
+                // Pause — signals Python to checkpoint and exit cleanly.
+                if ui.button("⏸ Pause").on_hover_text(
+                    "Save progress and stop. You can resume later without re-downloading."
+                ).clicked() {
+                    let stop = hf_stop_file(&self.hf_config.target_dir);
+                    if let Err(e) = std::fs::write(&stop, "") {
+                        self.hf_state.log.push(format!("⚠  Could not create stop file: {e}"));
+                    } else {
+                        self.hf_state.log.push("⏸  Pause signal sent — waiting for current shard to finish…".into());
+                    }
+                }
+                // Cancel — drops the channel (Python subprocess may briefly continue in background).
+                if ui.button("✖ Cancel").clicked() {
                     self.hf_state.receiver = None;
                     self.hf_state.is_running = false;
-                    self.hf_state.log.push("⏹  Download cancelled by user.".into());
+                    self.hf_state.paused = false;
+                    self.hf_state.log.push("✖  Download cancelled.".into());
+                }
+            } else if self.hf_state.paused {
+                // Resume — re-launches the pipeline; Python reads progress files and skips done shards.
+                if ui.button("▶ Resume").on_hover_text(
+                    "Continue from where the download paused."
+                ).clicked() {
+                    let cfg = self.build_hf_cfg(&datasets);
+                    self.hf_state.resume(cfg);
+                }
+                if ui.button("✖ Cancel").clicked() {
+                    self.hf_state.paused = false;
+                    self.hf_state.log.push("✖  Cancelled.".into());
                 }
             } else {
                 let label = if self.hf_state.finished { "🔄 Re-download" } else { "▶ Start Download" };
                 let can_start = !self.hf_selected.is_empty();
                 if ui.add_enabled(can_start, egui::Button::new(label)).clicked() {
-                    let mut cfg = self.hf_config.clone();
-                    let mut sorted: Vec<usize> = self.hf_selected.iter().copied().collect();
-                    sorted.sort_unstable();
-                    cfg.selected_ids = sorted
-                        .iter()
-                        .map(|&i| datasets[i].id.to_owned())
-                        .collect();
+                    let cfg = self.build_hf_cfg(&datasets);
                     self.hf_state.start(cfg);
                 }
             }
@@ -569,6 +625,12 @@ impl DatasetPanel {
                 ui.label(
                     egui::RichText::new("✅ Download complete")
                         .color(egui::Color32::GREEN)
+                        .strong(),
+                );
+            } else if self.hf_state.paused {
+                ui.label(
+                    egui::RichText::new("⏸ Paused — progress saved")
+                        .color(egui::Color32::YELLOW)
                         .strong(),
                 );
             } else if let Some(err) = &self.hf_state.error.clone() {

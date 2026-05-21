@@ -10,8 +10,20 @@ Protocol on stdout:
   SPEED:<bytes_per_sec>   — current download speed (float, bytes/s)
   BYTES:<done>/<total>    — cumulative bytes downloaded / estimated total
   FILE:<basename>         — file currently being downloaded
+  PAUSED:<reason>         — paused cleanly; progress saved to disk
   DONE                    — all work complete
   ERROR:<message>         — fatal error (also causes non-zero exit)
+
+Crash recovery / pause:
+  A progress file is maintained at <out_path>.progress.json, tracking which
+  Parquet shards have been fully converted and the output file byte offset after
+  each completed shard.  On resume, the output file is truncated to the last
+  good offset (discarding any partial shard write from a crash) and completed
+  shards are skipped.
+
+  If --stop-file is given, the script checks for that file at the start of each
+  shard.  When found it deletes the file, emits PAUSED:, and exits 0 so the
+  caller can resume later.
 """
 
 import argparse
@@ -119,7 +131,6 @@ def parallel_download(session, url: str, dest: str,
     requests or the file is smaller than 1 MiB.
     Returns True on success.
     """
-    # Probe file size and Range support via HEAD
     try:
         head = session.head(url, timeout=30, allow_redirects=True)
         total = int(head.headers.get("Content-Length", 0))
@@ -145,7 +156,6 @@ def parallel_download(session, url: str, dest: str,
             log(f"Download error: {e}")
             return False
 
-    # Divide file into n_workers byte ranges
     chunk_sz = total // n_workers
     ranges = [
         (i * chunk_sz, (i + 1) * chunk_sz - 1 if i < n_workers - 1 else total - 1)
@@ -173,7 +183,6 @@ def parallel_download(session, url: str, dest: str,
         if not success:
             return False
 
-        # Reassemble parts in order
         with open(dest, "wb") as out:
             for p in parts:
                 with open(p, "rb") as inp:
@@ -225,6 +234,41 @@ def pick_text_field(columns: list[str], forced: str | None) -> str | None:
     return columns[0] if columns else None
 
 
+# ── progress file helpers ─────────────────────────────────────────────────────
+
+def load_progress(progress_file: str) -> tuple[set[str], int]:
+    """Return (completed_shards, output_size_bytes) from the progress file."""
+    try:
+        with open(progress_file, encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("completed_shards", [])), int(data.get("output_size_bytes", 0))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return set(), 0
+
+
+def save_progress(progress_file: str, completed_shards: set[str], output_size_bytes: int) -> None:
+    tmp = progress_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {"completed_shards": sorted(completed_shards), "output_size_bytes": output_size_bytes},
+            f,
+        )
+    os.replace(tmp, progress_file)  # atomic on POSIX; best-effort on Windows
+
+
+# ── pause signal check ────────────────────────────────────────────────────────
+
+def check_pause(stop_file: str | None) -> bool:
+    """Return True and delete the stop file if a pause has been requested."""
+    if stop_file and os.path.exists(stop_file):
+        try:
+            os.remove(stop_file)
+        except OSError:
+            pass
+        return True
+    return False
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -245,6 +289,8 @@ def main() -> None:
                         help="Override text field name")
     parser.add_argument("--workers", type=int, default=10,
                         help="Parallel HTTP connections per file (default: 10)")
+    parser.add_argument("--stop-file", default=None,
+                        help="Path to pause-signal file; when it appears, checkpoint and exit 0")
     args = parser.parse_args()
 
     try:
@@ -258,9 +304,9 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     safe_id = args.dataset_id.replace("/", "__")
     out_path = os.path.join(args.output_dir, f"{safe_id}.jsonl")
+    progress_file = out_path + ".progress.json"
     max_bytes = int(args.max_gb * 1024 ** 3) if args.max_gb > 0 else 0
 
-    # Build a requests session with optional auth
     session = requests.Session()
     if args.hf_token:
         session.headers["Authorization"] = f"Bearer {args.hf_token}"
@@ -275,6 +321,18 @@ def main() -> None:
     if max_bytes:
         log(f"  limit  : {args.max_gb:.1f} GB")
 
+    # ── load prior progress and truncate output file to last safe offset ──
+    completed_shards, saved_output_size = load_progress(progress_file)
+    if completed_shards:
+        log(f"ℹ  Resuming: {len(completed_shards)} shard(s) already complete")
+        if os.path.exists(out_path) and saved_output_size > 0:
+            current_size = os.path.getsize(out_path)
+            if current_size != saved_output_size:
+                log(f"ℹ  Truncating output from {current_size} → {saved_output_size} bytes "
+                    f"(discarding partial shard from last crash)")
+                with open(out_path, "r+b") as ftrunc:
+                    ftrunc.truncate(saved_output_size)
+
     # ── enumerate Parquet shards ───────────────────────────────────────────
     log("Listing dataset files on HuggingFace Hub…")
     try:
@@ -285,7 +343,7 @@ def main() -> None:
         ))
     except Exception as e:
         log(f"Cannot list files ({e}) — falling back to streaming mode")
-        _streaming_fallback(args, out_path, max_bytes)
+        _streaming_fallback(args, out_path, progress_file, completed_shards, max_bytes)
         return
 
     split = args.split
@@ -302,7 +360,6 @@ def main() -> None:
 
     parquet_files = [f for f in all_files if matches(f)]
 
-    # Progressive relaxation — drop subset filter, then split filter
     if not parquet_files:
         parquet_files = [f for f in all_files if f.endswith(".parquet") and split in f]
     if not parquet_files:
@@ -310,12 +367,14 @@ def main() -> None:
 
     if not parquet_files:
         log("No Parquet shards found — falling back to streaming mode")
-        _streaming_fallback(args, out_path, max_bytes)
+        _streaming_fallback(args, out_path, progress_file, completed_shards, max_bytes)
         return
 
-    log(f"Found {len(parquet_files)} Parquet shards")
+    remaining = [f for f in parquet_files if f not in completed_shards]
+    log(f"Found {len(parquet_files)} Parquet shard(s)  "
+        f"({len(completed_shards)} already done, {len(remaining)} to download)")
 
-    # ── estimate total download size (sample first 3 shards via HEAD) ─────
+    # ── estimate total download size ──────────────────────────────────────
     def get_size(path: str) -> int:
         url = hf_hub_url(args.dataset_id, path, repo_type="dataset")
         try:
@@ -324,22 +383,23 @@ def main() -> None:
         except Exception:
             return 0
 
-    sample_n = min(3, len(parquet_files))
-    sample_sizes = [get_size(f) for f in parquet_files[:sample_n]]
+    sample_n = min(3, len(remaining)) if remaining else min(3, len(parquet_files))
+    sample_pool = remaining if remaining else parquet_files
+    sample_sizes = [get_size(f) for f in sample_pool[:sample_n]]
     avg_shard = sum(sample_sizes) / max(sample_n, 1)
 
-    # Trim shard list to honour the GB cap
     if max_bytes and avg_shard > 0:
         n_cap = max(1, int(max_bytes / avg_shard))
         if n_cap < len(parquet_files):
             parquet_files = parquet_files[:n_cap]
+            remaining = [f for f in parquet_files if f not in completed_shards]
             log(f"Cap {args.max_gb:.1f} GB → keeping first {n_cap} shards")
 
-    estimated_total = int(avg_shard * len(parquet_files)) if avg_shard > 0 else 0
+    estimated_total = int(avg_shard * len(remaining)) if avg_shard > 0 else 0
     log(
-        f"Estimated download: "
+        f"Estimated remaining download: "
         f"{estimated_total / 1024**3:.2f} GB "
-        f"({len(parquet_files)} shards × ~{avg_shard / 1024**2:.0f} MiB each)"
+        f"({len(remaining)} shards × ~{avg_shard / 1024**2:.0f} MiB each)"
     )
 
     tracker = SpeedTracker()
@@ -347,13 +407,29 @@ def main() -> None:
     stop_event = threading.Event()
     start_reporter(tracker, lambda: total_ref[0], stop_event)
 
-    written_bytes = 0
+    written_bytes = saved_output_size  # bytes already on disk from prior runs
 
     with tempfile.TemporaryDirectory(prefix="quark_hf_") as tmp_dir:
         with open(out_path, "a", encoding="utf-8") as fout:
             text_field: str | None = None
 
             for idx, shard_path in enumerate(parquet_files):
+                # ── pause check (before starting this shard) ──────────────
+                if check_pause(args.stop_file):
+                    stop_event.set()
+                    fout.flush()
+                    size_now = fout.seek(0, 2)
+                    save_progress(progress_file, completed_shards, size_now)
+                    log(f"⏸  Paused after {len(completed_shards)} shard(s) — progress saved.")
+                    print(f"PAUSED:Paused after {len(completed_shards)} shard(s) — "
+                          f"click Resume to continue.", flush=True)
+                    return
+
+                # ── skip already-completed shards ─────────────────────────
+                if shard_path in completed_shards:
+                    log(f"↩  Skipping already-completed shard: {os.path.basename(shard_path)}")
+                    continue
+
                 url = hf_hub_url(args.dataset_id, shard_path, repo_type="dataset")
                 name = os.path.basename(shard_path)
                 emit_file(name)
@@ -368,7 +444,7 @@ def main() -> None:
                     log(f"⚠ Skipping {name} (download failed)")
                     continue
 
-                # Convert Parquet → JSONL rows
+                # ── convert Parquet → JSONL ────────────────────────────────
                 try:
                     table = pq.read_table(local)
                     cols = table.schema.names
@@ -398,6 +474,18 @@ def main() -> None:
                     log(f"⚠ Parquet read error on {name}: {e}")
                     continue
 
+                # ── checkpoint: flush + record this shard as complete ──────
+                fout.flush()
+                try:
+                    os.fsync(fout.fileno())
+                except OSError:
+                    pass
+                size_now = fout.seek(0, 2)  # seek to end → current byte offset
+                completed_shards.add(shard_path)
+                save_progress(progress_file, completed_shards, size_now)
+                log(f"  ✔ Checkpoint saved ({len(completed_shards)} shard(s) done, "
+                    f"{size_now / 1024**2:.1f} MiB on disk)")
+
                 if max_bytes and written_bytes >= max_bytes:
                     log(f"Reached {args.max_gb:.1f} GB limit — stopping.")
                     break
@@ -412,15 +500,26 @@ def main() -> None:
 
 # ── streaming fallback ────────────────────────────────────────────────────────
 
-def _streaming_fallback(args, out_path: str, max_bytes: int) -> None:
+def _streaming_fallback(args, out_path: str, progress_file: str,
+                        completed_shards: set[str], max_bytes: int) -> None:
     """Row-by-row HuggingFace streaming — used when Parquet files are not
-    directly accessible (e.g. trust_remote_code datasets with custom loaders)."""
+    directly accessible.  Supports pause via stop file (checked every 500 rows).
+    Progress is saved as a synthetic shard key 'stream:<rows_written>'."""
     log("Streaming mode — row-by-row, no parallel acceleration")
     try:
         from datasets import load_dataset  # type: ignore
     except ImportError:
         print("ERROR:datasets package not installed", flush=True)
         sys.exit(1)
+
+    # Recover the row count written so far from a previously saved stream key.
+    rows_already = 0
+    for key in completed_shards:
+        if key.startswith("stream:"):
+            try:
+                rows_already = int(key.split(":", 1)[1])
+            except ValueError:
+                pass
 
     kw: dict = dict(streaming=True, trust_remote_code=True)
     if args.hf_token:
@@ -440,6 +539,11 @@ def _streaming_fallback(args, out_path: str, max_bytes: int) -> None:
 
     with open(out_path, "a", encoding="utf-8") as fout:
         for row in ds:
+            # Skip rows already written in a prior run.
+            if written_rows < rows_already:
+                written_rows += 1
+                continue
+
             if text_field is None:
                 candidates = (
                     ([args.text_field] if args.text_field else []) + TEXT_FIELD_CANDIDATES
@@ -466,6 +570,30 @@ def _streaming_fallback(args, out_path: str, max_bytes: int) -> None:
                 log(f"Wrote {written_rows:,} rows ({mb:.1f} MiB)")
                 if max_bytes:
                     emit_progress(min(written_bytes / max_bytes, 0.99))
+
+                # Checkpoint every 500 rows in streaming mode.
+                fout.flush()
+                try:
+                    os.fsync(fout.fileno())
+                except OSError:
+                    pass
+                size_now = fout.seek(0, 2)
+                stream_key = f"stream:{written_rows}"
+                # Keep only the latest stream key to avoid unbounded growth.
+                stale = {k for k in completed_shards if k.startswith("stream:")}
+                completed_shards -= stale
+                completed_shards.add(stream_key)
+                save_progress(progress_file, completed_shards, size_now)
+
+                # Pause check every 500 rows.
+                if check_pause(args.stop_file):
+                    fout.flush()
+                    size_now = fout.seek(0, 2)
+                    save_progress(progress_file, completed_shards, size_now)
+                    log(f"⏸  Paused at row {written_rows} — progress saved.")
+                    print(f"PAUSED:Paused at row {written_rows} — "
+                          f"click Resume to continue.", flush=True)
+                    return
 
             if max_bytes and written_bytes >= max_bytes:
                 log(f"Reached {args.max_gb:.1f} GB limit — stopping.")
