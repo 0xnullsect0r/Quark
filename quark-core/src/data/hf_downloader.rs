@@ -11,10 +11,62 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+
+use serde::{Deserialize, Serialize};
+
+// ─── Persisted configuration ──────────────────────────────────────────────────
+
+/// HuggingFace dataset settings that are saved to `dataset_config.toml`.
+///
+/// Separate from [`HfConfig`] (which is a runtime-only launch struct) so that
+/// sensitive fields like `hf_token` are handled intentionally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HfPersistConfig {
+    /// Stable dataset IDs (e.g. `"github_code"`) — matched by string, not index,
+    /// so additions to the catalogue don't corrupt saved selections.
+    pub selected_ids: Vec<String>,
+    pub target_dir: PathBuf,
+    pub python_cmd: String,
+    pub max_gb_per_dataset: f32,
+    pub parallel_workers: u8,
+    /// HuggingFace API token for gated datasets.  Stored in plaintext; the file
+    /// is written with mode 0o600 on Unix to limit visibility.
+    #[serde(default)]
+    pub hf_token: String,
+    /// `true` while a download job is running or paused.  Set on launch,
+    /// cleared on completion/cancel/error.  Used to auto-resume after a crash.
+    #[serde(default)]
+    pub download_in_progress: bool,
+}
+
+impl HfPersistConfig {
+    /// Write to `path` as TOML, creating parent directories as needed.
+    /// On Unix the file is created with mode 0o600 (owner read/write only).
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let toml = toml::to_string_pretty(self)?;
+        std::fs::write(path, &toml)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Load from `path`.  Returns an error if the file does not exist or cannot
+    /// be parsed; callers should fall back to a default in that case.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let s = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&s)?)
+    }
+}
 
 // ─── Embedded Python script ───────────────────────────────────────────────────
 

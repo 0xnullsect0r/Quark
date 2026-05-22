@@ -60,3 +60,9 @@ pub fn checkpoints_dir() -> PathBuf {
 pub fn datasets_dir() -> PathBuf {
     app_data_dir().join("datasets")
 }
+
+/// Convenience: `<app_data_dir>/dataset_config.toml` — persisted HF token,
+/// selected datasets, and in-progress download state.
+pub fn dataset_config_path() -> PathBuf {
+    app_data_dir().join("dataset_config.toml")
+}

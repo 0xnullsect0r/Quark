@@ -5,8 +5,9 @@ use std::sync::mpsc::Receiver;
 
 use quark_core::data::{
     detect_python, hf_datasets, hf_stop_file, start_hf_build, HfConfig, HfDataset,
-    HfDatasetCategory, HfMessage,
+    HfDatasetCategory, HfMessage, HfPersistConfig,
 };
+use quark_core::paths::dataset_config_path;
 
 // ─── File list entry ──────────────────────────────────────────────────────────
 
@@ -62,6 +63,7 @@ impl Default for HfState {
 impl HfState {
     /// Drain the channel and update state.  Returns `true` if any message
     /// arrived (so the caller knows to request a repaint).
+    /// Also returns the terminal state so the caller can persist config.
     fn poll(&mut self) -> bool {
         let Some(rx) = &self.receiver else { return false };
         let mut changed = false;
@@ -170,34 +172,71 @@ pub struct DatasetPanel {
 
 impl Default for DatasetPanel {
     fn default() -> Self {
-        // Pre-select a reasonable starter set.
-        let defaults: std::collections::HashSet<usize> = hf_datasets()
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| {
-                matches!(
-                    d.id,
-                    "github_code"
-                        | "wikipedia_en"
-                        | "scientific_papers"
-                        | "ultrachat"
-                        | "openhermes"
-                )
-            })
-            .map(|(i, _)| i)
-            .collect();
-        Self {
+        let catalogue = hf_datasets();
+
+        // Try to restore saved config; fall back to a sensible starter set.
+        let (hf_config, hf_selected, resume_on_start) =
+            match HfPersistConfig::load(&dataset_config_path()) {
+                Ok(saved) => {
+                    // Rebuild the selection set by matching stable string IDs.
+                    let selected = catalogue
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| saved.selected_ids.iter().any(|id| id == d.id))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let cfg = HfConfig {
+                        target_dir: saved.target_dir,
+                        python_cmd: saved.python_cmd,
+                        max_gb_per_dataset: saved.max_gb_per_dataset,
+                        parallel_workers: saved.parallel_workers,
+                        hf_token: saved.hf_token,
+                        ..HfConfig::default()
+                    };
+                    (cfg, selected, saved.download_in_progress)
+                }
+                Err(_) => {
+                    let defaults = catalogue
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| {
+                            matches!(
+                                d.id,
+                                "github_code"
+                                    | "wikipedia_en"
+                                    | "scientific_papers"
+                                    | "ultrachat"
+                                    | "openhermes"
+                            )
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    (HfConfig::default(), defaults, false)
+                }
+            };
+
+        let mut panel = Self {
             files: vec![],
             max_seq_len: 2048,
             tokenizer_path: None,
             vocab_size_input: 32000,
             status: String::new(),
-            hf_enabled: false,
-            hf_config: HfConfig::default(),
-            hf_selected: defaults,
+            // Auto-open the HF section if a download needs to resume.
+            hf_enabled: resume_on_start,
+            hf_config,
+            hf_selected,
             hf_state: HfState::default(),
             hf_log_autoscroll: true,
+        };
+
+        // If a download was in flight when the app last closed (crash or shutdown),
+        // resume it immediately — the Python script will skip completed shards.
+        if resume_on_start {
+            let cfg = panel.build_hf_cfg(&catalogue);
+            panel.hf_state.resume(cfg);
         }
+
+        panel
     }
 }
 
@@ -217,6 +256,24 @@ impl DatasetPanel {
         }
     }
 
+    /// Persist current HF settings to `dataset_config.toml`.  Best-effort —
+    /// silently ignores errors so a read-only filesystem never crashes the GUI.
+    fn save_config(&self) {
+        let datasets = hf_datasets();
+        let mut sorted: Vec<usize> = self.hf_selected.iter().copied().collect();
+        sorted.sort_unstable();
+        let persist = HfPersistConfig {
+            selected_ids: sorted.iter().map(|&i| datasets[i].id.to_owned()).collect(),
+            target_dir: self.hf_config.target_dir.clone(),
+            python_cmd: self.hf_config.python_cmd.clone(),
+            max_gb_per_dataset: self.hf_config.max_gb_per_dataset,
+            parallel_workers: self.hf_config.parallel_workers,
+            hf_token: self.hf_config.hf_token.clone(),
+            download_in_progress: self.hf_state.is_running || self.hf_state.paused,
+        };
+        let _ = persist.save(&dataset_config_path());
+    }
+
     /// Build an [`HfConfig`] from the current panel selections.
     fn build_hf_cfg(&self, datasets: &[HfDataset]) -> HfConfig {
         let mut cfg = self.hf_config.clone();
@@ -230,6 +287,9 @@ impl DatasetPanel {
     pub fn update(&mut self, ctx: &egui::Context) {
         if self.hf_state.poll() {
             ctx.request_repaint();
+            // Persist whenever the download state changes so `download_in_progress`
+            // is always up-to-date on disk (handles Done / Error / Paused).
+            self.save_config();
         }
     }
 
@@ -389,6 +449,7 @@ impl DatasetPanel {
                     );
                     if resp.changed() {
                         self.hf_config.target_dir = std::path::PathBuf::from(&dir_edit);
+                        self.save_config();
                     }
                     if ui.add_enabled(!running, egui::Button::new("📁")).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
@@ -396,6 +457,7 @@ impl DatasetPanel {
                             .pick_folder()
                         {
                             self.hf_config.target_dir = p;
+                            self.save_config();
                         }
                     }
                 });
@@ -403,22 +465,27 @@ impl DatasetPanel {
 
                 // Python command
                 ui.label("Python command:");
-                ui.add_enabled(
+                if ui.add_enabled(
                     !running,
                     egui::TextEdit::singleline(&mut self.hf_config.python_cmd)
                         .desired_width(160.0),
-                );
+                ).changed() {
+                    self.save_config();
+                }
                 ui.end_row();
 
                 // Max GB per dataset
                 ui.label("Max GB per dataset:");
                 ui.horizontal(|ui| {
-                    ui.add_enabled(
+                    let resp = ui.add_enabled(
                         !running,
                         egui::Slider::new(&mut self.hf_config.max_gb_per_dataset, 0.0f32..=200.0)
                             .suffix(" GB")
                             .step_by(1.0),
                     );
+                    if resp.changed() {
+                        self.save_config();
+                    }
                     if self.hf_config.max_gb_per_dataset == 0.0 {
                         ui.label(egui::RichText::new("(unlimited)").weak().small());
                     }
@@ -428,19 +495,16 @@ impl DatasetPanel {
                 // HuggingFace token
                 ui.label("HF Token (optional):");
                 ui.horizontal(|ui| {
-                    ui.add_enabled(
+                    let resp = ui.add_enabled(
                         !running,
                         egui::TextEdit::singleline(&mut self.hf_config.hf_token)
                             .password(true)
                             .hint_text("hf_xxxxxxxxxxxxxxxx — required for 🔑 datasets")
                             .desired_width(300.0),
                     );
-                    ui.label(
-                        egui::RichText::new("not saved to disk")
-                            .weak()
-                            .small()
-                            .italics(),
-                    );
+                    if resp.changed() {
+                        self.save_config();
+                    }
                 });
                 ui.end_row();
 
@@ -448,12 +512,15 @@ impl DatasetPanel {
                 ui.label("Parallel connections:");
                 ui.horizontal(|ui| {
                     let mut w = self.hf_config.parallel_workers as u32;
-                    ui.add_enabled(
+                    let resp = ui.add_enabled(
                         !running,
                         egui::Slider::new(&mut w, 1u32..=20)
                             .suffix(" workers")
                             .step_by(1.0),
                     );
+                    if resp.changed() {
+                        self.save_config();
+                    }
                     self.hf_config.parallel_workers = w as u8;
                     ui.label(
                         egui::RichText::new(format!(
@@ -501,6 +568,7 @@ impl DatasetPanel {
                         for i in &group_indices {
                             self.hf_selected.insert(*i);
                         }
+                        self.save_config();
                     }
                     if ui
                         .add_enabled(!running && !none_in_group, egui::Button::new("Select None"))
@@ -509,6 +577,7 @@ impl DatasetPanel {
                         for i in &group_indices {
                             self.hf_selected.remove(i);
                         }
+                        self.save_config();
                     }
                     let group_gib: f32 = group_indices
                         .iter()
@@ -551,6 +620,7 @@ impl DatasetPanel {
                         } else {
                             self.hf_selected.remove(i);
                         }
+                        self.save_config();
                     }
                 }
             });
@@ -604,6 +674,7 @@ impl DatasetPanel {
                     self.hf_state.is_running = false;
                     self.hf_state.paused = false;
                     self.hf_state.log.push("✖  Download cancelled.".into());
+                    self.save_config(); // clears download_in_progress
                 }
             } else if self.hf_state.paused {
                 // Resume — re-launches the pipeline; Python reads progress files and skips done shards.
@@ -612,10 +683,12 @@ impl DatasetPanel {
                 ).clicked() {
                     let cfg = self.build_hf_cfg(&datasets);
                     self.hf_state.resume(cfg);
+                    self.save_config(); // keeps download_in_progress = true
                 }
                 if ui.button("✖ Cancel").clicked() {
                     self.hf_state.paused = false;
                     self.hf_state.log.push("✖  Cancelled.".into());
+                    self.save_config(); // clears download_in_progress
                 }
             } else {
                 let label = if self.hf_state.finished { "🔄 Re-download" } else { "▶ Start Download" };
@@ -623,6 +696,7 @@ impl DatasetPanel {
                 if ui.add_enabled(can_start, egui::Button::new(label)).clicked() {
                     let cfg = self.build_hf_cfg(&datasets);
                     self.hf_state.start(cfg);
+                    self.save_config(); // sets download_in_progress = true
                 }
             }
 
