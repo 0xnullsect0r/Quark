@@ -234,61 +234,66 @@ impl DatasetPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("📂 Dataset");
-        ui.separator();
-
-        // ── Manual files ──────────────────────────────────────────────────
-        egui::CollapsingHeader::new("📄 Manual Files")
-            .default_open(!self.hf_enabled)
+        egui::ScrollArea::vertical()
+            .id_salt("dataset_panel")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.manual_files_ui(ui);
-            });
+                ui.heading("📂 Dataset");
+                ui.separator();
 
-        ui.add_space(8.0);
+                // ── Manual files ──────────────────────────────────────────────────
+                egui::CollapsingHeader::new("📄 Manual Files")
+                    .default_open(!self.hf_enabled)
+                    .show(ui, |ui| {
+                        self.manual_files_ui(ui);
+                    });
 
-        // ── HuggingFace Datasets ──────────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.toggle_value(&mut self.hf_enabled, "🤗 HuggingFace Datasets");
-            if self.hf_enabled {
-                ui.label(
-                    egui::RichText::new("streams directly to JSONL — no full pre-download required")
-                        .weak()
-                        .small(),
-                );
-            }
-        });
+                ui.add_space(8.0);
 
-        if self.hf_enabled {
-            ui.add_space(4.0);
-            egui::Frame::new()
-                .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
-                .corner_radius(6.0)
-                .inner_margin(egui::Margin::same(10))
-                .show(ui, |ui| {
-                    self.hf_ui(ui);
+                // ── HuggingFace Datasets ──────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.toggle_value(&mut self.hf_enabled, "🤗 HuggingFace Datasets");
+                    if self.hf_enabled {
+                        ui.label(
+                            egui::RichText::new("streams directly to JSONL — no full pre-download required")
+                                .weak()
+                                .small(),
+                        );
+                    }
                 });
-        }
 
-        ui.separator();
+                if self.hf_enabled {
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            self.hf_ui(ui);
+                        });
+                }
 
-        // ── Sequence length ───────────────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label("Max sequence length:");
-            ui.add(
-                egui::Slider::new(&mut self.max_seq_len, 128usize..=8192)
-                    .step_by(128.0)
-                    .suffix(" tokens")
-                    .logarithmic(true),
-            );
-        });
+                ui.separator();
 
-        ui.separator();
+                // ── Sequence length ───────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label("Max sequence length:");
+                    ui.add(
+                        egui::Slider::new(&mut self.max_seq_len, 128usize..=8192)
+                            .step_by(128.0)
+                            .suffix(" tokens")
+                            .logarithmic(true),
+                    );
+                });
 
-        // ── Tokenizer ─────────────────────────────────────────────────────
-        egui::CollapsingHeader::new("🔤 Tokenizer")
-            .default_open(true)
-            .show(ui, |ui| {
-                self.tokenizer_ui(ui);
+                ui.separator();
+
+                // ── Tokenizer ─────────────────────────────────────────────────────
+                egui::CollapsingHeader::new("🔤 Tokenizer")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        self.tokenizer_ui(ui);
+                    });
             });
     }
 
