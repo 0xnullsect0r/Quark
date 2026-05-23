@@ -7,5 +7,5 @@ pub mod lr_schedule;
 pub mod metrics;
 pub mod trainer;
 
-pub use metrics::{MetricsReceiver, MetricsSender, TrainingMetrics};
-pub use trainer::{Trainer, TrainerConfig};
+pub use metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
+pub use trainer::{start_training, Trainer, TrainerConfig, TrainingHandle};

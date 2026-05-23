@@ -3,16 +3,16 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 
 use crate::data::batch::DataBatch;
 use crate::memory::tier::TierConfig;
 use crate::model::config::QuarkConfig;
 use crate::training::adamw::AdamWConfig;
 use crate::training::lr_schedule::CosineSchedule;
-use crate::training::metrics::{MetricsReceiver, MetricsSender, TrainingMetrics};
+use crate::training::metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -72,20 +72,18 @@ impl Default for TrainerConfig {
 
 /// A handle to a running training job that allows external control.
 pub struct TrainingHandle {
-    /// Clone this sender to inject out-of-band metrics if needed.
     pub sender: MetricsSender,
-    /// Set to `true` to request a graceful stop.
+    /// Set to `true` to request a graceful stop after the current step.
     pub stop_flag: Arc<AtomicBool>,
 }
 
 impl TrainingHandle {
-    /// Signal the training loop to stop after the current step.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
     }
 }
 
-/// Orchestrates the training loop and streams metrics to the GUI / CLI.
+/// Orchestrates the training loop and streams events to the GUI / CLI.
 ///
 /// This is the legacy wrapper retained for API compatibility.  New code should
 /// prefer [`start_training`] which returns a [`TrainingHandle`] directly.
@@ -96,12 +94,12 @@ pub struct Trainer {
 
 impl Trainer {
     pub fn new(config: TrainerConfig) -> (Self, MetricsReceiver) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         (Self { config, sender: tx }, rx)
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
-        todo!("Trainer::run — use start_training() for the async loop")
+    pub fn run(&self) -> anyhow::Result<()> {
+        todo!("Trainer::run — use start_training() for the background loop")
     }
 }
 
@@ -109,41 +107,23 @@ impl Trainer {
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Spawn the training loop as a background [`tokio`] task.
+/// Spawn the training loop as a background thread.
 ///
-/// Returns a [`TrainingHandle`] (for stopping the job and monitoring it) and
-/// a [`MetricsReceiver`] that yields a [`TrainingMetrics`] snapshot after every
-/// optimiser step.
-///
-/// # Example
-/// ```no_run
-/// # use quark_core::training::trainer::{TrainerConfig, start_training};
-/// # use quark_core::model::config::QuarkConfig;
-/// let (handle, mut rx) = start_training(
-///     QuarkConfig::quark_1b(),
-///     TrainerConfig::default(),
-///     vec![],
-/// );
-/// // Later…
-/// handle.stop();
-/// ```
+/// Returns a [`TrainingHandle`] (for stopping the job) and a [`MetricsReceiver`]
+/// that yields [`TrainingEvent`]s.  The channel closes when the thread finishes.
 pub fn start_training(
     model_config: QuarkConfig,
     trainer_config: TrainerConfig,
     batches: Vec<DataBatch>,
 ) -> (TrainingHandle, MetricsReceiver) {
-    let (tx, rx) = mpsc::unbounded_channel::<TrainingMetrics>();
+    let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let stop_clone = Arc::clone(&stop_flag);
     let tx_clone = tx.clone();
 
-    tokio::spawn(async move {
-        if let Err(e) =
-            run_training_loop(model_config, trainer_config, batches, tx_clone, stop_clone).await
-        {
-            tracing::error!("Training error: {e}");
-        }
+    std::thread::spawn(move || {
+        run_training_loop(model_config, trainer_config, batches, tx_clone, stop_clone);
     });
 
     (TrainingHandle { sender: tx, stop_flag }, rx)
@@ -153,7 +133,7 @@ pub fn start_training(
 // Training loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Core training loop executed inside the background task.
+/// Core training loop executed in a background thread.
 ///
 /// # ⚠ Simulation notice
 ///
@@ -170,35 +150,53 @@ pub fn start_training(
 ///    to apply those gradients.
 /// 5. Per-step learning-rate injection via `CosineSchedule::get_lr`.
 ///
-/// The placeholder loss curve (`1 - step/max_steps + noise`) and the fixed
-/// `grad_norm: 1.0` are intentional stand-ins.  They allow the GUI metrics
-/// panel to be exercised end-to-end while model development is ongoing.
-///
-/// Once `QuarkModel::forward` is available this function should be replaced
-/// with a real loop structured roughly as:
-/// ```text
-/// let logits  = model.forward(batch.input_ids);
-/// let loss    = cross_entropy(logits, batch.labels);
-/// let grads   = loss.backward();
-/// let grads   = GradientsParams::from_grads(grads, &model);
-/// let model   = optimizer.step(lr, model, grads);
-/// ```
-async fn run_training_loop(
+/// The placeholder loss curve and fixed `grad_norm: 1.0` are intentional
+/// stand-ins that allow the GUI to be exercised end-to-end while model
+/// development is ongoing.
+fn run_training_loop(
     model_config: QuarkConfig,
     config: TrainerConfig,
     batches: Vec<DataBatch>,
     tx: MetricsSender,
     stop: Arc<AtomicBool>,
-) -> Result<()> {
-    use std::time::Instant;
+) {
+    macro_rules! log {
+        ($($t:tt)*) => {{ let _ = tx.send(TrainingEvent::Log(format!($($t)*))); }};
+    }
+    macro_rules! phase {
+        ($($t:tt)*) => {{ let _ = tx.send(TrainingEvent::Phase(format!($($t)*))); }};
+    }
 
     tracing::info!("Starting training for {} steps", config.max_steps);
-    std::fs::create_dir_all(&config.output_dir)?;
+
+    if let Err(e) = std::fs::create_dir_all(&config.output_dir) {
+        let _ = tx.send(TrainingEvent::Error(format!("Cannot create output dir: {e}")));
+        return;
+    }
 
     let total_batches = batches.len();
     if total_batches == 0 {
-        tracing::warn!("No training batches provided — running dry loop");
+        log!("⚠  No training batches provided — running dry simulation loop");
     }
+
+    log!("▶  Training started");
+    log!(
+        "   Model:     {} layers, {} heads, hidden={}",
+        model_config.num_hidden_layers,
+        model_config.num_attention_heads,
+        model_config.hidden_size
+    );
+    log!(
+        "   Config:    max_steps={}, batch_size={}, grad_accum={}",
+        config.max_steps,
+        config.batch_size,
+        config.grad_accum_steps
+    );
+    log!(
+        "   Output:    {}",
+        config.output_dir.display()
+    );
+    phase!("Initialising…");
 
     let start_time = Instant::now();
     let mut step = 0u64;
@@ -210,14 +208,13 @@ async fn run_training_loop(
             if batch_idx >= total_batches {
                 batch_idx = 0;
                 epoch += 1;
+                log!("━━  Epoch {} started", epoch + 1);
             }
             let _batch = &batches[batch_idx];
             batch_idx += 1;
         }
 
         let lr = config.schedule.get_lr(step) as f32;
-
-        // Placeholder loss that decreases monotonically with some noise.
         let loss = (1.0_f32 - step as f32 / config.max_steps as f32).max(0.1)
             + 0.05 * rand_f32_seed(step);
 
@@ -230,14 +227,15 @@ async fn run_training_loop(
 
         let elapsed_secs = start_time.elapsed().as_secs();
         let eta_secs = if step > 0 {
-            elapsed_secs.checked_mul(config.max_steps - step)
+            elapsed_secs
+                .checked_mul(config.max_steps - step)
                 .and_then(|n| n.checked_div(step))
                 .unwrap_or(0)
         } else {
             0
         };
 
-        let _ = tx.send(TrainingMetrics {
+        let _ = tx.send(TrainingEvent::Metrics(TrainingMetrics {
             step,
             loss,
             learning_rate: lr,
@@ -248,21 +246,39 @@ async fn run_training_loop(
             disk_used_bytes: 0,
             epoch,
             eta_secs,
-        });
+        }));
+
+        // Log at milestones
+        if step == 0 {
+            phase!("Training…");
+        } else if step.is_multiple_of(100) {
+            log!(
+                "   step={step:>6}  loss={loss:.4}  lr={lr:.2e}  {:.0} tok/s",
+                tokens_per_sec
+            );
+        }
 
         if step > 0 && step.is_multiple_of(config.save_every_steps) {
             let ckpt = config.output_dir.join(format!("checkpoint-{step}"));
-            std::fs::create_dir_all(&ckpt)?;
-            tracing::info!("Saved checkpoint at step {step} → {}", ckpt.display());
+            match std::fs::create_dir_all(&ckpt) {
+                Ok(()) => log!("💾  Checkpoint saved → {}", ckpt.display()),
+                Err(e) => log!("⚠  Checkpoint save failed: {e}"),
+            }
         }
 
         step += 1;
-        // Yield so the async runtime can deliver metrics to the GUI.
-        tokio::task::yield_now().await;
+        // Yield briefly so the channel consumer can drain messages without pegging a CPU core.
+        std::thread::sleep(Duration::from_millis(1));
     }
 
-    tracing::info!("Training complete at step {step}");
-    Ok(())
+    if stop.load(Ordering::SeqCst) {
+        log!("⏹  Training stopped at step {step}");
+        phase!("Stopped");
+    } else {
+        log!("✅  Training complete — {step} steps in {:.1}s", start_time.elapsed().as_secs_f32());
+        phase!("Complete!");
+    }
+    let _ = tx.send(TrainingEvent::Done);
 }
 
 /// Deterministic low-quality pseudo-random noise for the placeholder loss curve.

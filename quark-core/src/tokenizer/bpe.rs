@@ -100,3 +100,71 @@ impl QuarkTokenizer {
         self.inner.get_vocab_size(true)
     }
 }
+
+// ─── Background training entry point ─────────────────────────────────────────
+
+/// Messages emitted by the background tokenizer training thread.
+#[derive(Debug)]
+pub enum TokenizerMessage {
+    Log(String),
+    Progress(f32),
+    Done(PathBuf),
+    Error(String),
+}
+
+/// Spawn BPE tokenizer training in a background thread.
+///
+/// Calls [`QuarkTokenizer::train`] and reports progress over the returned
+/// channel.  The channel closes when training finishes (on `Done` or `Error`).
+pub fn start_tokenizer_training(
+    corpus_files: Vec<PathBuf>,
+    vocab_size: usize,
+    output_path: PathBuf,
+) -> std::sync::mpsc::Receiver<TokenizerMessage> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::time::Instant;
+        let start = Instant::now();
+
+        let n = corpus_files.len();
+        let total_bytes: u64 = corpus_files
+            .iter()
+            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        let mib = total_bytes as f64 / (1u64 << 20) as f64;
+
+        let _ = tx.send(TokenizerMessage::Log(format!(
+            "Scanning {n} corpus file(s) ({mib:.1} MiB)…"
+        )));
+        let _ = tx.send(TokenizerMessage::Progress(0.1));
+
+        let _ = tx.send(TokenizerMessage::Log(format!(
+            "Building BPE vocabulary (vocab_size={vocab_size}, min_frequency=2)…"
+        )));
+        let _ = tx.send(TokenizerMessage::Log(
+            "This may take several minutes for large corpora.".into(),
+        ));
+        let _ = tx.send(TokenizerMessage::Progress(0.3));
+
+        match QuarkTokenizer::train(&corpus_files, vocab_size, &output_path) {
+            Ok(_) => {
+                let elapsed = start.elapsed().as_secs_f32();
+                let _ = tx.send(TokenizerMessage::Progress(0.95));
+                let _ = tx.send(TokenizerMessage::Log(format!(
+                    "Saving tokenizer to {}…",
+                    output_path.display()
+                )));
+                let _ = tx.send(TokenizerMessage::Progress(1.0));
+                let _ = tx.send(TokenizerMessage::Log(format!(
+                    "✅  Tokenizer trained in {elapsed:.1}s — saved to {}",
+                    output_path.display()
+                )));
+                let _ = tx.send(TokenizerMessage::Done(output_path));
+            }
+            Err(e) => {
+                let _ = tx.send(TokenizerMessage::Error(format!("{e}")));
+            }
+        }
+    });
+    rx
+}

@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -8,6 +9,7 @@ use quark_core::data::{
     HfDatasetCategory, HfMessage, HfPersistConfig,
 };
 use quark_core::paths::dataset_config_path;
+use quark_core::tokenizer::{start_tokenizer_training, TokenizerMessage};
 
 // ─── File list entry ──────────────────────────────────────────────────────────
 
@@ -150,6 +152,95 @@ impl HfState {
     }
 }
 
+// ─── Tokenizer training state ─────────────────────────────────────────────────
+
+struct TokenizerState {
+    log: Vec<String>,
+    progress: f32,
+    phase: String,
+    is_running: bool,
+    finished: bool,
+    output_path: Option<PathBuf>,
+    error: Option<String>,
+    receiver: Option<Receiver<TokenizerMessage>>,
+}
+
+impl Default for TokenizerState {
+    fn default() -> Self {
+        Self {
+            log: Vec::new(),
+            progress: 0.0,
+            phase: String::new(),
+            is_running: false,
+            finished: false,
+            output_path: None,
+            error: None,
+            receiver: None,
+        }
+    }
+}
+
+impl TokenizerState {
+    fn poll(&mut self) -> bool {
+        let Some(rx) = &self.receiver else { return false };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    match msg {
+                        TokenizerMessage::Log(s) => {
+                            self.log.push(s);
+                            if self.log.len() > MAX_LOG_LINES {
+                                self.log.drain(0..MAX_LOG_LINES / 4);
+                            }
+                        }
+                        TokenizerMessage::Progress(p) => {
+                            self.progress = p;
+                            // Derive a phase label from progress milestones.
+                            self.phase = if p < 0.2 {
+                                "Scanning corpus…".into()
+                            } else if p < 0.9 {
+                                "Training BPE vocabulary…".into()
+                            } else {
+                                "Saving…".into()
+                            };
+                        }
+                        TokenizerMessage::Done(path) => {
+                            self.is_running = false;
+                            self.finished = true;
+                            self.output_path = Some(path);
+                            self.phase = "Complete!".into();
+                        }
+                        TokenizerMessage::Error(e) => {
+                            self.is_running = false;
+                            self.error = Some(e);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.receiver = None;
+                    self.is_running = false;
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    fn start(&mut self, corpus_files: Vec<PathBuf>, vocab_size: usize, output_path: PathBuf) {
+        self.log.clear();
+        self.progress = 0.0;
+        self.phase = "Starting…".into();
+        self.error = None;
+        self.finished = false;
+        self.output_path = None;
+        self.is_running = true;
+        self.receiver = Some(start_tokenizer_training(corpus_files, vocab_size, output_path));
+    }
+}
+
 // ─── Main panel ───────────────────────────────────────────────────────────────
 
 pub struct DatasetPanel {
@@ -158,7 +249,6 @@ pub struct DatasetPanel {
     max_seq_len: usize,
     tokenizer_path: Option<PathBuf>,
     vocab_size_input: usize,
-    status: String,
 
     // ── HuggingFace datasets section ──────────────────────────────────────
     hf_enabled: bool,
@@ -168,6 +258,11 @@ pub struct DatasetPanel {
     hf_state: HfState,
     /// Whether to auto-scroll the log.
     hf_log_autoscroll: bool,
+    /// Cached on-disk download state: dataset local ID → file size in bytes.
+    downloaded_map: HashMap<String, u64>,
+
+    // ── Tokenizer training ────────────────────────────────────────────────
+    tokenizer_state: TokenizerState,
 }
 
 impl Default for DatasetPanel {
@@ -220,14 +315,18 @@ impl Default for DatasetPanel {
             max_seq_len: 2048,
             tokenizer_path: None,
             vocab_size_input: 32000,
-            status: String::new(),
             // Auto-open the HF section if a download needs to resume.
             hf_enabled: resume_on_start,
             hf_config,
             hf_selected,
             hf_state: HfState::default(),
             hf_log_autoscroll: true,
+            downloaded_map: HashMap::new(),
+            tokenizer_state: TokenizerState::default(),
         };
+
+        // Scan which datasets are already on disk.
+        panel.scan_downloaded();
 
         // If a download was in flight when the app last closed (crash or shutdown),
         // resume it immediately — the Python script will skip completed shards.
@@ -253,6 +352,21 @@ impl DatasetPanel {
             Some(self.hf_config.target_dir.join("datasets"))
         } else {
             None
+        }
+    }
+
+    /// Scan `<target_dir>/datasets/` and populate `downloaded_map` with the
+    /// file size of each dataset JSONL that already exists on disk.
+    fn scan_downloaded(&mut self) {
+        let datasets = hf_datasets();
+        let out_dir = self.hf_config.target_dir.join("datasets");
+        self.downloaded_map.clear();
+        for ds in &datasets {
+            let safe_id = ds.hf_id.replace('/', "__");
+            let path = out_dir.join(format!("{safe_id}.jsonl"));
+            if let Ok(meta) = std::fs::metadata(&path) {
+                self.downloaded_map.insert(ds.id.to_owned(), meta.len());
+            }
         }
     }
 
@@ -285,11 +399,18 @@ impl DatasetPanel {
 
     /// Must be called every frame so the live log updates.
     pub fn update(&mut self, ctx: &egui::Context) {
-        if self.hf_state.poll() {
+        let hf_changed = self.hf_state.poll();
+        if hf_changed {
             ctx.request_repaint();
-            // Persist whenever the download state changes so `download_in_progress`
-            // is always up-to-date on disk (handles Done / Error / Paused).
             self.save_config();
+            // Re-scan downloads when a download job finishes or errors.
+            if self.hf_state.finished || self.hf_state.error.is_some() {
+                self.scan_downloaded();
+            }
+        }
+
+        if self.tokenizer_state.poll() {
+            ctx.request_repaint();
         }
     }
 
@@ -450,6 +571,7 @@ impl DatasetPanel {
                     if resp.changed() {
                         self.hf_config.target_dir = std::path::PathBuf::from(&dir_edit);
                         self.save_config();
+                        self.scan_downloaded();
                     }
                     if ui.add_enabled(!running, egui::Button::new("📁")).clicked() {
                         if let Some(p) = rfd::FileDialog::new()
@@ -458,6 +580,7 @@ impl DatasetPanel {
                         {
                             self.hf_config.target_dir = p;
                             self.save_config();
+                            self.scan_downloaded();
                         }
                     }
                 });
@@ -536,6 +659,26 @@ impl DatasetPanel {
 
         ui.add_space(8.0);
 
+        // ── Refresh downloaded status ─────────────────────────────────────
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("🔄 Refresh Status")
+                .on_hover_text("Re-scan the data directory to update download status")
+                .clicked()
+            {
+                self.scan_downloaded();
+            }
+            let n = self.downloaded_map.len();
+            if n > 0 {
+                ui.label(
+                    egui::RichText::new(format!("{n} dataset(s) already downloaded"))
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+        ui.add_space(4.0);
+
         // ── Dataset checkboxes grouped by category ────────────────────────
         let categories = [
             HfDatasetCategory::Code,
@@ -607,21 +750,48 @@ impl DatasetPanel {
                 ui.add_space(2.0);
 
                 for (i, ds) in &group {
-                    let mut checked = self.hf_selected.contains(i);
-                    let label = format!(
-                        "{}  (~{:.0} GB)",
-                        ds.label,
-                        ds.approx_size_gib
-                    );
-                    let resp = ui.add_enabled(!running, egui::Checkbox::new(&mut checked, label));
-                    if resp.changed() {
-                        if checked {
-                            self.hf_selected.insert(*i);
+                    let downloaded_bytes = self.downloaded_map.get(ds.id).copied();
+                    let is_downloaded = downloaded_bytes.is_some();
+
+                    ui.horizontal(|ui| {
+                        if is_downloaded {
+                            // Already on disk — show checkmark badge and disable checkbox.
+                            let size_str = fmt_bytes(downloaded_bytes.unwrap_or(0));
+                            ui.add_enabled(
+                                false,
+                                egui::Checkbox::new(
+                                    &mut true,
+                                    egui::RichText::new(format!(
+                                        "{}  ({size_str})",
+                                        ds.label
+                                    ))
+                                    .weak(),
+                                ),
+                            );
+                            ui.label(
+                                egui::RichText::new("✓ Downloaded")
+                                    .color(egui::Color32::from_rgb(80, 200, 100))
+                                    .small()
+                                    .strong(),
+                            );
                         } else {
-                            self.hf_selected.remove(i);
+                            let mut checked = self.hf_selected.contains(i);
+                            let label = format!(
+                                "{}  (~{:.0} GB)",
+                                ds.label, ds.approx_size_gib
+                            );
+                            let resp =
+                                ui.add_enabled(!running, egui::Checkbox::new(&mut checked, label));
+                            if resp.changed() {
+                                if checked {
+                                    self.hf_selected.insert(*i);
+                                } else {
+                                    self.hf_selected.remove(i);
+                                }
+                                self.save_config();
+                            }
                         }
-                        self.save_config();
-                    }
+                    });
                 }
             });
 
@@ -887,6 +1057,7 @@ impl DatasetPanel {
     // ── Tokenizer sub-UI ──────────────────────────────────────────────────────
 
     fn tokenizer_ui(&mut self, ui: &mut egui::Ui) {
+        // Load existing tokenizer
         ui.horizontal(|ui| {
             ui.label("Tokenizer:");
             match &self.tokenizer_path {
@@ -896,7 +1067,19 @@ impl DatasetPanel {
                     )
                     .color(egui::Color32::GREEN),
                 ),
-                None => ui.label(egui::RichText::new("None loaded").weak()),
+                None => {
+                    // Auto-show if tokenizer training just finished.
+                    if let Some(p) = &self.tokenizer_state.output_path {
+                        ui.label(
+                            egui::RichText::new(
+                                p.file_name().unwrap_or_default().to_string_lossy(),
+                            )
+                            .color(egui::Color32::GREEN),
+                        )
+                    } else {
+                        ui.label(egui::RichText::new("None loaded").weak())
+                    }
+                }
             };
             if ui.button("📂 Load…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
@@ -910,25 +1093,110 @@ impl DatasetPanel {
         });
 
         ui.add_space(4.0);
-        ui.label("Train new tokenizer from dataset:");
+        ui.separator();
+        ui.label(egui::RichText::new("Train new tokenizer from manual files:").strong());
+
+        let running = self.tokenizer_state.is_running;
+
         ui.horizontal(|ui| {
             ui.label("Vocab size:");
-            ui.add(
+            ui.add_enabled(
+                !running,
                 egui::DragValue::new(&mut self.vocab_size_input)
                     .range(1000..=128000)
                     .speed(100.0),
             );
-            let can_train = !self.files.is_empty();
+
+            let can_train = !self.files.is_empty() && !running;
             if ui
                 .add_enabled(can_train, egui::Button::new("🏋 Train Tokenizer"))
+                .on_hover_text("Train a BPE tokenizer from the files in the Manual Files list")
                 .clicked()
             {
-                self.status =
-                    "Tokenizer training queued (run from CLI or start training)".into();
+                let corpus = self.file_paths();
+                let out = quark_core::paths::datasets_dir().join("tokenizer.json");
+                self.tokenizer_state.start(corpus, self.vocab_size_input, out);
+            }
+
+            if self.files.is_empty() {
+                ui.label(
+                    egui::RichText::new("Add files above to enable training.")
+                        .weak()
+                        .italics(),
+                );
             }
         });
-        if !self.status.is_empty() {
-            ui.label(egui::RichText::new(&self.status).weak().italics());
+
+        // Status / progress
+        if running || self.tokenizer_state.progress > 0.0 {
+            ui.add_space(4.0);
+            ui.add(
+                egui::ProgressBar::new(self.tokenizer_state.progress)
+                    .desired_width(ui.available_width())
+                    .animate(running)
+                    .text(format!(
+                        "{:.0}%  {}",
+                        self.tokenizer_state.progress * 100.0,
+                        self.tokenizer_state.phase
+                    )),
+            );
+        }
+
+        // Error
+        if let Some(err) = &self.tokenizer_state.error.clone() {
+            ui.label(
+                egui::RichText::new(format!("❌  {err}"))
+                    .color(egui::Color32::RED)
+                    .small(),
+            );
+        }
+
+        // Live log
+        if !self.tokenizer_state.log.is_empty() || running {
+            ui.add_space(2.0);
+            let log_ref = &self.tokenizer_state.log;
+            egui::ScrollArea::vertical()
+                .id_salt("tok_log")
+                .max_height(180.0)
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(18, 18, 20))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            for line in log_ref.iter() {
+                                let color = if line.starts_with("❌") {
+                                    egui::Color32::from_rgb(255, 100, 100)
+                                } else if line.starts_with("✅") || line.starts_with("✔") {
+                                    egui::Color32::from_rgb(100, 220, 100)
+                                } else {
+                                    egui::Color32::from_rgb(200, 200, 200)
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(color),
+                                    )
+                                    .selectable(true),
+                                );
+                            }
+                            if running {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("▋")
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(egui::Color32::LIGHT_GRAY),
+                                    )
+                                    .selectable(false),
+                                );
+                            }
+                        });
+                });
         }
     }
 }

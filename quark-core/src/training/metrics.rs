@@ -1,7 +1,5 @@
 #![allow(dead_code, unused_imports)]
 
-use tokio::sync::mpsc;
-
 /// Snapshot of training state emitted after each optimiser step.
 #[derive(Debug, Clone)]
 pub struct TrainingMetrics {
@@ -17,5 +15,20 @@ pub struct TrainingMetrics {
     pub eta_secs: u64,
 }
 
-pub type MetricsSender = mpsc::UnboundedSender<TrainingMetrics>;
-pub type MetricsReceiver = mpsc::UnboundedReceiver<TrainingMetrics>;
+/// Events emitted by the training loop to the GUI over an mpsc channel.
+#[derive(Debug)]
+pub enum TrainingEvent {
+    /// Numeric metrics snapshot after one optimiser step.
+    Metrics(TrainingMetrics),
+    /// Human-readable log line.
+    Log(String),
+    /// Short phase description for the status bar.
+    Phase(String),
+    /// Training completed successfully.
+    Done,
+    /// Training aborted; contains an error description.
+    Error(String),
+}
+
+pub type MetricsSender = std::sync::mpsc::Sender<TrainingEvent>;
+pub type MetricsReceiver = std::sync::mpsc::Receiver<TrainingEvent>;
