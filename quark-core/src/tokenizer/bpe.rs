@@ -114,15 +114,19 @@ pub enum TokenizerMessage {
 
 /// Spawn BPE tokenizer training in a background thread.
 ///
-/// Calls [`QuarkTokenizer::train`] and reports progress over the returned
-/// channel.  The channel closes when training finishes (on `Done` or `Error`).
+/// `max_bytes` caps how much plain text is sampled before training (0 = no
+/// cap, dangerous with large corpora).  JSONL files have their `"text"` field
+/// extracted so JSON syntax doesn't pollute the vocabulary.  The sampled text
+/// is written to a temp file beside `output_path` and deleted after training.
 pub fn start_tokenizer_training(
     corpus_files: Vec<PathBuf>,
     vocab_size: usize,
     output_path: PathBuf,
+    max_bytes: u64,
 ) -> std::sync::mpsc::Receiver<TokenizerMessage> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write as _};
         use std::time::Instant;
         let start = Instant::now();
 
@@ -131,37 +135,114 @@ pub fn start_tokenizer_training(
             .iter()
             .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
             .sum();
-        let mib = total_bytes as f64 / (1u64 << 20) as f64;
+        let total_gib = total_bytes as f64 / (1u64 << 30) as f64;
+        let cap_label = if max_bytes == 0 {
+            "no cap".into()
+        } else {
+            format!("{:.1} GiB cap", max_bytes as f64 / (1u64 << 30) as f64)
+        };
 
         let _ = tx.send(TokenizerMessage::Log(format!(
-            "Scanning {n} corpus file(s) ({mib:.1} MiB)…"
-        )));
-        let _ = tx.send(TokenizerMessage::Progress(0.1));
-
-        let _ = tx.send(TokenizerMessage::Log(format!(
-            "Building BPE vocabulary (vocab_size={vocab_size}, min_frequency=2)…"
+            "Found {n} corpus file(s) ({total_gib:.1} GiB on disk, {cap_label})"
         )));
         let _ = tx.send(TokenizerMessage::Log(
-            "This may take several minutes for large corpora.".into(),
+            "Sampling text from corpus…".into(),
         ));
-        let _ = tx.send(TokenizerMessage::Progress(0.3));
+        let _ = tx.send(TokenizerMessage::Progress(0.05));
 
-        match QuarkTokenizer::train(&corpus_files, vocab_size, &output_path) {
+        // ── Sample + extract plain text into a temp file ──────────────────
+        let tmp_path = output_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("_tokenizer_corpus_tmp.txt");
+
+        let tmp_file = match std::fs::File::create(&tmp_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(TokenizerMessage::Error(
+                    format!("Cannot create temp file: {e}"),
+                ));
+                return;
+            }
+        };
+        let mut writer = std::io::BufWriter::new(tmp_file);
+        let mut written_bytes: u64 = 0;
+        let mut docs_written: u64 = 0;
+        let mut hit_cap = false;
+
+        'files: for path in &corpus_files {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(TokenizerMessage::Log(format!(
+                        "⚠  Skipping {}: {e}", path.display()
+                    )));
+                    continue;
+                }
+            };
+            for raw in BufReader::new(file).lines() {
+                let Ok(raw) = raw else { continue };
+                let text: &str = &if ext == "jsonl" {
+                    serde_json::from_str::<serde_json::Value>(&raw)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("text").and_then(|t| t.as_str()).map(str::to_owned)
+                        })
+                        .unwrap_or(raw)
+                } else {
+                    raw
+                };
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if let Err(e) = writeln!(writer, "{text}") {
+                    let _ = tx.send(TokenizerMessage::Error(format!("Write error: {e}")));
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+                written_bytes += text.len() as u64 + 1;
+                docs_written += 1;
+                if max_bytes > 0 && written_bytes >= max_bytes {
+                    hit_cap = true;
+                    break 'files;
+                }
+            }
+        }
+        drop(writer); // flush
+
+        let written_gib = written_bytes as f64 / (1u64 << 30) as f64;
+        if hit_cap {
+            let _ = tx.send(TokenizerMessage::Log(format!(
+                "Sampled {written_gib:.2} GiB ({docs_written} docs) — cap reached. \
+                 Raise the cap to use more data."
+            )));
+        } else {
+            let _ = tx.send(TokenizerMessage::Log(format!(
+                "Sampled {written_gib:.2} GiB ({docs_written} docs)"
+            )));
+        }
+        let _ = tx.send(TokenizerMessage::Progress(0.25));
+
+        let _ = tx.send(TokenizerMessage::Log(format!(
+            "Training BPE (vocab_size={vocab_size})… this takes ~5–20 min per GiB"
+        )));
+        let _ = tx.send(TokenizerMessage::Progress(0.30));
+
+        match QuarkTokenizer::train(&[tmp_path.clone()], vocab_size, &output_path) {
             Ok(_) => {
                 let elapsed = start.elapsed().as_secs_f32();
-                let _ = tx.send(TokenizerMessage::Progress(0.95));
-                let _ = tx.send(TokenizerMessage::Log(format!(
-                    "Saving tokenizer to {}…",
-                    output_path.display()
-                )));
+                let _ = std::fs::remove_file(&tmp_path);
                 let _ = tx.send(TokenizerMessage::Progress(1.0));
                 let _ = tx.send(TokenizerMessage::Log(format!(
-                    "✅  Tokenizer trained in {elapsed:.1}s — saved to {}",
+                    "✅  Tokenizer trained in {elapsed:.0}s — saved to {}",
                     output_path.display()
                 )));
                 let _ = tx.send(TokenizerMessage::Done(output_path));
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
                 let _ = tx.send(TokenizerMessage::Error(format!("{e}")));
             }
         }

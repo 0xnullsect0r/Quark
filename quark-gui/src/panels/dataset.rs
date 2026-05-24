@@ -229,7 +229,13 @@ impl TokenizerState {
         changed
     }
 
-    fn start(&mut self, corpus_files: Vec<PathBuf>, vocab_size: usize, output_path: PathBuf) {
+    fn start(
+        &mut self,
+        corpus_files: Vec<PathBuf>,
+        vocab_size: usize,
+        output_path: PathBuf,
+        max_bytes: u64,
+    ) {
         self.log.clear();
         self.progress = 0.0;
         self.phase = "Starting…".into();
@@ -237,7 +243,8 @@ impl TokenizerState {
         self.finished = false;
         self.output_path = None;
         self.is_running = true;
-        self.receiver = Some(start_tokenizer_training(corpus_files, vocab_size, output_path));
+        self.receiver =
+            Some(start_tokenizer_training(corpus_files, vocab_size, output_path, max_bytes));
     }
 }
 
@@ -263,6 +270,8 @@ pub struct DatasetPanel {
 
     // ── Tokenizer training ────────────────────────────────────────────────
     tokenizer_state: TokenizerState,
+    /// How many GiB of text to sample for tokenizer training (default 5).
+    tokenizer_max_gib: f32,
 }
 
 impl Default for DatasetPanel {
@@ -323,6 +332,7 @@ impl Default for DatasetPanel {
             hf_log_autoscroll: true,
             downloaded_map: HashMap::new(),
             tokenizer_state: TokenizerState::default(),
+            tokenizer_max_gib: 5.0,
         };
 
         // Scan which datasets are already on disk.
@@ -1122,7 +1132,21 @@ impl DatasetPanel {
                     .range(1000..=128000)
                     .speed(100.0),
             );
+            ui.separator();
+            ui.label("Max corpus:");
+            ui.add_enabled(
+                !running,
+                egui::Slider::new(&mut self.tokenizer_max_gib, 0.5f32..=50.0)
+                    .suffix(" GiB")
+                    .step_by(0.5),
+            )
+            .on_hover_text(
+                "Cap how much text is sampled from your corpus. \
+                 5 GiB ≈ 20–60 min. More data = better tokenizer but slower.",
+            );
+        });
 
+        ui.horizontal(|ui| {
             let can_train = !all_corpus.is_empty() && !running;
             if ui
                 .add_enabled(can_train, egui::Button::new("🏋 Train Tokenizer"))
@@ -1132,7 +1156,10 @@ impl DatasetPanel {
                 .clicked()
             {
                 let out = quark_core::paths::datasets_dir().join("tokenizer.json");
-                self.tokenizer_state.start(all_corpus.clone(), self.vocab_size_input, out);
+                let max_bytes =
+                    (self.tokenizer_max_gib as f64 * (1u64 << 30) as f64) as u64;
+                self.tokenizer_state
+                    .start(all_corpus.clone(), self.vocab_size_input, out, max_bytes);
             }
 
             if all_corpus.is_empty() {
