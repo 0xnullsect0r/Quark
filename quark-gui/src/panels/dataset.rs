@@ -1054,6 +1054,18 @@ impl DatasetPanel {
         }
     }
 
+    /// Collect JSONL files already downloaded by the HF downloader.
+    fn hf_corpus_files(&self) -> Vec<PathBuf> {
+        let dir = quark_core::paths::datasets_dir();
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect()
+    }
+
     // ── Tokenizer sub-UI ──────────────────────────────────────────────────────
 
     fn tokenizer_ui(&mut self, ui: &mut egui::Ui) {
@@ -1098,6 +1110,10 @@ impl DatasetPanel {
 
         let running = self.tokenizer_state.is_running;
 
+        let hf_files = self.hf_corpus_files();
+        let all_corpus: Vec<PathBuf> =
+            self.file_paths().into_iter().chain(hf_files).collect();
+
         ui.horizontal(|ui| {
             ui.label("Vocab size:");
             ui.add_enabled(
@@ -1107,22 +1123,28 @@ impl DatasetPanel {
                     .speed(100.0),
             );
 
-            let can_train = !self.files.is_empty() && !running;
+            let can_train = !all_corpus.is_empty() && !running;
             if ui
                 .add_enabled(can_train, egui::Button::new("🏋 Train Tokenizer"))
-                .on_hover_text("Train a BPE tokenizer from the files in the Manual Files list")
+                .on_hover_text(
+                    "Train a BPE tokenizer from manual files + any downloaded HF datasets",
+                )
                 .clicked()
             {
-                let corpus = self.file_paths();
                 let out = quark_core::paths::datasets_dir().join("tokenizer.json");
-                self.tokenizer_state.start(corpus, self.vocab_size_input, out);
+                self.tokenizer_state.start(all_corpus.clone(), self.vocab_size_input, out);
             }
 
-            if self.files.is_empty() {
+            if all_corpus.is_empty() {
                 ui.label(
-                    egui::RichText::new("Add files above to enable training.")
+                    egui::RichText::new("Add files or download HF datasets to enable training.")
                         .weak()
                         .italics(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!("{} corpus file(s) ready", all_corpus.len()))
+                        .weak(),
                 );
             }
         });

@@ -9,13 +9,28 @@ struct CkptEntry {
     modified: Option<SystemTime>,
 }
 
-#[derive(Default)]
 pub struct CheckpointsPanel {
     dir: Option<PathBuf>,
     entries: Vec<CkptEntry>,
     loaded: Option<PathBuf>,
     confirm_delete: Option<usize>,
     status: String,
+}
+
+impl Default for CheckpointsPanel {
+    fn default() -> Self {
+        let dir = quark_core::paths::checkpoints_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut s = Self {
+            dir: Some(dir),
+            entries: Vec::new(),
+            loaded: None,
+            confirm_delete: None,
+            status: String::new(),
+        };
+        s.scan();
+        s
+    }
 }
 
 impl CheckpointsPanel {

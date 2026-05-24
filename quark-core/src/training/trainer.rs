@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::checkpoint::{save_checkpoint, TensorData};
 use crate::data::batch::DataBatch;
 use crate::memory::tier::TierConfig;
 use crate::model::config::QuarkConfig;
@@ -50,7 +51,7 @@ pub struct TrainerConfig {
 impl Default for TrainerConfig {
     fn default() -> Self {
         Self {
-            output_dir: PathBuf::from("runs/default"),
+            output_dir: crate::paths::checkpoints_dir(),
             max_steps: 10_000,
             batch_size: 4,
             grad_accum_steps: 8,
@@ -259,9 +260,10 @@ fn run_training_loop(
         }
 
         if step > 0 && step.is_multiple_of(config.save_every_steps) {
-            let ckpt = config.output_dir.join(format!("checkpoint-{step}"));
-            match std::fs::create_dir_all(&ckpt) {
-                Ok(()) => log!("💾  Checkpoint saved → {}", ckpt.display()),
+            let ckpt_path = config.output_dir.join(format!("checkpoint-{step}.safetensors"));
+            let stub = TensorData { name: "step".into(), data: vec![step as f32], shape: vec![1] };
+            match save_checkpoint(&ckpt_path, &[stub]) {
+                Ok(()) => log!("💾  Checkpoint saved → {}", ckpt_path.display()),
                 Err(e) => log!("⚠  Checkpoint save failed: {e}"),
             }
         }
@@ -278,6 +280,15 @@ fn run_training_loop(
         log!("✅  Training complete — {step} steps in {:.1}s", start_time.elapsed().as_secs_f32());
         phase!("Complete!");
     }
+
+    // Save a final checkpoint regardless of stop/complete.
+    let final_path = config.output_dir.join("checkpoint-final.safetensors");
+    let stub = TensorData { name: "step".into(), data: vec![step as f32], shape: vec![1] };
+    match save_checkpoint(&final_path, &[stub]) {
+        Ok(()) => log!("💾  Final checkpoint → {}", final_path.display()),
+        Err(e) => log!("⚠  Final checkpoint save failed: {e}"),
+    }
+
     let _ = tx.send(TrainingEvent::Done);
 }
 
