@@ -2,7 +2,7 @@
 //!
 //! Expects model files next to the executable in a `model/` directory:
 //!   model/config.json              QuarkConfig
-//!   model/checkpoint.safetensors   weights
+//!   model/checkpoint.bin           weights (CompactRecorder format)
 //!   model/tokenizer.json           BPE tokenizer
 //!   model/mcp.json                 McpConfig  (optional)
 //!   model/system_prompt.txt        system prompt (optional)
@@ -11,7 +11,10 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use quark_core::inference::sampling::SamplingParams;
+use quark_core::inference::InferenceEngine;
 use quark_core::mcp::{execute_tool, format_tool_result, parse_tool_calls, McpConfig};
+use quark_core::model::config::QuarkConfig;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -39,7 +42,6 @@ fn main() -> Result<()> {
     } else {
         McpConfig::default()
     };
-    // Set working dir to cwd so relative tool paths work naturally
     mcp_cfg.working_dir = std::env::current_dir().unwrap_or_else(|_| exe_dir.clone());
 
     // Load system prompt
@@ -51,24 +53,45 @@ fn main() -> Result<()> {
             .to_string()
     };
 
-    // Load config.json for display
+    // Load model config
     let config_path = model_dir.join("config.json");
-    let model_name = if config_path.exists() {
-        let txt = std::fs::read_to_string(&config_path).unwrap_or_default();
-        let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
-        v["name"].as_str().unwrap_or("Quark").to_string()
+    let model_config: QuarkConfig = if config_path.exists() {
+        let txt = std::fs::read_to_string(&config_path)?;
+        serde_json::from_str(&txt).unwrap_or_else(|_| QuarkConfig::quark_1b())
     } else {
-        "Quark".to_string()
+        QuarkConfig::quark_1b()
     };
+
+    let model_name = "Quark".to_string();
+
+    // Load inference engine
+    let checkpoint_path = model_dir.join("checkpoint.bin");
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    let engine = if checkpoint_path.exists() && tokenizer_path.exists() {
+        eprintln!("Loading model from {}…", checkpoint_path.display());
+        match InferenceEngine::load(&checkpoint_path, &model_config, &tokenizer_path) {
+            Ok(e) => {
+                eprintln!("Model loaded.");
+                Some(e)
+            }
+            Err(e) => {
+                eprintln!("Warning: model load failed: {e}");
+                None
+            }
+        }
+    } else {
+        eprintln!("Warning: checkpoint.bin or tokenizer.json not found — running without model.");
+        None
+    };
+
+    let sampling = SamplingParams::default();
 
     println!("╔══════════════════════════════════════════╗");
     println!("║  {} — Chat                               ", model_name);
     println!("╚══════════════════════════════════════════╝");
     println!();
-    println!(
-        "System: {}",
-        system_prompt.lines().next().unwrap_or("")
-    );
+    println!("System: {}", system_prompt.lines().next().unwrap_or(""));
     println!();
     print_mcp_status(&mcp_cfg);
     println!();
@@ -76,7 +99,6 @@ fn main() -> Result<()> {
     println!("─────────────────────────────────────────────────");
     println!();
 
-    // Conversation history (simple string accumulation for context)
     let mut history = format!("<system>\n{system_prompt}\n</system>\n\n");
 
     let stdin = io::stdin();
@@ -86,7 +108,7 @@ fn main() -> Result<()> {
 
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
                 eprintln!("Input error: {e}");
@@ -116,57 +138,43 @@ fn main() -> Result<()> {
 
         history.push_str(&format!("<user>\n{input}\n</user>\n\n<assistant>\n"));
 
-        // NOTE: Real inference requires a loaded Burn model.
-        // This binary is designed to be bundled by quark-gui's export feature,
-        // which will wire up actual model loading when the full inference pipeline
-        // is integrated. For now we show the tool-calling loop correctly and
-        // emit a placeholder response so the MCP dispatch machinery is exercisable.
-        println!();
-        println!("Quark: [Model weights not loaded — this binary was exported without a compiled");
-        println!(
-            "       backend wired to inference. Re-export from Quark GUI after training"
-        );
-        println!("       completes to get a functional model.]");
-
-        // Demo: if user mentions a filename, do a read_file to show MCP works
-        let simulated_response =
-            if input.contains(".rs") || input.contains(".txt") || input.contains(".py") {
-                // Extract a plausible filename from input
-                let word = input
-                    .split_whitespace()
-                    .find(|w| w.contains('.') && !w.starts_with("http"))
-                    .unwrap_or("");
-                if !word.is_empty() {
-                    format!(
-                        "Let me read that file for you.\n<tool_call>{{\"tool\":\"read_file\",\"path\":\"{word}\"}}</tool_call>"
-                    )
-                } else {
-                    String::new()
+        let response = match &engine {
+            Some(e) => {
+                print!("Quark: ");
+                io::stdout().flush()?;
+                match e.generate(&history, sampling.clone()) {
+                    Ok(text) => {
+                        println!("{text}");
+                        text
+                    }
+                    Err(err) => {
+                        let msg = format!("[Generation error: {err}]");
+                        println!("{msg}");
+                        msg
+                    }
                 }
-            } else {
-                String::new()
-            };
-
-        if !simulated_response.is_empty() {
-            let calls = parse_tool_calls(&simulated_response);
-            for call in &calls {
-                println!();
-                println!("[MCP] Calling tool: {} {:?}", call.tool, call.args);
-                let result = execute_tool(call, &mcp_cfg);
-                let formatted = format_tool_result(&result);
-                println!(
-                    "[MCP] Result ({}):",
-                    if result.ok { "ok" } else { "error" }
-                );
-                // Show a preview (first 500 chars)
-                let preview: String = result.content.chars().take(500).collect();
-                println!("{preview}");
-                history.push_str(&formatted);
-                history.push('\n');
             }
+            None => {
+                let msg = "[Model not loaded — export from Quark GUI after training to get a functional model.]";
+                println!("Quark: {msg}");
+                msg.to_string()
+            }
+        };
+
+        let calls = parse_tool_calls(&response);
+        for call in &calls {
+            println!();
+            println!("[MCP] Calling tool: {} {:?}", call.tool, call.args);
+            let result = execute_tool(call, &mcp_cfg);
+            let formatted = format_tool_result(&result);
+            println!("[MCP] Result ({}):", if result.ok { "ok" } else { "error" });
+            let preview: String = result.content.chars().take(500).collect();
+            println!("{preview}");
+            history.push_str(&formatted);
+            history.push('\n');
         }
 
-        history.push_str("</assistant>\n\n");
+        history.push_str(&format!("{response}\n</assistant>\n\n"));
         println!();
     }
 
@@ -176,30 +184,12 @@ fn main() -> Result<()> {
 
 fn print_mcp_status(cfg: &McpConfig) {
     println!("MCP Tools enabled:");
-    println!(
-        "  read_file:    {}",
-        if cfg.read_file { "✓" } else { "✗" }
-    );
-    println!(
-        "  write_file:   {}",
-        if cfg.write_file { "✓" } else { "✗" }
-    );
-    println!(
-        "  list_dir:     {}",
-        if cfg.list_dir { "✓" } else { "✗" }
-    );
-    println!(
-        "  search_files: {}",
-        if cfg.search_files { "✓" } else { "✗" }
-    );
-    println!(
-        "  get_cwd:      {}",
-        if cfg.get_cwd { "✓" } else { "✗" }
-    );
-    println!(
-        "  run_shell:    {}",
-        if cfg.run_shell { "✓" } else { "✗" }
-    );
+    println!("  read_file:    {}", if cfg.read_file { "✓" } else { "✗" });
+    println!("  write_file:   {}", if cfg.write_file { "✓" } else { "✗" });
+    println!("  list_dir:     {}", if cfg.list_dir { "✓" } else { "✗" });
+    println!("  search_files: {}", if cfg.search_files { "✓" } else { "✗" });
+    println!("  get_cwd:      {}", if cfg.get_cwd { "✓" } else { "✗" });
+    println!("  run_shell:    {}", if cfg.run_shell { "✓" } else { "✗" });
     println!("  working_dir:  {}", cfg.working_dir.display());
 }
 
@@ -209,11 +199,4 @@ fn print_help() {
     println!("  /mcp    — show MCP tool status");
     println!("  /help   — show this help");
     println!("  /exit   — quit");
-    println!();
-    println!("MCP Tool Calling:");
-    println!("  The model can call tools by emitting:");
-    println!("  <tool_call>{{\"tool\":\"read_file\",\"path\":\"file.txt\"}}</tool_call>");
-    println!(
-        "  Available tools: read_file, write_file, list_dir, search_files, get_cwd, run_shell"
-    );
 }

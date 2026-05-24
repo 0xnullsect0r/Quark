@@ -1,6 +1,11 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use quark_core::inference::sampling::SamplingParams;
+use quark_core::inference::InferenceEngine;
+use quark_core::model::config::QuarkConfig;
 
 #[derive(Clone, PartialEq)]
 enum Role {
@@ -14,13 +19,27 @@ struct Message {
     content: String,
 }
 
+type LoadReceiver = std::sync::mpsc::Receiver<Result<Arc<InferenceEngine>, String>>;
+
+enum EngineState {
+    None,
+    Loading,
+    Ready(Arc<InferenceEngine>),
+    Error(String),
+}
+
 pub struct ChatPanel {
     messages: Vec<Message>,
     input: String,
     system_prompt: String,
     sampling: SamplingParams,
-    loaded_model: Option<String>,
+    engine_state: EngineState,
+    loaded_model_name: Option<String>,
     is_generating: bool,
+    /// Streams decoded tokens from the inference thread.
+    response_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Receives the result of background model loading.
+    load_rx: Option<LoadReceiver>,
 }
 
 impl Default for ChatPanel {
@@ -30,37 +49,107 @@ impl Default for ChatPanel {
             input: String::new(),
             system_prompt: "You are a helpful coding assistant.".into(),
             sampling: SamplingParams::default(),
-            loaded_model: None,
+            engine_state: EngineState::None,
+            loaded_model_name: None,
             is_generating: false,
+            response_rx: None,
+            load_rx: None,
         }
     }
 }
 
 impl ChatPanel {
-    pub fn set_model(&mut self, name: impl Into<String>) {
-        self.loaded_model = Some(name.into());
+    /// Begin loading a checkpoint in a background thread.
+    pub fn start_load(&mut self, checkpoint: PathBuf, config: QuarkConfig, tokenizer: PathBuf) {
+        self.engine_state = EngineState::Loading;
+        self.loaded_model_name = checkpoint
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Arc<InferenceEngine>, String>>();
+        self.load_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result = InferenceEngine::load(&checkpoint, &config, &tokenizer)
+                .map(Arc::new)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_load(&mut self) {
+        if let Some(rx) = &self.load_rx {
+            match rx.try_recv() {
+                Ok(Ok(engine)) => {
+                    self.engine_state = EngineState::Ready(engine);
+                    self.load_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.engine_state = EngineState::Error(e);
+                    self.load_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.engine_state = EngineState::Error("Load thread crashed".into());
+                    self.load_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn drain_response(&mut self) {
+        if let Some(rx) = &self.response_rx {
+            let last = self.messages.iter_mut().rev().find(|m| m.role == Role::Assistant);
+            while let Ok(token) = rx.try_recv() {
+                if let Some(msg) = self.messages.iter_mut().rev().find(|m| m.role == Role::Assistant) {
+                    msg.content.push_str(&token);
+                }
+            }
+            if matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)) {
+                self.response_rx = None;
+                self.is_generating = false;
+            }
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.poll_load();
+        self.drain_response();
+
+        if self.is_generating || matches!(&self.engine_state, EngineState::Loading) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         ui.heading("💬 Chat");
         ui.separator();
 
         // Model status bar
         ui.horizontal(|ui| {
-            match &self.loaded_model {
-                Some(name) => {
+            match &self.engine_state {
+                EngineState::None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ No model loaded — go to Checkpoints tab to load one.",
+                        )
+                        .color(egui::Color32::YELLOW),
+                    );
+                }
+                EngineState::Loading => {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Loading model…").weak());
+                }
+                EngineState::Ready(_) => {
+                    let name = self.loaded_model_name.as_deref().unwrap_or("Model");
                     ui.label(
                         egui::RichText::new(format!("Model: {name}"))
                             .color(egui::Color32::GREEN)
                             .strong(),
                     );
                 }
-                None => {
+                EngineState::Error(e) => {
                     ui.label(
-                        egui::RichText::new(
-                            "⚠ No model loaded — go to Checkpoints tab to load one.",
-                        )
-                        .color(egui::Color32::YELLOW),
+                        egui::RichText::new(format!("❌ Load failed: {e}"))
+                            .color(egui::Color32::RED),
                     );
                 }
             }
@@ -165,8 +254,6 @@ impl ChatPanel {
                         ui.spinner();
                         ui.label(egui::RichText::new("generating…").weak().italics());
                     });
-                    ui.ctx()
-                        .request_repaint_after(std::time::Duration::from_millis(100));
                 }
             });
 
@@ -179,25 +266,55 @@ impl ChatPanel {
             let text_edit = egui::TextEdit::singleline(&mut self.input)
                 .desired_width(ui.available_width() - 80.0)
                 .hint_text("Ask Quark something…");
-            let response = ui.add(text_edit);
+            let response_widget = ui.add(text_edit);
 
-            let can_send = !self.input.trim().is_empty()
-                && !self.is_generating
-                && self.loaded_model.is_some();
+            let model_ready = matches!(&self.engine_state, EngineState::Ready(_));
+            let can_send =
+                !self.input.trim().is_empty() && !self.is_generating && model_ready;
 
-            if (send_shortcut && response.has_focus() || ui.add_enabled(can_send, egui::Button::new("Send")).clicked()) && can_send {
-                let user_msg = std::mem::take(&mut self.input);
-                self.messages.push(Message {
-                    role: Role::User,
-                    content: user_msg,
-                });
-                self.messages.push(Message {
-                    role: Role::Assistant,
-                    content: "(Model inference not yet wired — checkpoint is loaded but generation requires the training loop to finish)".into(),
-                });
+            let send = (send_shortcut && response_widget.has_focus())
+                || ui.add_enabled(can_send, egui::Button::new("Send")).clicked();
+
+            if send && can_send {
+                let user_text = std::mem::take(&mut self.input);
+                self.messages.push(Message { role: Role::User, content: user_text.clone() });
+                self.messages.push(Message { role: Role::Assistant, content: String::new() });
+
+                if let EngineState::Ready(engine) = &self.engine_state {
+                    let engine = Arc::clone(engine);
+                    let sampling = self.sampling.clone();
+                    let system_prompt = self.system_prompt.clone();
+                    let (token_tx, token_rx) = std::sync::mpsc::channel::<String>();
+                    self.response_rx = Some(token_rx);
+                    self.is_generating = true;
+
+                    // Build full prompt from conversation history
+                    let mut full_prompt =
+                        format!("<system>\n{system_prompt}\n</system>\n\n");
+                    for msg in &self.messages {
+                        match msg.role {
+                            Role::User => full_prompt.push_str(&format!(
+                                "<user>\n{}\n</user>\n\n<assistant>\n",
+                                msg.content
+                            )),
+                            Role::Assistant => {
+                                if !msg.content.is_empty() {
+                                    full_prompt.push_str(&format!(
+                                        "{}\n</assistant>\n\n",
+                                        msg.content
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    std::thread::spawn(move || {
+                        let _ = engine.generate_streaming(&full_prompt, sampling, token_tx);
+                    });
+                }
             }
 
-            if self.loaded_model.is_none() {
+            if !model_ready && !matches!(&self.engine_state, EngineState::Loading) {
                 ui.label(egui::RichText::new("Load a checkpoint first").weak());
             }
         });

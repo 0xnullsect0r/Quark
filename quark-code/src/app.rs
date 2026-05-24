@@ -1,6 +1,8 @@
 //! Application state for Quark Code.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use quark_core::inference::InferenceEngine;
 use quark_core::mcp::McpConfig;
 
 // ─── Mode ─────────────────────────────────────────────────────────────────────
@@ -71,6 +73,7 @@ pub struct App {
     pub system_prompt: String,
     pub mcp_cfg:       McpConfig,
     pub model_loaded:  bool,
+    pub engine:        Option<Arc<InferenceEngine>>,
     /// Streaming: tokens arrive here from the background generate thread.
     pub stream_buf:    String,
     pub generating:    bool,
@@ -95,6 +98,7 @@ impl App {
         system_prompt: String,
         mcp_cfg:       McpConfig,
         model_loaded:  bool,
+        engine:        Option<Arc<InferenceEngine>>,
         project_root:  PathBuf,
     ) -> Self {
         let agents_md = load_agents_md(&project_root);
@@ -109,6 +113,7 @@ impl App {
             system_prompt,
             mcp_cfg,
             model_loaded,
+            engine,
             stream_buf:   String::new(),
             generating:   false,
             project_root,

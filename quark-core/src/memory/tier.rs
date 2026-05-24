@@ -24,8 +24,8 @@ pub struct TierConfig {
 impl Default for TierConfig {
     fn default() -> Self {
         Self {
-            vram_limit_frac: 0.60,
-            ram_limit_frac: 0.75,
+            vram_limit_frac: 0.80,
+            ram_limit_frac: 0.80,
             cpu_thread_frac: 0.80,
             gpu_compute_frac: 0.90,
             disk_offload_path: PathBuf::from("offload"),

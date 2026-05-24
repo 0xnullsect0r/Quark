@@ -24,25 +24,57 @@ impl HardwareBudget {
         let ram_free_bytes = sys.available_memory();
         let cpu_logical_cores = sys.cpus().len() as u32;
 
-        // Disk: use the root/current directory mount as a proxy.
         let disk_free_bytes = {
             use sysinfo::Disks;
             let disks = Disks::new_with_refreshed_list();
-            disks
-                .iter()
-                .map(|d| d.available_space())
-                .max()
-                .unwrap_or(0)
+            disks.iter().map(|d| d.available_space()).max().unwrap_or(0)
         };
 
-        // VRAM requires a CUDA/Vulkan query; report 0 if unavailable.
+        let (vram_total_bytes, vram_free_bytes) = detect_vram();
+
         Self {
-            vram_total_bytes: 0,
-            vram_free_bytes: 0,
+            vram_total_bytes,
+            vram_free_bytes,
             ram_total_bytes,
             ram_free_bytes,
             cpu_logical_cores,
             disk_free_bytes,
         }
     }
+}
+
+fn detect_vram() -> (u64, u64) {
+    // ── NVIDIA via NVML ───────────────────────────────────────────────────────
+    #[cfg(feature = "backend-cuda")]
+    {
+        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            if let Ok(device) = nvml.device_by_index(0) {
+                if let Ok(mem) = device.memory_info() {
+                    return (mem.total, mem.free);
+                }
+            }
+        }
+    }
+
+    // ── AMD / Intel via wgpu adapter ─────────────────────────────────────────
+    #[cfg(all(feature = "backend-wgpu", not(feature = "backend-cuda")))]
+    {
+        use wgpu::{Instance, InstanceDescriptor, PowerPreference, RequestAdapterOptions};
+        let instance = Instance::new(InstanceDescriptor::default());
+        if let Some(adapter) = pollster::block_on(instance.request_adapter(
+            &RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            },
+        )) {
+            // wgpu exposes max_buffer_size as the largest allocation the driver
+            // will allow — a conservative proxy for available device memory.
+            let limits = adapter.limits();
+            let total = limits.max_buffer_size;
+            return (total, total);
+        }
+    }
+
+    (0, 0)
 }

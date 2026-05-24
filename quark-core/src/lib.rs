@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables, unused_mut)]
 
+pub mod backend;
 pub mod checkpoint;
 pub mod data;
 pub mod inference;
@@ -10,3 +11,5 @@ pub mod paths;
 pub mod tokenizer;
 pub mod training;
 pub mod updater;
+
+pub use backend::{InferBackend, TrainBackend};

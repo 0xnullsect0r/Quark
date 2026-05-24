@@ -32,12 +32,12 @@ pub fn start_turn(app: &App) -> StreamHandle {
     let system_prompt = build_system_prompt(app);
     let prompt        = build_prompt(app);
     let mode          = app.mode;
-    let model_loaded  = app.model_loaded;
+    let engine        = app.engine.clone();
 
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        run_agent_turn(tx, system_prompt, prompt, mcp_cfg, mode, model_loaded);
+        run_agent_turn(tx, system_prompt, prompt, mcp_cfg, mode, engine);
     });
 
     StreamHandle { rx }
@@ -109,19 +109,24 @@ fn build_prompt(app: &App) -> String {
 // ─── Agent turn execution ─────────────────────────────────────────────────────
 
 fn run_agent_turn(
-    tx:               mpsc::Sender<AgentEvent>,
-    _system_prompt:   String,
-    prompt:           String,
-    mcp_cfg:          McpConfig,
-    _mode:            Mode,
-    model_loaded:     bool,
+    tx:             mpsc::Sender<AgentEvent>,
+    system_prompt:  String,
+    prompt:         String,
+    mcp_cfg:        McpConfig,
+    _mode:          Mode,
+    engine:         Option<std::sync::Arc<quark_core::inference::InferenceEngine>>,
 ) {
     // ── Generate response ────────────────────────────────────────────────────
-    let response = if model_loaded {
-        // TODO: Wire in quark-core inference once weights are loaded.
-        // This requires: tokenize(system_prompt + prompt) → generate() → detokenize
-        // For now produce a stub response that still exercises the tool loop.
-        generate_stub_response(&prompt, &mcp_cfg)
+    let response = if let Some(engine) = engine {
+        let full_prompt = format!("{system_prompt}\n\n{prompt}");
+        let params = quark_core::inference::SamplingParams::default();
+        match engine.generate(&full_prompt, params) {
+            Ok(text) => text,
+            Err(e) => {
+                let _ = tx.send(AgentEvent::Error(format!("Inference error: {e}")));
+                return;
+            }
+        }
     } else {
         generate_stub_response(&prompt, &mcp_cfg)
     };

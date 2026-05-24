@@ -365,6 +365,35 @@ impl DatasetPanel {
         }
     }
 
+    /// All corpus files available for training: manually added files plus any
+    /// HF-downloaded JSONL files found on disk.
+    pub fn corpus_files(&self) -> Vec<PathBuf> {
+        let mut files = self.file_paths();
+        let datasets_dir = self.hf_config.target_dir.join("datasets");
+        if let Ok(rd) = std::fs::read_dir(&datasets_dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "jsonl") {
+                    files.push(p);
+                }
+            }
+        }
+        files
+    }
+
+    /// The tokenizer to use for training: the one trained in the tokenizer tab,
+    /// or a manually set path, or the default `~/.quark/datasets/tokenizer.json`.
+    pub fn active_tokenizer_path(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.tokenizer_state.output_path {
+            return Some(p.clone());
+        }
+        if let Some(p) = &self.tokenizer_path {
+            return Some(p.clone());
+        }
+        let default = quark_core::paths::datasets_dir().join("tokenizer.json");
+        if default.exists() { Some(default) } else { None }
+    }
+
     /// Scan `<target_dir>/datasets/` and populate `downloaded_map` with the
     /// file size of each dataset JSONL that already exists on disk.
     fn scan_downloaded(&mut self) {

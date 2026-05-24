@@ -169,11 +169,11 @@ impl ExportPanel {
         // ─── Source files ───────────────────────────────────────────────────────
         egui::CollapsingHeader::new("📁 Source Files").default_open(true).show(ui, |ui| {
             egui::Grid::new("src_grid").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("Checkpoint (.safetensors)");
+                ui.label("Checkpoint (.bin / .safetensors)");
                 path_label(ui, &self.checkpoint_path);
                 if ui.button("Browse…").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("SafeTensors", &["safetensors"])
+                        .add_filter("Checkpoint", &["bin", "safetensors"])
                         .set_title("Pick checkpoint")
                         .pick_file()
                     {
@@ -417,7 +417,7 @@ impl ExportPanel {
                         "\n{name}/\n\
                         ├── {bin_name}          (or {bin_name}.exe on Windows)\n\
                         ├── model/\n\
-                        │   ├── checkpoint.safetensors\n\
+                        │   ├── checkpoint.bin\n\
                         │   ├── tokenizer.json\n\
                         │   ├── config.json\n\
                         │   ├── mcp.json\n\
@@ -472,14 +472,14 @@ impl ExportPanel {
             }
             prog!(0.1);
 
-            // Copy checkpoint
+            // Copy checkpoint — always named checkpoint.bin in the bundle
             log!("Copying checkpoint…");
-            if let Err(e) = fs::copy(&checkpoint_path, model_dir.join("checkpoint.safetensors")) {
+            if let Err(e) = fs::copy(&checkpoint_path, model_dir.join("checkpoint.bin")) {
                 let _ = tx.send(ExportMessage::Error(format!("Failed to copy checkpoint: {e}")));
                 return;
             }
             prog!(0.35);
-            log!("✔  checkpoint.safetensors");
+            log!("✔  checkpoint.bin");
 
             // Copy tokenizer
             log!("Copying tokenizer…");

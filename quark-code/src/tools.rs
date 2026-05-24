@@ -225,14 +225,40 @@ fn write_file_checked(cfg: &McpConfig, path: &str, content: &str) -> ToolResult 
     }
 }
 
-fn apply_patch(_cfg: &McpConfig, path: &str, _patch: &str) -> ToolResult {
-    // Very simple line-based patch: lines starting with '+' are additions,
-    // '-' are removals, everything else is context.  Not full unified diff —
-    // just best-effort for small model-generated patches.
-    ToolResult {
-        tool:    "apply_diff".into(),
-        ok:      false,
-        content: format!("apply_diff not yet implemented for {path}; use write_file instead."),
+fn apply_patch(cfg: &McpConfig, path: &str, patch: &str) -> ToolResult {
+    if path.is_empty() {
+        return err_result("apply_diff", "path arg required");
+    }
+    if patch.is_empty() {
+        return err_result("apply_diff", "patch arg required");
+    }
+
+    let full = cfg.working_dir.join(path);
+    let original = match std::fs::read_to_string(&full) {
+        Ok(s) => s,
+        Err(e) => return err_result("apply_diff", &format!("read {path}: {e}")),
+    };
+
+    let parsed = match diffy::Patch::from_str(patch) {
+        Ok(p) => p,
+        Err(e) => return err_result("apply_diff", &format!("parse patch: {e}")),
+    };
+
+    let patched = match diffy::apply(&original, &parsed) {
+        Ok(s) => s,
+        Err(e) => return err_result("apply_diff", &format!("apply patch: {e}")),
+    };
+
+    if let Some(parent) = full.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&full, &patched) {
+        Ok(_) => ToolResult {
+            tool: "apply_diff".into(),
+            ok: true,
+            content: format!("Applied patch to {path}"),
+        },
+        Err(e) => err_result("apply_diff", &format!("write {path}: {e}")),
     }
 }
 

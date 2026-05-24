@@ -13,6 +13,8 @@ pub struct CheckpointsPanel {
     dir: Option<PathBuf>,
     entries: Vec<CkptEntry>,
     loaded: Option<PathBuf>,
+    /// Set to `Some` for one frame after the user clicks Load, then cleared.
+    just_loaded: Option<PathBuf>,
     confirm_delete: Option<usize>,
     status: String,
 }
@@ -25,6 +27,7 @@ impl Default for CheckpointsPanel {
             dir: Some(dir),
             entries: Vec::new(),
             loaded: None,
+            just_loaded: None,
             confirm_delete: None,
             status: String::new(),
         };
@@ -38,13 +41,20 @@ impl CheckpointsPanel {
         self.loaded.as_ref()
     }
 
+    /// Returns the path that was just loaded (if any) and clears the flag.
+    /// The caller should call this once per frame and act on the result.
+    pub fn take_just_loaded(&mut self) -> Option<PathBuf> {
+        self.just_loaded.take()
+    }
+
     fn scan(&mut self) {
         self.entries.clear();
         if let Some(dir) = &self.dir {
             if let Ok(rd) = std::fs::read_dir(dir) {
                 for entry in rd.flatten() {
                     let p = entry.path();
-                    if p.extension().is_some_and(|e| e == "safetensors") {
+                    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext == "safetensors" || ext == "bin" {
                         let meta = std::fs::metadata(&p).ok();
                         self.entries.push(CkptEntry {
                             size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
@@ -105,7 +115,7 @@ impl CheckpointsPanel {
 
         if self.entries.is_empty() {
             ui.label(
-                egui::RichText::new("No .safetensors files found.")
+                egui::RichText::new("No checkpoints found (.safetensors or .bin).")
                     .weak()
                     .italics(),
             );
@@ -157,7 +167,7 @@ impl CheckpointsPanel {
 
                                 if ui.button("📤 Export…").clicked() {
                                     if let Some(dst) = rfd::FileDialog::new()
-                                        .add_filter("safetensors", &["safetensors"])
+                                        .add_filter("checkpoint", &["safetensors", "bin"])
                                         .set_file_name(name.as_ref())
                                         .save_file()
                                     {
@@ -188,7 +198,9 @@ impl CheckpointsPanel {
             });
 
         if let Some(i) = to_load {
-            self.loaded = Some(self.entries[i].path.clone());
+            let path = self.entries[i].path.clone();
+            self.loaded = Some(path.clone());
+            self.just_loaded = Some(path);
             self.status = format!(
                 "Loaded {}",
                 self.entries[i]

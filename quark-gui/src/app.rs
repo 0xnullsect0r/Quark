@@ -65,6 +65,21 @@ impl eframe::App for QuarkApp {
             }
         }
 
+        // Wire: when a checkpoint is loaded in the Checkpoints panel, start
+        // loading it into the Chat panel's InferenceEngine.
+        if let Some(ckpt_path) = self.checkpoints_panel.take_just_loaded() {
+            // Only load .bin checkpoints (CompactRecorder format from training).
+            if ckpt_path.extension().is_some_and(|e| e == "bin") {
+                let config = self.config_panel.config().clone();
+                let tokenizer = self
+                    .dataset_panel
+                    .active_tokenizer_path()
+                    .unwrap_or_else(|| quark_core::paths::datasets_dir().join("tokenizer.json"));
+                self.chat_panel.start_load(ckpt_path, config, tokenizer);
+                self.active = ActivePanel::Chat;
+            }
+        }
+
         // Update banner
         if let Some(info) = &self.update_info.clone() {
             egui::TopBottomPanel::top("update_banner").show(ctx, |ui| {
@@ -99,7 +114,17 @@ impl eframe::App for QuarkApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.active {
             ActivePanel::Config => self.config_panel.ui(ui),
             ActivePanel::Dataset => self.dataset_panel.ui(ui),
-            ActivePanel::Training => self.training_panel.ui(ui),
+            ActivePanel::Training => {
+                // Disjoint field borrows: the borrow checker allows &mut on
+                // training_panel while taking & on config_panel / dataset_panel
+                // because they are separate fields of QuarkApp.
+                let (tp, cp, dp) = (
+                    &mut self.training_panel,
+                    &self.config_panel,
+                    &self.dataset_panel,
+                );
+                tp.ui(ui, cp, dp);
+            }
             ActivePanel::Checkpoints => self.checkpoints_panel.ui(ui),
             ActivePanel::Chat => self.chat_panel.ui(ui),
             ActivePanel::Settings => self.settings_panel.ui(ui),

@@ -10,8 +10,8 @@ repository.workspace = true
 [features]
 default = ["backend-cpu"]
 backend-cpu  = ["burn/ndarray",  "burn-ndarray"]
-backend-cuda = ["burn-cuda"]
-backend-wgpu = ["burn/wgpu",     "burn-wgpu"]
+backend-cuda = ["burn-cuda",     "nvml-wrapper"]
+backend-wgpu = ["burn/wgpu",     "burn-wgpu",   "pollster"]
 
 [dependencies]
 burn          = { workspace = true, features = ["autodiff", "std"] }
@@ -37,6 +37,8 @@ half          = { workspace = true }
 rand          = { workspace = true }
 rayon         = { workspace = true }
 dirs          = { workspace = true }
+nvml-wrapper  = { version = "0.10", optional = true }
+pollster      = { version = "0.3",  optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

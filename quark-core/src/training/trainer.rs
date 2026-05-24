@@ -3,14 +3,24 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::Result;
+use burn::{
+    module::Module,
+    nn::loss::CrossEntropyLossConfig,
+    optim::{GradientsParams, Optimizer},
+    record::{CompactRecorder, Recorder},
+    tensor::{Int, Tensor, TensorData, backend::AutodiffBackend},
+};
 
-use crate::checkpoint::{save_checkpoint, TensorData};
-use crate::data::batch::DataBatch;
+use crate::checkpoint::{save_checkpoint, TensorData as CkptTensorData};
+use crate::data::batch::{DataBatch, collate_batch};
+use crate::data::loader::TextLoader;
+use crate::data::packing::pack_sequences;
 use crate::memory::tier::TierConfig;
+use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
+use crate::tokenizer::bpe::{PAD_ID, QuarkTokenizer};
 use crate::training::adamw::AdamWConfig;
 use crate::training::lr_schedule::CosineSchedule;
 use crate::training::metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
@@ -71,10 +81,8 @@ impl Default for TrainerConfig {
 // Handle & legacy wrapper
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A handle to a running training job that allows external control.
 pub struct TrainingHandle {
     pub sender: MetricsSender,
-    /// Set to `true` to request a graceful stop after the current step.
     pub stop_flag: Arc<AtomicBool>,
 }
 
@@ -84,10 +92,6 @@ impl TrainingHandle {
     }
 }
 
-/// Orchestrates the training loop and streams events to the GUI / CLI.
-///
-/// This is the legacy wrapper retained for API compatibility.  New code should
-/// prefer [`start_training`] which returns a [`TrainingHandle`] directly.
 pub struct Trainer {
     config: TrainerConfig,
     sender: MetricsSender,
@@ -110,12 +114,14 @@ impl Trainer {
 
 /// Spawn the training loop as a background thread.
 ///
-/// Returns a [`TrainingHandle`] (for stopping the job) and a [`MetricsReceiver`]
-/// that yields [`TrainingEvent`]s.  The channel closes when the thread finishes.
+/// `corpus_files` are `.txt` / `.jsonl` files to train on.
+/// `tokenizer_path` is the trained BPE tokenizer; if `None`, the default
+/// `~/.quark/datasets/tokenizer.json` is tried.
 pub fn start_training(
     model_config: QuarkConfig,
     trainer_config: TrainerConfig,
-    batches: Vec<DataBatch>,
+    corpus_files: Vec<PathBuf>,
+    tokenizer_path: Option<PathBuf>,
 ) -> (TrainingHandle, MetricsReceiver) {
     let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -124,7 +130,7 @@ pub fn start_training(
     let tx_clone = tx.clone();
 
     std::thread::spawn(move || {
-        run_training_loop(model_config, trainer_config, batches, tx_clone, stop_clone);
+        run_training_loop(model_config, trainer_config, corpus_files, tokenizer_path, tx_clone, stop_clone);
     });
 
     (TrainingHandle { sender: tx, stop_flag }, rx)
@@ -134,30 +140,11 @@ pub fn start_training(
 // Training loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Core training loop executed in a background thread.
-///
-/// # ⚠ Simulation notice
-///
-/// **This function currently *simulates* a training loop** — it does not
-/// perform real forward or backward passes through the model.  Actual gradient
-/// computation requires:
-///
-/// 1. The `QuarkModel` architecture to be finalised and compiled.
-/// 2. An autodiff backend (e.g. `burn-autodiff` wrapping `burn-ndarray` or
-///    `burn-wgpu`) to be selected at runtime and threaded through the model.
-/// 3. Burn's `AutodiffModule::backward` + `GradientsParams` machinery to
-///    compute per-parameter gradients.
-/// 4. The AdamW optimiser obtained from `AdamWConfig::to_burn_config().init()`
-///    to apply those gradients.
-/// 5. Per-step learning-rate injection via `CosineSchedule::get_lr`.
-///
-/// The placeholder loss curve and fixed `grad_norm: 1.0` are intentional
-/// stand-ins that allow the GUI to be exercised end-to-end while model
-/// development is ongoing.
 fn run_training_loop(
     model_config: QuarkConfig,
     config: TrainerConfig,
-    batches: Vec<DataBatch>,
+    corpus_files: Vec<PathBuf>,
+    tokenizer_path: Option<PathBuf>,
     tx: MetricsSender,
     stop: Arc<AtomicBool>,
 ) {
@@ -167,63 +154,191 @@ fn run_training_loop(
     macro_rules! phase {
         ($($t:tt)*) => {{ let _ = tx.send(TrainingEvent::Phase(format!($($t)*))); }};
     }
+    macro_rules! bail {
+        ($($t:tt)*) => {{
+            let _ = tx.send(TrainingEvent::Error(format!($($t)*)));
+            return;
+        }};
+    }
 
     tracing::info!("Starting training for {} steps", config.max_steps);
 
     if let Err(e) = std::fs::create_dir_all(&config.output_dir) {
-        let _ = tx.send(TrainingEvent::Error(format!("Cannot create output dir: {e}")));
-        return;
-    }
-
-    let total_batches = batches.len();
-    if total_batches == 0 {
-        log!("⚠  No training batches provided — running dry simulation loop");
+        bail!("Cannot create output dir: {e}");
     }
 
     log!("▶  Training started");
     log!(
-        "   Model:     {} layers, {} heads, hidden={}",
+        "   Model:  {} layers, {} heads, hidden={}",
         model_config.num_hidden_layers,
         model_config.num_attention_heads,
         model_config.hidden_size
     );
     log!(
-        "   Config:    max_steps={}, batch_size={}, grad_accum={}",
+        "   Config: max_steps={}, batch_size={}, grad_accum={}",
         config.max_steps,
         config.batch_size,
         config.grad_accum_steps
     );
-    log!(
-        "   Output:    {}",
-        config.output_dir.display()
-    );
-    phase!("Initialising…");
+    log!("   Output: {}", config.output_dir.display());
+
+    // ── Load tokenizer ────────────────────────────────────────────────────────
+    phase!("Loading tokenizer…");
+    let tok_path = tokenizer_path.unwrap_or_else(|| {
+        crate::paths::datasets_dir().join("tokenizer.json")
+    });
+
+    let tokenizer = match QuarkTokenizer::load(&tok_path) {
+        Ok(t) => {
+            log!("   Tokenizer: {} vocab tokens", t.vocab_size());
+            t
+        }
+        Err(e) => bail!("Tokenizer load failed: {e}\nTrain a tokenizer in the Dataset tab first."),
+    };
+
+    // Use tokenizer vocab size if it differs from model config
+    let vocab_size = tokenizer.vocab_size();
+
+    // ── Load and tokenize corpus ──────────────────────────────────────────────
+    let batches = if !corpus_files.is_empty() {
+        phase!("Loading corpus…");
+        log!("   Loading {} corpus file(s)…", corpus_files.len());
+
+        let loader = TextLoader::new(corpus_files, model_config.max_position_embeddings);
+        let texts = match loader.load_texts() {
+            Ok(t) => t,
+            Err(e) => bail!("Corpus load failed: {e}"),
+        };
+        log!("   Loaded {} documents", texts.len());
+
+        phase!("Tokenizing…");
+        let mut token_seqs: Vec<Vec<u32>> = Vec::new();
+        for text in &texts {
+            if let Ok(ids) = tokenizer.encode(text) {
+                if !ids.is_empty() {
+                    token_seqs.push(ids);
+                }
+            }
+        }
+        log!("   Tokenized {} sequences", token_seqs.len());
+
+        let packed = pack_sequences(token_seqs, model_config.max_position_embeddings);
+        log!("   Packed into {} chunks of {} tokens", packed.len(), model_config.max_position_embeddings);
+
+        if packed.is_empty() {
+            bail!("No training tokens after packing. Check your corpus files.");
+        }
+
+        packed
+            .chunks(config.batch_size)
+            .map(|chunk| collate_batch(chunk.to_vec(), PAD_ID))
+            .collect::<Vec<_>>()
+    } else {
+        log!("⚠  No corpus files provided — running demo loop with random inputs");
+        vec![]
+    };
+
+    log!("   {} training batches ready", batches.len());
+
+    // ── Initialise model ──────────────────────────────────────────────────────
+    phase!("Initialising model…");
+
+    use crate::backend::TrainBackend;
+    type AB = TrainBackend;
+
+    let device = <AB as burn::tensor::backend::Backend>::Device::default();
+    let mut model = QuarkModel::<AB>::new(&model_config, &device);
+    log!("   Model initialised on {:?}", device);
+
+    // ── Initialise optimiser ──────────────────────────────────────────────────
+    let mut optim = config.adamw.to_burn_config().init();
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
+    phase!("Training…");
+    log!("▶  Starting training loop");
 
     let start_time = Instant::now();
     let mut step = 0u64;
     let mut epoch = 0u32;
     let mut batch_idx = 0usize;
 
+    let total_batches = batches.len();
+    let mut step_loss;
+
     while step < config.max_steps && !stop.load(Ordering::SeqCst) {
-        if total_batches > 0 {
+        // ── Get next batch ────────────────────────────────────────────────────
+        let (input_ids, label_ids) = if total_batches > 0 {
             if batch_idx >= total_batches {
                 batch_idx = 0;
                 epoch += 1;
                 log!("━━  Epoch {} started", epoch + 1);
             }
-            let _batch = &batches[batch_idx];
+            let batch = &batches[batch_idx];
             batch_idx += 1;
-        }
 
-        let lr = config.schedule.get_lr(step) as f32;
-        let loss = (1.0_f32 - step as f32 / config.max_steps as f32).max(0.1)
-            + 0.05 * rand_f32_seed(step);
+            let b = batch.input_ids.len();
+            let s = batch.input_ids.first().map(|r| r.len()).unwrap_or(1).max(1);
 
-        let tokens_per_sec = {
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let avg_step_time = elapsed / step.max(1) as f32;
-            model_config.max_position_embeddings as f32 * config.batch_size as f32
-                / avg_step_time.max(1e-6)
+            let input_flat: Vec<i32> = batch
+                .input_ids
+                .iter()
+                .flat_map(|row| row.iter().map(|&id| id as i32))
+                .collect();
+            let label_flat: Vec<i32> = batch
+                .labels
+                .iter()
+                .flat_map(|row| row.iter().map(|&id| id as i32))
+                .collect();
+
+            (
+                Tensor::<AB, 2, Int>::from_data(TensorData::new(input_flat, [b, s]), &device),
+                Tensor::<AB, 2, Int>::from_data(TensorData::new(label_flat, [b, s]), &device),
+            )
+        } else {
+            // Demo: random token ids in range [0, vocab_size)
+            let b = config.batch_size;
+            let s = model_config.max_position_embeddings.min(64);
+            let ids: Vec<i32> = (0..b * s)
+                .map(|i| ((step as usize * b * s + i) % vocab_size) as i32)
+                .collect();
+            let lbl: Vec<i32> = (0..b * s)
+                .map(|i| ((step as usize * b * s + i + 1) % vocab_size) as i32)
+                .collect();
+            (
+                Tensor::<AB, 2, Int>::from_data(TensorData::new(ids, [b, s]), &device),
+                Tensor::<AB, 2, Int>::from_data(TensorData::new(lbl, [b, s]), &device),
+            )
+        };
+
+        // ── Forward pass ──────────────────────────────────────────────────────
+        let logits = model.forward(input_ids); // [batch, seq, vocab]
+        let [b, s, v] = logits.dims();
+        let logits_2d = logits.reshape([b * s, v]);
+        let labels_1d = label_ids.reshape([b * s]);
+
+        let loss = CrossEntropyLossConfig::new()
+            .with_pad_tokens(Some(vec![PAD_ID as usize]))
+            .init(&device)
+            .forward(logits_2d, labels_1d);
+
+        step_loss = loss.clone().into_scalar();
+        // ── Backward + optimizer step ─────────────────────────────────────────
+        // NOTE: Burn's optimizer API does not support explicit gradient
+        // accumulation; grad_accum_steps is accepted in config but each
+        // forward/backward updates the model immediately.
+        let lr = config.schedule.get_lr(step);
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        model = optim.step(lr, model, grads);
+
+
+        let elapsed = start_time.elapsed().as_secs_f32();
+        let tokens_per_sec = if elapsed > 0.0 {
+            (step + 1) as f32
+                * config.batch_size as f32
+                * model_config.max_position_embeddings as f32
+                / elapsed
+        } else {
+            0.0
         };
 
         let elapsed_secs = start_time.elapsed().as_secs();
@@ -238,8 +353,8 @@ fn run_training_loop(
 
         let _ = tx.send(TrainingEvent::Metrics(TrainingMetrics {
             step,
-            loss,
-            learning_rate: lr,
+            loss: step_loss,
+            learning_rate: lr as f32,
             tokens_per_sec,
             grad_norm: 1.0,
             vram_used_bytes: 0,
@@ -249,30 +364,24 @@ fn run_training_loop(
             eta_secs,
         }));
 
-        // Log at milestones
         if step == 0 {
-            phase!("Training…");
+            log!("   First optimizer step complete");
         } else if step.is_multiple_of(100) {
             log!(
-                "   step={step:>6}  loss={loss:.4}  lr={lr:.2e}  {:.0} tok/s",
+                "   step={step:>6}  loss={step_loss:.4}  lr={lr:.2e}  {:.0} tok/s",
                 tokens_per_sec
             );
         }
 
+        // ── Save checkpoint ───────────────────────────────────────────────────
         if step > 0 && step.is_multiple_of(config.save_every_steps) {
-            let ckpt_path = config.output_dir.join(format!("checkpoint-{step}.safetensors"));
-            let stub = TensorData { name: "step".into(), data: vec![step as f32], shape: vec![1] };
-            match save_checkpoint(&ckpt_path, &[stub]) {
-                Ok(()) => log!("💾  Checkpoint saved → {}", ckpt_path.display()),
-                Err(e) => log!("⚠  Checkpoint save failed: {e}"),
-            }
+            save_burn_checkpoint(&model, &config.output_dir, step, &tx);
         }
 
         step += 1;
-        // Yield briefly so the channel consumer can drain messages without pegging a CPU core.
-        std::thread::sleep(Duration::from_millis(1));
     }
 
+    // ── Final checkpoint ──────────────────────────────────────────────────────
     if stop.load(Ordering::SeqCst) {
         log!("⏹  Training stopped at step {step}");
         phase!("Stopped");
@@ -281,21 +390,32 @@ fn run_training_loop(
         phase!("Complete!");
     }
 
-    // Save a final checkpoint regardless of stop/complete.
-    let final_path = config.output_dir.join("checkpoint-final.safetensors");
-    let stub = TensorData { name: "step".into(), data: vec![step as f32], shape: vec![1] };
-    match save_checkpoint(&final_path, &[stub]) {
-        Ok(()) => log!("💾  Final checkpoint → {}", final_path.display()),
-        Err(e) => log!("⚠  Final checkpoint save failed: {e}"),
-    }
-
+    save_burn_checkpoint(&model, &config.output_dir, step, &tx);
     let _ = tx.send(TrainingEvent::Done);
 }
 
-/// Deterministic low-quality pseudo-random noise for the placeholder loss curve.
-fn rand_f32_seed(seed: u64) -> f32 {
-    let x = seed
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    ((x >> 33) as f32) / (u32::MAX as f32)
+// ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+fn save_burn_checkpoint(
+    model: &QuarkModel<crate::backend::TrainBackend>,
+    output_dir: &std::path::Path,
+    step: u64,
+    tx: &MetricsSender,
+) {
+    macro_rules! log {
+        ($($t:tt)*) => {{ let _ = tx.send(TrainingEvent::Log(format!($($t)*))); }};
+    }
+
+    // CompactRecorder appends ".bin" automatically.
+    let stem = if step == u64::MAX {
+        output_dir.join("checkpoint-final")
+    } else {
+        output_dir.join(format!("checkpoint-{step}"))
+    };
+
+    let record = model.clone().into_record();
+    match CompactRecorder::new().record(record, stem.clone()) {
+        Ok(_) => log!("💾  Checkpoint saved → {}.bin", stem.display()),
+        Err(e) => log!("⚠  Checkpoint save failed: {e}"),
+    }
 }

@@ -13,6 +13,9 @@ use quark_core::model::config::QuarkConfig;
 use quark_core::training::metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics};
 use quark_core::training::trainer::{start_training, TrainerConfig, TrainingHandle};
 
+use super::config::ConfigPanel;
+use super::dataset::DatasetPanel;
+
 const MAX_LOG_LINES: usize = 2000;
 
 pub struct TrainingPanel {
@@ -95,7 +98,12 @@ impl TrainingPanel {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        config_panel: &ConfigPanel,
+        dataset_panel: &DatasetPanel,
+    ) {
         self.drain_events();
         if self.is_running {
             ui.ctx()
@@ -138,9 +146,15 @@ impl TrainingPanel {
                             self.log.clear();
                             self.phase.clear();
                             self.latest = None;
-                            let model_config = QuarkConfig::quark_1b();
-                            let (handle, rx) =
-                                start_training(model_config, self.trainer_config.clone(), vec![]);
+                            let model_config = config_panel.config().clone();
+                            let corpus_files = dataset_panel.corpus_files();
+                            let tokenizer_path = dataset_panel.active_tokenizer_path();
+                            let (handle, rx) = start_training(
+                                model_config,
+                                self.trainer_config.clone(),
+                                corpus_files,
+                                tokenizer_path,
+                            );
                             self.stop_flag = Some(Arc::clone(&handle.stop_flag));
                             self.metrics_rx = Some(rx);
                             self.is_running = true;
