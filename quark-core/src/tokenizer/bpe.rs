@@ -230,7 +230,7 @@ pub fn start_tokenizer_training(
         )));
         let _ = tx.send(TokenizerMessage::Progress(0.30));
 
-        match QuarkTokenizer::train(&[tmp_path.clone()], vocab_size, &output_path) {
+        match QuarkTokenizer::train(std::slice::from_ref(&tmp_path), vocab_size, &output_path) {
             Ok(_) => {
                 let elapsed = start.elapsed().as_secs_f32();
                 let _ = std::fs::remove_file(&tmp_path);
