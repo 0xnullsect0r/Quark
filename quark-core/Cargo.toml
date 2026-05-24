@@ -11,7 +11,7 @@ repository.workspace = true
 default = ["backend-cpu"]
 backend-cpu  = ["burn/ndarray",  "burn-ndarray"]
 backend-cuda = ["burn-cuda",     "nvml-wrapper"]
-backend-wgpu = ["burn/wgpu",     "burn-wgpu",   "pollster"]
+backend-wgpu = ["burn/wgpu",     "burn-wgpu"]
 
 [dependencies]
 burn          = { workspace = true, features = ["autodiff", "std"] }

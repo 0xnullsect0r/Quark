@@ -56,25 +56,8 @@ fn detect_vram() -> (u64, u64) {
         }
     }
 
-    // ── AMD / Intel via wgpu adapter ─────────────────────────────────────────
-    #[cfg(all(feature = "backend-wgpu", not(feature = "backend-cuda")))]
-    {
-        use wgpu::{Instance, InstanceDescriptor, PowerPreference, RequestAdapterOptions};
-        let instance = Instance::new(InstanceDescriptor::default());
-        if let Some(adapter) = pollster::block_on(instance.request_adapter(
-            &RequestAdapterOptions {
-                power_preference: PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            },
-        )) {
-            // wgpu exposes max_buffer_size as the largest allocation the driver
-            // will allow — a conservative proxy for available device memory.
-            let limits = adapter.limits();
-            let total = limits.max_buffer_size;
-            return (total, total);
-        }
-    }
-
+    // AMD/Intel VRAM detection via wgpu is not available without a direct wgpu
+    // dependency (burn-wgpu does not re-export wgpu types).  The Settings panel
+    // shows "N/A" when these are 0, which is acceptable.
     (0, 0)
 }
