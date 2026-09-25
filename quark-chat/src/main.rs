@@ -2,7 +2,7 @@
 //!
 //! Expects model files next to the executable in a `model/` directory:
 //!   model/config.json              QuarkConfig
-//!   model/checkpoint.bin           weights (CompactRecorder format)
+//!   model/checkpoint.bin           weights (Burn BinFileRecorder, full precision)
 //!   model/tokenizer.json           BPE tokenizer
 //!   model/mcp.json                 McpConfig  (optional)
 //!   model/system_prompt.txt        system prompt (optional)

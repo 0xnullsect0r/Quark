@@ -24,6 +24,7 @@ pub struct TrainingPanel {
     stop_flag: Option<Arc<AtomicBool>>,
     latest: Option<TrainingMetrics>,
     loss_history: Vec<[f64; 2]>,
+    eval_history: Vec<[f64; 2]>,
     lr_history: Vec<[f64; 2]>,
     is_running: bool,
     phase: String,
@@ -39,6 +40,7 @@ impl Default for TrainingPanel {
             stop_flag: None,
             latest: None,
             loss_history: Vec::new(),
+            eval_history: Vec::new(),
             lr_history: Vec::new(),
             is_running: false,
             phase: String::new(),
@@ -75,6 +77,9 @@ impl TrainingPanel {
                     self.loss_history.push([m.step as f64, m.loss as f64]);
                     self.lr_history.push([m.step as f64, m.learning_rate as f64]);
                     self.latest = Some(m);
+                }
+                TrainingEvent::Eval { step, loss } => {
+                    self.eval_history.push([step as f64, loss as f64]);
                 }
                 TrainingEvent::Log(s) => {
                     self.log.push(s);
@@ -142,6 +147,7 @@ impl TrainingPanel {
                             .clicked()
                         {
                             self.loss_history.clear();
+                            self.eval_history.clear();
                             self.lr_history.clear();
                             self.log.clear();
                             self.phase.clear();
@@ -196,6 +202,14 @@ impl TrainingPanel {
                             ui.label("ETA");
                             let eta = m.eta_secs;
                             ui.label(format!("{}h {}m", eta / 3600, (eta % 3600) / 60));
+                            ui.end_row();
+                            ui.label("Grad norm");
+                            ui.label(format!("{:.3}", m.grad_norm));
+                            ui.label("Eval loss");
+                            ui.label(match self.eval_history.last() {
+                                Some([_, loss]) => format!("{loss:.4}"),
+                                None => "—".to_owned(),
+                            });
                             ui.end_row();
                         });
                 }
@@ -264,6 +278,16 @@ impl TrainingPanel {
                                     .color(egui::Color32::from_rgb(255, 140, 50))
                                     .width(1.5),
                             );
+                            if !self.eval_history.is_empty() {
+                                let pts: PlotPoints =
+                                    self.eval_history.iter().copied().collect();
+                                plot_ui.line(
+                                    Line::new(pts)
+                                        .name("eval loss")
+                                        .color(egui::Color32::from_rgb(120, 220, 120))
+                                        .width(2.0),
+                                );
+                            }
                         });
 
                     ui.label(egui::RichText::new("Learning Rate").strong());
@@ -436,6 +460,13 @@ impl TrainingPanel {
                                     )
                                     .range(0.1f32..=10.0f32)
                                     .speed(0.1),
+                                );
+                                ui.end_row();
+
+                                ui.label("Resume");
+                                ui.checkbox(
+                                    &mut self.trainer_config.resume,
+                                    "Continue from latest checkpoint",
                                 );
                                 ui.end_row();
 

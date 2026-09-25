@@ -46,6 +46,15 @@ impl<B: Backend> QuarkModel<B> {
 
     /// Forward pass. Returns logits of shape `[batch, seq, vocab]`.
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.forward_with_aux(input_ids).0
+    }
+
+    /// Forward pass that also returns the MoE load-balancing loss averaged
+    /// over MoE layers (`None` if the model has no MoE layers).
+    pub fn forward_with_aux(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         let device = input_ids.device();
         let [batch, seq] = input_ids.dims();
 
@@ -65,13 +74,24 @@ impl<B: Backend> QuarkModel<B> {
                 .reshape([1_usize, 1, seq, seq]);
 
         // Forward through all decoder layers
+        let mut aux_sum: Option<Tensor<B, 1>> = None;
+        let mut moe_layers = 0usize;
         for layer in &self.layers {
-            x = layer.forward(x, Some(mask.clone()));
+            let (out, aux) = layer.forward_with_aux(x, Some(mask.clone()));
+            x = out;
+            if let Some(aux) = aux {
+                moe_layers += 1;
+                aux_sum = Some(match aux_sum {
+                    Some(sum) => sum + aux,
+                    None => aux,
+                });
+            }
         }
+        let aux = aux_sum.map(|sum| sum / moe_layers as f32);
 
         // Final layer norm and language-model head
         x = self.norm.forward(x);
-        self.lm_head.forward(x)
+        (self.lm_head.forward(x), aux)
     }
 }
 

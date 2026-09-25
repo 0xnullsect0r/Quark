@@ -22,6 +22,8 @@ pub enum TrainingEvent {
     Metrics(TrainingMetrics),
     /// Human-readable log line.
     Log(String),
+    /// Held-out evaluation loss after optimiser step `step`.
+    Eval { step: u64, loss: f32 },
     /// Short phase description for the status bar.
     Phase(String),
     /// Training completed successfully.

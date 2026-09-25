@@ -68,7 +68,7 @@ impl eframe::App for QuarkApp {
         // Wire: when a checkpoint is loaded in the Checkpoints panel, start
         // loading it into the Chat panel's InferenceEngine.
         if let Some(ckpt_path) = self.checkpoints_panel.take_just_loaded() {
-            // Only load .bin checkpoints (CompactRecorder format from training).
+            // Only load .bin checkpoints (the format training writes).
             if ckpt_path.extension().is_some_and(|e| e == "bin") {
                 // Prefer the architecture + tokenizer saved alongside the checkpoint.
                 let config = quark_core::model::config::QuarkConfig::for_checkpoint(&ckpt_path)

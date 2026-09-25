@@ -5,7 +5,9 @@ use std::sync::mpsc;
 
 use anyhow::{Context, Result};
 use burn::module::Module;
-use burn::record::{CompactRecorder, Recorder};
+use burn::record::Recorder;
+
+use crate::checkpoint::CheckpointRecorder;
 
 use crate::backend::InferBackend;
 use crate::inference::generate::{GenerateConfig, generate, generate_with};
@@ -41,9 +43,9 @@ impl InferenceEngine {
         // Init model skeleton
         let model = QuarkModel::<InferBackend>::new(config, &device);
 
-        // Load checkpoint — CompactRecorder strips the extension to find the file
+        // Load checkpoint — The recorder adds the extension to find the file
         let stem = checkpoint.with_extension("");
-        let record = CompactRecorder::new()
+        let record = CheckpointRecorder::new()
             .load(stem, &device)
             .with_context(|| format!("Failed to load checkpoint: {}", checkpoint.display()))?;
         let model = model.load_record(record);

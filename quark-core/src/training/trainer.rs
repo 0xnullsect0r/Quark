@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -6,14 +6,17 @@ use std::sync::{
 use std::time::Instant;
 
 use burn::{
-    module::Module,
+    module::{AutodiffModule, Module},
     nn::loss::CrossEntropyLossConfig,
-    optim::{GradientsParams, Optimizer},
-    record::{CompactRecorder, Recorder},
-    tensor::{Int, Tensor, TensorData, backend::AutodiffBackend},
+    optim::{GradientsAccumulator, GradientsParams, Optimizer},
+    record::Recorder,
+    tensor::{
+        ElementConversion, Int, Tensor, TensorData,
+        backend::{AutodiffBackend, Backend},
+    },
 };
 
-use crate::checkpoint::{save_checkpoint, TensorData as CkptTensorData};
+use crate::checkpoint::CheckpointRecorder;
 use crate::data::batch::{DataBatch, collate_batch};
 use crate::data::loader::TextLoader;
 use crate::data::packing::pack_sequences;
@@ -22,8 +25,14 @@ use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
 use crate::tokenizer::bpe::{PAD_ID, QuarkTokenizer};
 use crate::training::adamw::AdamWConfig;
+use crate::training::grad_clip::clip_grad_norm;
 use crate::training::lr_schedule::CosineSchedule;
 use crate::training::metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
+
+/// Weight of the MoE load-balancing loss added to the LM loss.
+const AUX_LOSS_COEF: f32 = 0.01;
+/// Maximum number of held-out batches used per evaluation.
+const MAX_EVAL_BATCHES: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -56,6 +65,14 @@ pub struct TrainerConfig {
     pub schedule: CosineSchedule,
     /// Memory-tier resource limits.
     pub tier: TierConfig,
+    /// Continue from the latest `checkpoint-N.bin` in `output_dir` when its
+    /// saved `config.json` matches the current model config.
+    #[serde(default = "default_true")]
+    pub resume: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for TrainerConfig {
@@ -73,6 +90,7 @@ impl Default for TrainerConfig {
             adamw: AdamWConfig::default(),
             schedule: CosineSchedule::default(),
             tier: TierConfig::default(),
+            resume: true,
         }
     }
 }
@@ -191,6 +209,13 @@ fn run_training_loop(
         model_config.vocab_size = vocab_size;
     }
 
+    // Look for a checkpoint to resume from before config.json is overwritten.
+    let resume_from = if config.resume {
+        find_resumable_checkpoint(&config.output_dir, &model_config)
+    } else {
+        None
+    };
+
     // Save the exact architecture + tokenizer next to the checkpoints so
     // inference and export can rebuild the same model.
     match serde_json::to_string_pretty(&model_config) {
@@ -209,7 +234,7 @@ fn run_training_loop(
     }
 
     // ── Load and tokenize corpus ──────────────────────────────────────────────
-    let batches = if !corpus_files.is_empty() {
+    let mut batches = if !corpus_files.is_empty() {
         phase!("Loading corpus…");
         log!("   Loading {} corpus file(s)…", corpus_files.len());
 
@@ -239,7 +264,7 @@ fn run_training_loop(
         }
 
         packed
-            .chunks(config.batch_size)
+            .chunks(config.batch_size.max(1))
             .map(|chunk| collate_batch(chunk.to_vec(), PAD_ID))
             .collect::<Vec<_>>()
     } else {
@@ -247,7 +272,19 @@ fn run_training_loop(
         vec![]
     };
 
-    log!("   {} training batches ready", batches.len());
+    // Hold out ~1% of batches for evaluation once there is enough data.
+    let eval_batches = if batches.len() >= 20 {
+        let n_eval = (batches.len() / 100).max(1);
+        batches.split_off(batches.len() - n_eval)
+    } else {
+        Vec::new()
+    };
+
+    log!(
+        "   {} training batches ready ({} held out for eval)",
+        batches.len(),
+        eval_batches.len()
+    );
 
     // ── Initialise model ──────────────────────────────────────────────────────
     phase!("Initialising model…");
@@ -255,9 +292,31 @@ fn run_training_loop(
     use crate::backend::TrainBackend;
     type AB = TrainBackend;
 
-    let device = <AB as burn::tensor::backend::Backend>::Device::default();
+    let device = <AB as Backend>::Device::default();
+    <AB as Backend>::seed(config.seed);
     let mut model = QuarkModel::<AB>::new(&model_config, &device);
     log!("   Model initialised on {:?}", device);
+
+    let mut step = 0u64;
+    if let Some((path, saved_step)) = resume_from {
+        match CheckpointRecorder::new().load(path.with_extension(""), &device) {
+            Ok(record) => {
+                model = model.load_record(record);
+                step = saved_step;
+                log!(
+                    "↻  Resumed from {} (step {saved_step}); optimiser state starts fresh",
+                    path.display()
+                );
+            }
+            Err(e) => log!("⚠  Could not resume from {}: {e} — starting fresh", path.display()),
+        }
+    }
+    if step >= config.max_steps {
+        log!("✅  Already trained for {step} steps (max_steps={})", config.max_steps);
+        phase!("Complete!");
+        let _ = tx.send(TrainingEvent::Done);
+        return;
+    }
 
     // ── Initialise optimiser ──────────────────────────────────────────────────
     let mut optim = config.adamw.to_burn_config().init();
@@ -266,106 +325,77 @@ fn run_training_loop(
     phase!("Training…");
     log!("▶  Starting training loop");
 
+    let accum_steps = config.grad_accum_steps.max(1);
+    let start_step = step;
     let start_time = Instant::now();
-    let mut step = 0u64;
-    let mut epoch = 0u32;
-    let mut batch_idx = 0usize;
-
     let total_batches = batches.len();
-    let mut step_loss;
+    let mut batch_idx = (step as usize * accum_steps) % total_batches.max(1);
+    let mut epoch = (step as usize * accum_steps / total_batches.max(1)) as u32;
+    let mut tokens_seen = 0u64;
+    let ce_loss = CrossEntropyLossConfig::new()
+        .with_pad_tokens(Some(vec![PAD_ID as usize]))
+        .init(&device);
 
     while step < config.max_steps && !stop.load(Ordering::SeqCst) {
-        // ── Get next batch ────────────────────────────────────────────────────
-        let (input_ids, label_ids) = if total_batches > 0 {
-            if batch_idx >= total_batches {
-                batch_idx = 0;
-                epoch += 1;
-                log!("━━  Epoch {} started", epoch + 1);
-            }
-            let batch = &batches[batch_idx];
-            batch_idx += 1;
-
-            let b = batch.input_ids.len();
-            let s = batch.input_ids.first().map(|r| r.len()).unwrap_or(1).max(1);
-
-            let input_flat: Vec<i32> = batch
-                .input_ids
-                .iter()
-                .flat_map(|row| row.iter().map(|&id| id as i32))
-                .collect();
-            let label_flat: Vec<i32> = batch
-                .labels
-                .iter()
-                .flat_map(|row| row.iter().map(|&id| id as i32))
-                .collect();
-
-            (
-                Tensor::<AB, 2, Int>::from_data(TensorData::new(input_flat, [b, s]), &device),
-                Tensor::<AB, 2, Int>::from_data(TensorData::new(label_flat, [b, s]), &device),
-            )
-        } else {
-            // Demo: random token ids in range [0, vocab_size)
-            let b = config.batch_size;
-            let s = model_config.max_position_embeddings.min(64);
-            let ids: Vec<i32> = (0..b * s)
-                .map(|i| ((step as usize * b * s + i) % vocab_size) as i32)
-                .collect();
-            let lbl: Vec<i32> = (0..b * s)
-                .map(|i| ((step as usize * b * s + i + 1) % vocab_size) as i32)
-                .collect();
-            (
-                Tensor::<AB, 2, Int>::from_data(TensorData::new(ids, [b, s]), &device),
-                Tensor::<AB, 2, Int>::from_data(TensorData::new(lbl, [b, s]), &device),
-            )
-        };
-
-        // ── Forward pass ──────────────────────────────────────────────────────
-        let logits = model.forward(input_ids); // [batch, seq, vocab]
-        let [b, s, v] = logits.dims();
-        let logits_2d = logits.reshape([b * s, v]);
-        let labels_1d = label_ids.reshape([b * s]);
-
-        let loss = CrossEntropyLossConfig::new()
-            .with_pad_tokens(Some(vec![PAD_ID as usize]))
-            .init(&device)
-            .forward(logits_2d, labels_1d);
-
-        step_loss = loss.clone().into_scalar();
-        // ── Backward + optimizer step ─────────────────────────────────────────
-        // NOTE: Burn's optimizer API does not support explicit gradient
-        // accumulation; grad_accum_steps is accepted in config but each
-        // forward/backward updates the model immediately.
         let lr = config.schedule.get_lr(step);
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
-        model = optim.step(lr, model, grads);
+        let mut accumulator = GradientsAccumulator::new();
+        let mut step_loss = 0.0f32;
 
+        for micro in 0..accum_steps {
+            // ── Get next batch ────────────────────────────────────────────────
+            let (input_ids, label_ids, n_tokens) = if total_batches > 0 {
+                if batch_idx >= total_batches {
+                    batch_idx = 0;
+                    epoch += 1;
+                    log!("━━  Epoch {} started", epoch + 1);
+                }
+                let batch = &batches[batch_idx];
+                batch_idx += 1;
+                batch_tensors::<AB>(batch, &device)
+            } else {
+                demo_batch::<AB>(
+                    config.batch_size,
+                    model_config.max_position_embeddings.min(64),
+                    vocab_size,
+                    step as usize * accum_steps + micro,
+                    &device,
+                )
+            };
+            tokens_seen += n_tokens;
+
+            // ── Forward + backward ────────────────────────────────────────────
+            let (logits, aux) = model.forward_with_aux(input_ids); // [batch, seq, vocab]
+            let [b, s, v] = logits.dims();
+            let ce = ce_loss.forward(logits.reshape([b * s, v]), label_ids.reshape([b * s]));
+            step_loss += ce.clone().into_scalar().elem::<f32>() / accum_steps as f32;
+
+            let loss = match aux {
+                Some(aux) => ce + aux * AUX_LOSS_COEF,
+                None => ce,
+            };
+            let loss = loss / accum_steps as f32;
+            let grads = GradientsParams::from_grads(loss.backward(), &model);
+            accumulator.accumulate(&model, grads);
+        }
+
+        // ── Clip + optimiser step ─────────────────────────────────────────────
+        let mut grads = accumulator.grads();
+        let grad_norm = clip_grad_norm(&model, &mut grads, config.max_grad_norm);
+        model = optim.step(lr, model, grads);
+        step += 1;
 
         let elapsed = start_time.elapsed().as_secs_f32();
-        let tokens_per_sec = if elapsed > 0.0 {
-            (step + 1) as f32
-                * config.batch_size as f32
-                * model_config.max_position_embeddings as f32
-                / elapsed
-        } else {
-            0.0
-        };
-
-        let elapsed_secs = start_time.elapsed().as_secs();
-        let eta_secs = if step > 0 {
-            elapsed_secs
-                .checked_mul(config.max_steps - step)
-                .and_then(|n| n.checked_div(step))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let tokens_per_sec = if elapsed > 0.0 { tokens_seen as f32 / elapsed } else { 0.0 };
+        let steps_this_run = step - start_step;
+        let eta_secs =
+            (elapsed / steps_this_run as f32 * (config.max_steps - step) as f32) as u64;
 
         let _ = tx.send(TrainingEvent::Metrics(TrainingMetrics {
             step,
             loss: step_loss,
             learning_rate: lr as f32,
             tokens_per_sec,
-            grad_norm: 1.0,
+            grad_norm,
             vram_used_bytes: 0,
             ram_used_bytes: 0,
             disk_used_bytes: 0,
@@ -373,21 +403,32 @@ fn run_training_loop(
             eta_secs,
         }));
 
-        if step == 0 {
+        if steps_this_run == 1 {
             log!("   First optimizer step complete");
         } else if step.is_multiple_of(100) {
             log!(
-                "   step={step:>6}  loss={step_loss:.4}  lr={lr:.2e}  {:.0} tok/s",
+                "   step={step:>6}  loss={step_loss:.4}  lr={lr:.2e}  |g|={grad_norm:.3}  {:.0} tok/s",
                 tokens_per_sec
             );
         }
 
-        // ── Save checkpoint ───────────────────────────────────────────────────
-        if step > 0 && step.is_multiple_of(config.save_every_steps) {
-            save_burn_checkpoint(&model, &config.output_dir, step, &tx);
+        // ── Evaluate ──────────────────────────────────────────────────────────
+        if !eval_batches.is_empty()
+            && config.eval_every_steps > 0
+            && step.is_multiple_of(config.eval_every_steps)
+        {
+            let loss = evaluate(&model.valid(), &eval_batches, &device);
+            log!("   eval  step={step:>6}  loss={loss:.4}  ppl={:.1}", loss.exp());
+            let _ = tx.send(TrainingEvent::Eval { step, loss });
         }
 
-        step += 1;
+        // ── Save checkpoint ───────────────────────────────────────────────────
+        if step < config.max_steps
+            && config.save_every_steps > 0
+            && step.is_multiple_of(config.save_every_steps)
+        {
+            save_burn_checkpoint(&model, &config.output_dir, step, &tx);
+        }
     }
 
     // ── Final checkpoint ──────────────────────────────────────────────────────
@@ -403,7 +444,88 @@ fn run_training_loop(
     let _ = tx.send(TrainingEvent::Done);
 }
 
+// ── Batch helpers ─────────────────────────────────────────────────────────────
+
+/// Convert a collated batch to `(input_ids, labels, non_pad_tokens)`.
+fn batch_tensors<B: Backend>(
+    batch: &DataBatch,
+    device: &B::Device,
+) -> (Tensor<B, 2, Int>, Tensor<B, 2, Int>, u64) {
+    let b = batch.input_ids.len();
+    let s = batch.input_ids.first().map(|r| r.len()).unwrap_or(1).max(1);
+
+    let input_flat: Vec<i32> =
+        batch.input_ids.iter().flat_map(|row| row.iter().map(|&id| id as i32)).collect();
+    let label_flat: Vec<i32> =
+        batch.labels.iter().flat_map(|row| row.iter().map(|&id| id as i32)).collect();
+    let n_tokens = label_flat.iter().filter(|&&id| id != PAD_ID as i32).count() as u64;
+
+    (
+        Tensor::from_data(TensorData::new(input_flat, [b, s]), device),
+        Tensor::from_data(TensorData::new(label_flat, [b, s]), device),
+        n_tokens,
+    )
+}
+
+/// Deterministic synthetic batch used when no corpus is provided.
+fn demo_batch<B: Backend>(
+    batch_size: usize,
+    seq: usize,
+    vocab_size: usize,
+    offset: usize,
+    device: &B::Device,
+) -> (Tensor<B, 2, Int>, Tensor<B, 2, Int>, u64) {
+    let n = batch_size * seq;
+    let ids: Vec<i32> = (0..n).map(|i| ((offset * n + i) % vocab_size) as i32).collect();
+    let lbl: Vec<i32> = (0..n).map(|i| ((offset * n + i + 1) % vocab_size) as i32).collect();
+    (
+        Tensor::from_data(TensorData::new(ids, [batch_size, seq]), device),
+        Tensor::from_data(TensorData::new(lbl, [batch_size, seq]), device),
+        n as u64,
+    )
+}
+
+/// Mean cross-entropy over (up to `MAX_EVAL_BATCHES`) held-out batches.
+fn evaluate<B: Backend>(model: &QuarkModel<B>, batches: &[DataBatch], device: &B::Device) -> f32 {
+    let ce_loss = CrossEntropyLossConfig::new()
+        .with_pad_tokens(Some(vec![PAD_ID as usize]))
+        .init(device);
+    let used = &batches[..batches.len().min(MAX_EVAL_BATCHES)];
+    let total: f32 = used
+        .iter()
+        .map(|batch| {
+            let (input_ids, label_ids, _) = batch_tensors::<B>(batch, device);
+            let logits = model.forward(input_ids);
+            let [b, s, v] = logits.dims();
+            ce_loss
+                .forward(logits.reshape([b * s, v]), label_ids.reshape([b * s]))
+                .into_scalar()
+                .elem::<f32>()
+        })
+        .sum();
+    total / used.len() as f32
+}
+
 // ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+/// Latest `checkpoint-N.bin` in `dir`, if the `config.json` saved alongside it
+/// matches `model_config` exactly.
+fn find_resumable_checkpoint(dir: &Path, model_config: &QuarkConfig) -> Option<(PathBuf, u64)> {
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).ok()?).ok()?;
+    if saved != serde_json::to_value(model_config).ok()? {
+        return None;
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            let step = name.strip_prefix("checkpoint-")?.strip_suffix(".bin")?.parse().ok()?;
+            Some((path, step))
+        })
+        .max_by_key(|(_, step)| *step)
+}
 
 fn save_burn_checkpoint(
     model: &QuarkModel<crate::backend::TrainBackend>,
@@ -415,15 +537,11 @@ fn save_burn_checkpoint(
         ($($t:tt)*) => {{ let _ = tx.send(TrainingEvent::Log(format!($($t)*))); }};
     }
 
-    // CompactRecorder appends ".bin" automatically.
-    let stem = if step == u64::MAX {
-        output_dir.join("checkpoint-final")
-    } else {
-        output_dir.join(format!("checkpoint-{step}"))
-    };
+    // The recorder appends ".bin" automatically.
+    let stem = output_dir.join(format!("checkpoint-{step}"));
 
     let record = model.clone().into_record();
-    match CompactRecorder::new().record(record, stem.clone()) {
+    match CheckpointRecorder::new().record(record, stem.clone()) {
         Ok(_) => log!("💾  Checkpoint saved → {}.bin", stem.display()),
         Err(e) => log!("⚠  Checkpoint save failed: {e}"),
     }
