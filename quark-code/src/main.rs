@@ -1,7 +1,10 @@
 //! quark-code — terminal AI coding agent powered by a bundled Quark model.
 //!
 //! Usage:
-//!   quark-code [project_dir]
+//!   quark-code [--allow-shell] [project_dir]
+//!
+//! `run_shell` is disabled unless `--allow-shell` is passed or `model/mcp.json`
+//! enables it.
 //!
 //! Looks for model files in a `model/` directory next to the executable
 //! (set by quark-gui's Export panel).  Falls back to a demo/stub mode if
@@ -63,14 +66,14 @@ fn main() -> Result<()> {
         let txt = std::fs::read_to_string(&mcp_path)?;
         serde_json::from_str(&txt).unwrap_or_default()
     } else {
-        // Default: enable all read tools + shell for coding use
+        // Default: file tools on; shell stays off unless --allow-shell is passed
         McpConfig {
             read_file:    true,
             write_file:   true,
             list_dir:     true,
             search_files: true,
             get_cwd:      true,
-            run_shell:    true,
+            run_shell:    false,
             working_dir:  std::env::current_dir().unwrap_or_else(|_| exe_dir.clone()),
         }
     };
@@ -83,9 +86,16 @@ fn main() -> Result<()> {
         DEFAULT_SYSTEM_PROMPT.to_owned()
     };
 
-    // ── Project directory (first arg or cwd) ──────────────────────────────
-    let project_root = std::env::args()
-        .nth(1)
+    // ── Command-line flags ─────────────────────────────────────────────────
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--allow-shell") {
+        mcp_cfg.run_shell = true;
+    }
+
+    // ── Project directory (first non-flag arg or cwd) ─────────────────────
+    let project_root = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 

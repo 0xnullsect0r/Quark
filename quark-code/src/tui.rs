@@ -84,10 +84,18 @@ fn event_loop(term: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) 
                     Ok(AgentEvent::FileChanged(fc)) => {
                         app.record_changes(vec![fc]);
                     }
+                    Ok(AgentEvent::Segment(text)) => {
+                        // Replace the streaming bubble with this round's text
+                        app.stream_buf.clear();
+                        app.messages.push(Message::assistant(text));
+                        app.scroll_to_bottom();
+                    }
                     Ok(AgentEvent::Done(full)) => {
                         // Replace streaming bubble with final message
                         app.stream_buf.clear();
-                        app.messages.push(Message::assistant(full));
+                        if !full.trim().is_empty() {
+                            app.messages.push(Message::assistant(full));
+                        }
                         app.generating = false;
                         app.scroll_to_bottom();
                         done = true;

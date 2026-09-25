@@ -306,7 +306,7 @@ Options:
 | `write_file` | Write or overwrite a file |
 | `list_dir` | List directory contents |
 | `search_files` | Search file contents with a pattern |
-| `run_shell` | Execute a shell command and capture output |
+| `run_shell` | Execute a shell command and capture output (off by default; pass `--allow-shell` or enable it in `model/mcp.json`) |
 | `git_status` | Show `git status` |
 | `git_diff` | Show `git diff` (staged or unstaged) |
 | `git_log` | Show recent commit log |
@@ -316,6 +316,8 @@ Options:
 | `find_files` | Glob-pattern file search |
 | `read_lines` | Read specific line ranges from a file |
 | `write_lines` | Replace specific line ranges in a file |
+
+In **Plan** mode, tools that change the project (`write_file`, `write_lines`, `apply_diff`, `git_add`, `git_commit`, `run_shell`) are blocked. Tool results go back to the model, which can make further tool calls (up to 8 rounds per turn) before it gives its answer.
 
 #### Context Injection
 

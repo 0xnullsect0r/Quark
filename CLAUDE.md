@@ -91,11 +91,10 @@ The model emits tool calls as `<tool_call>{"tool":"name",...}</tool_call>` XML i
 
 `start_turn()` spawns a background thread that:
 1. Builds a system prompt injecting available tools, current mode (Plan/Build), and `AGENTS.md` context
-2. Runs inference (currently a keyword-matching stub — real model wiring is a TODO)
-3. Streams `AgentEvent` tokens back over `mpsc::channel`
-4. Parses tool calls from the response, executes them, and emits `FileChanged` events for undo tracking
+2. Runs inference with the loaded `InferenceEngine` and streams real tokens as `AgentEvent::Token`, falling back to a keyword-matching stub (`generate_stub_response`) when no model is bundled
+3. Parses tool calls, executes them, emits `FileChanged` events for undo tracking, and feeds `<tool_result>` blocks back to the model for up to `MAX_TOOL_ROUNDS` rounds
 
-Plan mode blocks all write/git tools. Build mode allows full filesystem access.
+Plan mode blocks mutating tools (`is_mutating_tool`) in code, not just in the prompt. Build mode allows full filesystem access. `run_shell` is off unless `--allow-shell` is passed or `mcp.json` enables it.
 
 ### GUI panels (`quark-gui/src/panels/`)
 
@@ -126,6 +125,10 @@ Subdirectories: `checkpoints/`, `datasets/`, `the-pile/`, `settings.toml`.
 - Error handling uses `anyhow` for applications and `thiserror` for library types
 - Logging uses `tracing`; log level is controlled by `RUST_LOG` env var (default: `quark=info`)
 
-## Key TODOs in the Codebase
+## Model, training and inference notes
 
-The inference path in `quark-code/src/agent.rs` is a heuristic stub (`generate_stub_response`). The comment at line 121 marks where real `quark-core` inference needs to be wired in once model weights are loadable.
+- `DecoderBlock` holds either a dense FFN or a `MoeBlock` (as `Option`s), never both. MoE uses sparse top-k dispatch and returns a Switch-style load-balancing loss via `forward_with_aux`.
+- Training (`training/trainer.rs`) supports grad accumulation, global-norm clipping (`training/grad_clip.rs`), held-out eval (`TrainingEvent::Eval`), and resume from the latest `checkpoint-N.bin`. It writes `config.json` and `tokenizer.json` next to the checkpoints; `QuarkConfig::for_checkpoint` reads the config back.
+- Checkpoints use `checkpoint::CheckpointRecorder` (Burn `BinFileRecorder`, full precision, `.bin`). Optimizer state is not saved, so it restarts fresh on resume.
+- Generation (`inference/generate.rs`) uses per-layer KV caches (`QuarkModel::forward_cached`). When the context window fills, it re-prefills the most recent half window.
+- `quark-core/tests/train_e2e.rs` trains a tiny model end-to-end (train → eval → checkpoint → load → stream → resume). Run it after touching the model, trainer or inference code.

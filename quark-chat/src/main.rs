@@ -142,9 +142,19 @@ fn main() -> Result<()> {
             Some(e) => {
                 print!("Quark: ");
                 io::stdout().flush()?;
-                match e.generate(&history, sampling.clone()) {
+                let (token_tx, token_rx) = std::sync::mpsc::channel::<String>();
+                let result = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        for piece in token_rx {
+                            print!("{piece}");
+                            let _ = io::stdout().flush();
+                        }
+                    });
+                    e.generate_streaming(&history, sampling.clone(), token_tx)
+                });
+                match result {
                     Ok(text) => {
-                        println!("{text}");
+                        println!();
                         text
                     }
                     Err(err) => {
@@ -161,6 +171,8 @@ fn main() -> Result<()> {
             }
         };
 
+        history.push_str(&format!("{response}\n</assistant>\n\n"));
+
         let calls = parse_tool_calls(&response);
         for call in &calls {
             println!();
@@ -173,8 +185,6 @@ fn main() -> Result<()> {
             history.push_str(&formatted);
             history.push('\n');
         }
-
-        history.push_str(&format!("{response}\n</assistant>\n\n"));
         println!();
     }
 

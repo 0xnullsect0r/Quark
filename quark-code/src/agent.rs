@@ -1,9 +1,10 @@
-//! Agent loop: builds prompts, calls inference (or stub), parses tool calls.
+//! Agent loop: builds prompts, calls inference (or stub), runs tool calls and
+//! feeds their results back to the model until it answers without tools.
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use quark_core::mcp::{parse_tool_calls, McpConfig, ToolCall};
+use quark_core::mcp::{parse_tool_calls, McpConfig, ToolCall, ToolResult};
 
 use crate::app::{App, FileChange, Message, Mode};
 use crate::tools::execute_extended;
@@ -19,7 +20,9 @@ pub enum AgentEvent {
     ToolCall { name: String, preview: String },
     ToolResult { name: String, ok: bool, preview: String },
     FileChanged(FileChange),
-    Done(String), // final assembled response
+    /// Text of an intermediate round (the one that issued tool calls).
+    Segment(String),
+    Done(String), // final round's response (may be empty)
     Error(String),
 }
 
@@ -108,67 +111,144 @@ fn build_prompt(app: &App) -> String {
 
 // ─── Agent turn execution ─────────────────────────────────────────────────────
 
+/// Maximum model → tools → model round trips in one turn.
+const MAX_TOOL_ROUNDS: usize = 8;
+/// Tool output fed back to the model is truncated to this many characters.
+const MAX_TOOL_RESULT_CHARS: usize = 4000;
+
+/// Tools that modify the project (or can, like `run_shell`); blocked in Plan mode.
+fn is_mutating_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "write_lines" | "apply_diff" | "git_add" | "git_commit" | "run_shell"
+    )
+}
+
 fn run_agent_turn(
     tx:             mpsc::Sender<AgentEvent>,
     system_prompt:  String,
     prompt:         String,
     mcp_cfg:        McpConfig,
-    _mode:          Mode,
+    mode:           Mode,
     engine:         Option<std::sync::Arc<quark_core::inference::InferenceEngine>>,
 ) {
-    // ── Generate response ────────────────────────────────────────────────────
-    let response = if let Some(engine) = engine {
-        let full_prompt = format!("{system_prompt}\n\n{prompt}");
-        let params = quark_core::inference::SamplingParams::default();
-        match engine.generate(&full_prompt, params) {
-            Ok(text) => text,
-            Err(e) => {
-                let _ = tx.send(AgentEvent::Error(format!("Inference error: {e}")));
-                return;
+    // `transcript` ends with an open `<assistant>` tag; each round appends the
+    // model's reply and the tool results, then reopens `<assistant>`.
+    let mut transcript = prompt;
+    let mut response = String::new();
+
+    for round in 0..MAX_TOOL_ROUNDS {
+        // ── Generate response ────────────────────────────────────────────────
+        response = match &engine {
+            Some(engine) => match generate_streamed(engine, &system_prompt, &transcript, &tx) {
+                Ok(text) => text,
+                Err(e) => {
+                    let _ = tx.send(AgentEvent::Error(format!("Inference error: {e}")));
+                    return;
+                }
+            },
+            None => {
+                let text = generate_stub_response(&transcript, &mcp_cfg);
+                // Stream word-by-word for a typing feel.
+                for word in text.split_inclusive(' ') {
+                    let _ = tx.send(AgentEvent::Token(word.to_owned()));
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                }
+                text
             }
-        }
-    } else {
-        generate_stub_response(&prompt, &mcp_cfg)
-    };
+        };
 
-    // Stream the response token-by-token (word-by-word for the stub)
-    for word in response.split_inclusive(' ') {
-        let _ = tx.send(AgentEvent::Token(word.to_owned()));
-        std::thread::sleep(std::time::Duration::from_millis(8)); // typing feel
+        let calls = parse_tool_calls(&response);
+        if calls.is_empty() {
+            break;
+        }
+        // Show this round's text before its tool calls.
+        let _ = tx.send(AgentEvent::Segment(response.clone()));
+
+        // ── Execute tool calls ───────────────────────────────────────────────
+        let mut results = String::new();
+        for call in &calls {
+            let preview = format!("{} {:?}", call.tool, call.args);
+            let _ = tx.send(AgentEvent::ToolCall {
+                name:    call.tool.clone(),
+                preview,
+            });
+
+            let (result, change) = run_tool(call, mode, &mcp_cfg);
+            if let Some(fc) = change {
+                let _ = tx.send(AgentEvent::FileChanged(fc));
+            }
+
+            let _ = tx.send(AgentEvent::ToolResult {
+                name:    result.tool.clone(),
+                ok:      result.ok,
+                preview: result.content.chars().take(300).collect(),
+            });
+
+            let status = if result.ok { "ok" } else { "error" };
+            let content: String = result.content.chars().take(MAX_TOOL_RESULT_CHARS).collect();
+            results.push_str(&format!(
+                "<tool_result>\n{} ({status}):\n{content}\n</tool_result>\n",
+                result.tool
+            ));
+        }
+
+        // The stub can't read tool results, so a second round would repeat itself.
+        if engine.is_none() {
+            response.clear();
+            break;
+        }
+        if round + 1 == MAX_TOOL_ROUNDS {
+            response = format!("(stopped after {MAX_TOOL_ROUNDS} tool rounds)");
+            break;
+        }
+
+        transcript.push_str(&response);
+        transcript.push_str("\n</assistant>\n\n");
+        transcript.push_str(&results);
+        transcript.push_str("\n<assistant>\n");
     }
 
-    // ── Parse and execute tool calls ─────────────────────────────────────────
-    let calls = parse_tool_calls(&response);
-    let mut changes: Vec<FileChange> = Vec::new();
-
-    for call in &calls {
-        let preview = format!("{} {:?}", call.tool, call.args);
-        let _ = tx.send(AgentEvent::ToolCall {
-            name:    call.tool.clone(),
-            preview: preview.clone(),
-        });
-
-        // Snapshot before-state for undo if write tool
-        let before = snapshot_before(call, &mcp_cfg);
-
-        let result = execute_extended(call, &mcp_cfg);
-
-        // Capture after-state for undo
-        if let Some(fc) = build_file_change(call, before, &mcp_cfg) {
-            changes.push(fc.clone());
-            let _ = tx.send(AgentEvent::FileChanged(fc));
-        }
-
-        let preview_result: String = result.content.chars().take(300).collect();
-        let _ = tx.send(AgentEvent::ToolResult {
-            name:    result.tool.clone(),
-            ok:      result.ok,
-            preview: preview_result,
-        });
-    }
-
-    // Signal done with full response + any file changes
     let _ = tx.send(AgentEvent::Done(response));
+}
+
+/// Execute one tool call (unless Plan mode blocks it), returning its result
+/// and the file change to record for undo, if any.
+fn run_tool(call: &ToolCall, mode: Mode, cfg: &McpConfig) -> (ToolResult, Option<FileChange>) {
+    if mode == Mode::Plan && is_mutating_tool(&call.tool) {
+        let blocked = ToolResult {
+            tool:    call.tool.clone(),
+            ok:      false,
+            content: "blocked: Plan mode is read-only (switch with /build)".into(),
+        };
+        return (blocked, None);
+    }
+    // Snapshot before-state for undo if write tool
+    let before = snapshot_before(call, cfg);
+    let result = execute_extended(call, cfg);
+    let change = if result.ok { build_file_change(call, before, cfg) } else { None };
+    (result, change)
+}
+
+/// Run the model on `system_prompt` + `transcript`, forwarding text pieces to
+/// the UI as they are generated.
+fn generate_streamed(
+    engine:        &quark_core::inference::InferenceEngine,
+    system_prompt: &str,
+    transcript:    &str,
+    tx:            &mpsc::Sender<AgentEvent>,
+) -> anyhow::Result<String> {
+    let full_prompt = format!("{system_prompt}\n\n{transcript}");
+    let params = quark_core::inference::SamplingParams::default();
+    let (token_tx, token_rx) = mpsc::channel::<String>();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for piece in token_rx {
+                let _ = tx.send(AgentEvent::Token(piece));
+            }
+        });
+        engine.generate_streaming(&full_prompt, params, token_tx)
+    })
 }
 
 // ─── Inference stub ───────────────────────────────────────────────────────────
@@ -262,5 +342,63 @@ fn build_file_change(call: &ToolCall, before: Option<String>, cfg: &McpConfig) -
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_cfg(name: &str) -> McpConfig {
+        let dir = std::env::temp_dir().join(format!("quark-code-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello.txt"), "hi").unwrap();
+        McpConfig { working_dir: dir, ..McpConfig::default() }
+    }
+
+    fn write_call() -> ToolCall {
+        let args = serde_json::json!({ "path": "new.txt", "content": "x" });
+        ToolCall { tool: "write_file".into(), args }
+    }
+
+    #[test]
+    fn plan_mode_blocks_writes() {
+        let cfg = McpConfig { write_file: true, ..temp_cfg("plan") };
+        let (result, change) = run_tool(&write_call(), Mode::Plan, &cfg);
+        assert!(!result.ok);
+        assert!(change.is_none());
+        assert!(!cfg.working_dir.join("new.txt").exists());
+    }
+
+    #[test]
+    fn build_mode_writes_and_records_change() {
+        let cfg = McpConfig { write_file: true, ..temp_cfg("build") };
+        let (result, change) = run_tool(&write_call(), Mode::Build, &cfg);
+        assert!(result.ok, "{}", result.content);
+        let change = change.expect("file change recorded");
+        assert_eq!(change.before, None);
+        assert_eq!(change.after.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn stub_turn_runs_tools_and_finishes() {
+        let cfg = McpConfig { list_dir: true, ..temp_cfg("stub") };
+        let (tx, rx) = mpsc::channel();
+        run_agent_turn(
+            tx,
+            String::new(),
+            "<user>\nlist the files\n</user>\n\n<assistant>\n".into(),
+            cfg,
+            Mode::Build,
+            None,
+        );
+        let events: Vec<AgentEvent> = rx.into_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "list_dir")));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult { ok: true, preview, .. } if preview.contains("hello.txt")
+        )));
+        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
     }
 }
