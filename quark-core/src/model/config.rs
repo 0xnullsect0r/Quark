@@ -35,6 +35,12 @@ pub enum ModelPreset {
 }
 
 impl QuarkConfig {
+    /// Read the `config.json` the trainer writes next to its checkpoints.
+    pub fn for_checkpoint(checkpoint: &std::path::Path) -> Option<Self> {
+        let txt = std::fs::read_to_string(checkpoint.parent()?.join("config.json")).ok()?;
+        serde_json::from_str(&txt).ok()
+    }
+
     pub fn quark_1b() -> Self {
         Self {
             vocab_size: 32000,

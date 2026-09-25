@@ -92,22 +92,6 @@ impl TrainingHandle {
     }
 }
 
-pub struct Trainer {
-    config: TrainerConfig,
-    sender: MetricsSender,
-}
-
-impl Trainer {
-    pub fn new(config: TrainerConfig) -> (Self, MetricsReceiver) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        (Self { config, sender: tx }, rx)
-    }
-
-    pub fn run(&self) -> anyhow::Result<()> {
-        todo!("Trainer::run — use start_training() for the background loop")
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,7 +125,7 @@ pub fn start_training(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn run_training_loop(
-    model_config: QuarkConfig,
+    mut model_config: QuarkConfig,
     config: TrainerConfig,
     corpus_files: Vec<PathBuf>,
     tokenizer_path: Option<PathBuf>,
@@ -196,8 +180,33 @@ fn run_training_loop(
         Err(e) => bail!("Tokenizer load failed: {e}\nTrain a tokenizer in the Dataset tab first."),
     };
 
-    // Use tokenizer vocab size if it differs from model config
+    // The embedding and LM head must cover every id the tokenizer can emit.
     let vocab_size = tokenizer.vocab_size();
+    if model_config.vocab_size != vocab_size {
+        log!(
+            "   vocab_size {} → {} (matching tokenizer)",
+            model_config.vocab_size,
+            vocab_size
+        );
+        model_config.vocab_size = vocab_size;
+    }
+
+    // Save the exact architecture + tokenizer next to the checkpoints so
+    // inference and export can rebuild the same model.
+    match serde_json::to_string_pretty(&model_config) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(config.output_dir.join("config.json"), json) {
+                log!("⚠  Could not write config.json: {e}");
+            }
+        }
+        Err(e) => log!("⚠  Could not serialise model config: {e}"),
+    }
+    let tok_dest = config.output_dir.join("tokenizer.json");
+    if tok_dest != tok_path {
+        if let Err(e) = std::fs::copy(&tok_path, &tok_dest) {
+            log!("⚠  Could not copy tokenizer.json: {e}");
+        }
+    }
 
     // ── Load and tokenize corpus ──────────────────────────────────────────────
     let batches = if !corpus_files.is_empty() {

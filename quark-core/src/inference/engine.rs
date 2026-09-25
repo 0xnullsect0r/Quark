@@ -8,7 +8,7 @@ use burn::module::Module;
 use burn::record::{CompactRecorder, Recorder};
 
 use crate::backend::InferBackend;
-use crate::inference::generate::{GenerateConfig, generate, generate_streaming};
+use crate::inference::generate::{GenerateConfig, generate, generate_with};
 use crate::inference::sampling::SamplingParams;
 use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
@@ -21,6 +21,7 @@ pub struct InferenceEngine {
     model: QuarkModel<InferBackend>,
     tokenizer: QuarkTokenizer,
     device: Device,
+    max_context: usize,
 }
 
 // Burn's NdArray Param types use OnceCell which is not Sync, but InferenceEngine
@@ -50,26 +51,26 @@ impl InferenceEngine {
         let tokenizer = QuarkTokenizer::load(tokenizer)
             .with_context(|| format!("Failed to load tokenizer: {}", tokenizer.display()))?;
 
-        Ok(Self { model, tokenizer, device })
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+            max_context: config.max_position_embeddings,
+        })
     }
 
     /// Generate a response for `prompt`, returning the full decoded string.
     pub fn generate(&self, prompt: &str, params: SamplingParams) -> Result<String> {
-        let mut ids = self.encode_prompt(prompt)?;
-
-        let cfg = GenerateConfig {
-            prompt_ids: ids.clone(),
-            sampling: params,
-            seed: 42,
-        };
-
-        let output = generate(&self.model, cfg, &self.device)?;
+        let ids = self.encode_prompt(prompt)?;
+        let prompt_len = ids.len();
+        let output = generate(&self.model, self.generate_config(ids, params), &self.device)?;
         // Decode only the newly generated tokens (after the prompt)
-        let new_tokens = &output[ids.len()..];
-        self.tokenizer.decode(new_tokens).map_err(|e| anyhow::anyhow!(e))
+        self.tokenizer.decode(&output[prompt_len..])
     }
 
-    /// Stream tokens one by one through `token_tx`, then return the full decoded response.
+    /// Stream decoded text pieces through `token_tx` as tokens are generated,
+    /// then return the full decoded response. Stops early if the receiver is
+    /// dropped.
     pub fn generate_streaming(
         &self,
         prompt: &str,
@@ -79,31 +80,49 @@ impl InferenceEngine {
         let ids = self.encode_prompt(prompt)?;
         let prompt_len = ids.len();
 
-        // Generate tokens; stream each decoded token
-        let (raw_tx, raw_rx) = mpsc::channel::<u32>();
-        let tokenizer = crate::tokenizer::bpe::QuarkTokenizer::load(
-            // re-use existing tokenizer by re-loading is wrong; use a workaround
-            // We decode incrementally by buffering in a thread
-            &crate::paths::datasets_dir().join("_placeholder_"),
-        );
+        // Decode the whole response so far and emit only the new suffix, so
+        // multi-token characters and merged whitespace come out correctly.
+        let mut new_ids: Vec<u32> = Vec::new();
+        let mut emitted = String::new();
+        let output = generate_with(
+            &self.model,
+            self.generate_config(ids, params),
+            &self.device,
+            |tok| {
+                new_ids.push(tok);
+                let Ok(text) = self.tokenizer.decode(&new_ids) else {
+                    return true;
+                };
+                // Hold back incomplete UTF-8 sequences until the next token.
+                if text.ends_with('\u{FFFD}') || !text.starts_with(emitted.as_str()) {
+                    return true;
+                }
+                let piece = &text[emitted.len()..];
+                if piece.is_empty() {
+                    return true;
+                }
+                let ok = token_tx.send(piece.to_owned()).is_ok();
+                emitted = text;
+                ok
+            },
+        )?;
 
-        // Use simple blocking generation and decode the final result
-        let cfg = GenerateConfig {
-            prompt_ids: ids,
-            sampling: params,
-            seed: 42,
-        };
-
-        let output = generate(&self.model, cfg, &self.device)?;
-        let new_tokens = &output[prompt_len..];
-        let text = self.tokenizer.decode(new_tokens).map_err(|e| anyhow::anyhow!(e))?;
-
-        // Stream word by word for smooth display
-        for word in text.split_inclusive(' ') {
-            let _ = token_tx.send(word.to_owned());
+        let text = self.tokenizer.decode(&output[prompt_len..])?;
+        if let Some(rest) = text.strip_prefix(emitted.as_str()) {
+            if !rest.is_empty() {
+                let _ = token_tx.send(rest.to_owned());
+            }
         }
-
         Ok(text)
+    }
+
+    fn generate_config(&self, prompt_ids: Vec<u32>, sampling: SamplingParams) -> GenerateConfig {
+        GenerateConfig {
+            prompt_ids,
+            sampling,
+            seed: 42,
+            max_context: self.max_context,
+        }
     }
 
     fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>> {

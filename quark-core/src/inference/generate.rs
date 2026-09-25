@@ -16,6 +16,9 @@ pub struct GenerateConfig {
     pub sampling: SamplingParams,
     /// RNG seed for reproducible sampling.
     pub seed: u64,
+    /// Only the last `max_context` tokens are fed to the model (the model's
+    /// `max_position_embeddings`). `0` means unlimited.
+    pub max_context: usize,
 }
 
 impl Default for GenerateConfig {
@@ -24,6 +27,7 @@ impl Default for GenerateConfig {
             prompt_ids: vec![],
             sampling: SamplingParams::default(),
             seed: 42,
+            max_context: 0,
         }
     }
 }
@@ -62,6 +66,43 @@ fn last_logits<B: Backend>(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Generate tokens autoregressively, calling `on_token` with each new token.
+///
+/// Generation stops at a stop token, after `max_new_tokens`, or as soon as
+/// `on_token` returns `false`. Returns the full token sequence
+/// (prompt + newly generated tokens).
+pub fn generate_with<B: Backend>(
+    model: &crate::model::QuarkModel<B>,
+    config: GenerateConfig,
+    device: &B::Device,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<Vec<u32>> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
+    let mut generated = config.prompt_ids.clone();
+
+    for _ in 0..config.sampling.max_new_tokens {
+        let window_start = match config.max_context {
+            0 => 0,
+            n => generated.len().saturating_sub(n),
+        };
+        let mut logits = match last_logits(model, &generated[window_start..], device) {
+            Some(l) => l,
+            None => break,
+        };
+
+        let next_token = config.sampling.sample(&mut logits, &mut rng);
+        generated.push(next_token);
+
+        let keep_going = on_token(next_token);
+        if !keep_going || config.sampling.stop_tokens.contains(&next_token) || next_token == EOS_ID
+        {
+            break;
+        }
+    }
+
+    Ok(generated)
+}
+
 /// Generate tokens autoregressively.
 ///
 /// Returns the full token sequence (prompt + newly generated tokens).
@@ -70,28 +111,11 @@ pub fn generate<B: Backend>(
     config: GenerateConfig,
     device: &B::Device,
 ) -> Result<Vec<u32>> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
-    let mut generated = config.prompt_ids.clone();
-
-    for _ in 0..config.sampling.max_new_tokens {
-        let mut logits = match last_logits(model, &generated, device) {
-            Some(l) => l,
-            None => break,
-        };
-
-        let next_token = config.sampling.sample(&mut logits, &mut rng);
-        generated.push(next_token);
-
-        if config.sampling.stop_tokens.contains(&next_token) || next_token == EOS_ID {
-            break;
-        }
-    }
-
-    Ok(generated)
+    generate_with(model, config, device, |_| true)
 }
 
 /// Streaming variant: sends each newly generated token through `token_sender`
-/// before checking the stop condition.
+/// before checking the stop condition. Stops early if the receiver is dropped.
 ///
 /// Returns the full token sequence (prompt + generated).
 pub fn generate_streaming<B: Backend>(
@@ -100,25 +124,5 @@ pub fn generate_streaming<B: Backend>(
     device: &B::Device,
     token_sender: std_mpsc::Sender<u32>,
 ) -> Result<Vec<u32>> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
-    let mut generated = config.prompt_ids.clone();
-
-    for _ in 0..config.sampling.max_new_tokens {
-        let mut logits = match last_logits(model, &generated, device) {
-            Some(l) => l,
-            None => break,
-        };
-
-        let next_token = config.sampling.sample(&mut logits, &mut rng);
-        generated.push(next_token);
-
-        // Non-blocking send; ignore errors if the receiver was dropped.
-        let _ = token_sender.send(next_token);
-
-        if config.sampling.stop_tokens.contains(&next_token) || next_token == EOS_ID {
-            break;
-        }
-    }
-
-    Ok(generated)
+    generate_with(model, config, device, |tok| token_sender.send(tok).is_ok())
 }

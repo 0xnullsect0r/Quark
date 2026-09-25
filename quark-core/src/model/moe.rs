@@ -75,23 +75,7 @@ impl<B: Backend> MoeBlock<B> {
         let logits = self.router.forward(x.clone());
         let weights = softmax(logits, 2);
 
-        // Select top-k weights per token.
-        // `topk(k, dim)` returns the k largest values along `dim`.
-        let top_k_vals = weights.clone().topk(top_k, 2); // [batch, seq, top_k]
-
-        // Threshold: k-th largest weight per token — anything strictly below
-        // this is outside the top-k set and should receive weight 0.
-        let threshold = top_k_vals.narrow(2, top_k - 1, 1); // [batch, seq, 1]
-
-        // Zero out weights below threshold using an arithmetic mask:
-        //   relu(w - threshold) is positive for top-k, 0 for the rest.
-        // Clamp to {0,1} via sign (always ≥ 0) to get a binary mask.
-        let diff = weights.clone() - threshold;     // [batch, seq, n_exp]
-        let relu_diff = diff.clamp_min(0.0_f32);    // 0 for non-top-k
-        // Normalise top-k weights among themselves (sum over expert dim)
-        let sum2d = relu_diff.clone().sum_dim(2);   // [batch, seq]
-        let sum3d = sum2d.reshape([batch, seq, 1]) + 1e-9_f32; // [batch, seq, 1]
-        let final_weights = relu_diff / sum3d;      // [batch, seq, num_experts]
+        let final_weights = top_k_weights(weights, top_k); // [batch, seq, num_experts]
 
         // Weighted sum over expert outputs (non-top-k experts have weight ≈ 0).
         let mut output = Tensor::<B, 3>::zeros([batch, seq, hidden], &device);
@@ -102,5 +86,49 @@ impl<B: Backend> MoeBlock<B> {
         }
 
         output
+    }
+}
+
+/// Keep the `top_k` largest routing weights per token (renormalised to sum
+/// to 1) and zero out the rest. Input/output shape: `[batch, seq, num_experts]`.
+pub fn top_k_weights<B: Backend>(weights: Tensor<B, 3>, top_k: usize) -> Tensor<B, 3> {
+    // k-th largest weight per token; everything >= it is in the top-k set.
+    let threshold = weights.clone().topk(top_k, 2).narrow(2, top_k - 1, 1); // [batch, seq, 1]
+    let mask = weights.clone().greater_equal(threshold).float();
+    let kept = weights * mask;
+    let sum = kept.clone().sum_dim(2) + 1e-9_f32; // [batch, seq, 1]
+    kept / sum
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::tensor::TensorData;
+    use burn_ndarray::NdArray;
+
+    use super::*;
+
+    type B = NdArray<f32>;
+
+    fn weights() -> Tensor<B, 3> {
+        let data = TensorData::new(vec![0.1f32, 0.6, 0.3, 0.5, 0.2, 0.3], [1, 2, 3]);
+        Tensor::from_data(data, &Default::default())
+    }
+
+    #[test]
+    fn top1_is_one_hot() {
+        let out: Vec<f32> = top_k_weights(weights(), 1).into_data().into_vec().unwrap();
+        let expected = [0.0, 1.0, 0.0, 1.0, 0.0, 0.0];
+        for (a, b) in out.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-5, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn top2_keeps_two_and_renormalises() {
+        let out: Vec<f32> = top_k_weights(weights(), 2).into_data().into_vec().unwrap();
+        let expected = [0.0, 0.6 / 0.9, 0.3 / 0.9, 0.5 / 0.8, 0.0, 0.3 / 0.8];
+        for (a, b) in out.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-5, "{out:?}");
+        }
     }
 }

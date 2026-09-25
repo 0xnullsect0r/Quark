@@ -70,11 +70,17 @@ impl eframe::App for QuarkApp {
         if let Some(ckpt_path) = self.checkpoints_panel.take_just_loaded() {
             // Only load .bin checkpoints (CompactRecorder format from training).
             if ckpt_path.extension().is_some_and(|e| e == "bin") {
-                let config = self.config_panel.config().clone();
-                let tokenizer = self
-                    .dataset_panel
-                    .active_tokenizer_path()
-                    .unwrap_or_else(|| quark_core::paths::datasets_dir().join("tokenizer.json"));
+                // Prefer the architecture + tokenizer saved alongside the checkpoint.
+                let config = quark_core::model::config::QuarkConfig::for_checkpoint(&ckpt_path)
+                    .unwrap_or_else(|| self.config_panel.config().clone());
+                let sibling_tok = ckpt_path.with_file_name("tokenizer.json");
+                let tokenizer = if sibling_tok.exists() {
+                    sibling_tok
+                } else {
+                    self.dataset_panel
+                        .active_tokenizer_path()
+                        .unwrap_or_else(|| quark_core::paths::datasets_dir().join("tokenizer.json"))
+                };
                 self.chat_panel.start_load(ckpt_path, config, tokenizer);
                 self.active = ActivePanel::Chat;
             }

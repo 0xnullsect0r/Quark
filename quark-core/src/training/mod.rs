@@ -10,4 +10,4 @@ pub mod trainer;
 
 pub use loss::cross_entropy_loss;
 pub use metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
-pub use trainer::{start_training, Trainer, TrainerConfig, TrainingHandle};
+pub use trainer::{start_training, TrainerConfig, TrainingHandle};
