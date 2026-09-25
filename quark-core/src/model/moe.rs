@@ -3,7 +3,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{activation::softmax, backend::Backend, Tensor},
+    tensor::{activation::softmax, backend::Backend, Int, Tensor, TensorData},
 };
 
 use super::{config::QuarkConfig, ffn::SwiGluFfn};
@@ -85,15 +85,29 @@ impl<B: Backend> MoeBlock<B> {
 
         let mask = top_k_mask(weights.clone(), top_k);
         let aux = load_balance_loss(weights.clone(), mask.clone(), top_k);
-        let final_weights = renormalise(weights * mask); // [batch, seq, num_experts]
+        let final_weights = renormalise(weights * mask.clone()); // [batch, seq, num_experts]
 
-        // Weighted sum over expert outputs (non-top-k experts have weight 0).
-        let mut output = Tensor::<B, 3>::zeros([batch, seq, hidden], &device);
-        for (i, expert) in self.experts.iter().enumerate() {
-            let expert_out = expert.forward(x.clone()); // [batch, seq, hidden]
-            let w = final_weights.clone().narrow(2, i, 1); // [batch, seq, 1]
-            output = output + expert_out * w;
+        // Run each expert only on the tokens routed to it (sparse dispatch).
+        let n_tokens = batch * seq;
+        let x_flat = x.reshape([n_tokens, hidden]);
+        let weights_flat = final_weights.reshape([n_tokens, self.num_experts]);
+        let routed = routed_tokens(mask, self.num_experts);
+
+        let mut output = Tensor::<B, 2>::zeros([n_tokens, hidden], &device);
+        for (i, (expert, tokens)) in self.experts.iter().zip(routed).enumerate() {
+            if tokens.is_empty() {
+                continue;
+            }
+            let n = tokens.len();
+            let idx = Tensor::<B, 1, Int>::from_data(TensorData::new(tokens, [n]), &device);
+            let expert_in = x_flat.clone().select(0, idx.clone()); // [n, hidden]
+            let w = weights_flat.clone().narrow(1, i, 1).select(0, idx.clone()); // [n, 1]
+            let expert_out = expert
+                .forward(expert_in.reshape([1, n, hidden]))
+                .reshape([n, hidden]);
+            output = output.select_assign(0, idx, expert_out * w);
         }
+        let output = output.reshape([batch, seq, hidden]);
 
         (output, aux)
     }
@@ -105,6 +119,22 @@ fn top_k_mask<B: Backend>(weights: Tensor<B, 3>, top_k: usize) -> Tensor<B, 3> {
     // k-th largest weight per token; everything >= it is in the top-k set.
     let threshold = weights.clone().topk(top_k, 2).narrow(2, top_k - 1, 1); // [batch, seq, 1]
     weights.greater_equal(threshold).float()
+}
+
+/// For each expert, the flat token indices (`batch * seq + pos`) routed to it.
+fn routed_tokens<B: Backend>(mask: Tensor<B, 3>, num_experts: usize) -> Vec<Vec<i32>> {
+    let flags: Vec<f32> = mask
+        .into_data()
+        .convert::<f32>()
+        .into_vec()
+        .unwrap_or_default();
+    let mut routed = vec![Vec::new(); num_experts];
+    for (i, &flag) in flags.iter().enumerate() {
+        if flag > 0.5 {
+            routed[i % num_experts].push((i / num_experts) as i32);
+        }
+    }
+    routed
 }
 
 /// Scale weights so they sum to 1 over the expert dimension.
@@ -136,7 +166,6 @@ pub fn top_k_weights<B: Backend>(weights: Tensor<B, 3>, top_k: usize) -> Tensor<
 
 #[cfg(test)]
 mod tests {
-    use burn::tensor::TensorData;
     use burn_ndarray::NdArray;
 
     use super::*;
@@ -175,5 +204,36 @@ mod tests {
         let mask: Tensor<B, 3> = Tensor::from_data(mask_data, &Default::default());
         let aux: f32 = load_balance_loss(probs, mask, 1).into_scalar();
         assert!((aux - 1.0).abs() < 1e-5, "{aux}");
+    }
+
+    #[test]
+    fn sparse_dispatch_matches_dense_mixture() {
+        let device = Default::default();
+        let cfg = QuarkConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            ..QuarkConfig::quark_1b()
+        };
+        let moe = MoeBlock::<B>::new(&cfg, &device);
+        let x = Tensor::<B, 3>::random(
+            [2, 5, 16],
+            burn::tensor::Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let sparse: Vec<f32> = moe.forward(x.clone()).into_data().into_vec().unwrap();
+
+        let weights = top_k_weights(softmax(moe.router.forward(x.clone()), 2), 2);
+        let mut dense = Tensor::<B, 3>::zeros([2, 5, 16], &device);
+        for (i, expert) in moe.experts.iter().enumerate() {
+            dense = dense + expert.forward(x.clone()) * weights.clone().narrow(2, i, 1);
+        }
+        let dense: Vec<f32> = dense.into_data().into_vec().unwrap();
+
+        for (a, b) in sparse.iter().zip(&dense) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
     }
 }

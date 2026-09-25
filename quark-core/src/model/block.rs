@@ -6,12 +6,10 @@ use burn::{
 };
 
 use super::{
-    attention::GroupedQueryAttention,
-    config::QuarkConfig,
-    ffn::SwiGluFfn,
-    moe::MoeBlock,
+    attention::GroupedQueryAttention, config::QuarkConfig, ffn::SwiGluFfn, moe::MoeBlock,
     norm::RmsNorm,
 };
+use crate::inference::cache::KvCache;
 
 /// A single transformer decoder block (dense or MoE depending on `is_moe`).
 #[derive(Module, Debug)]
@@ -45,6 +43,24 @@ impl<B: Backend> DecoderBlock<B> {
         self.forward_with_aux(x, mask).0
     }
 
+    /// Incremental forward pass for generation; see
+    /// [`GroupedQueryAttention::forward_cached`].
+    pub fn forward_cached(
+        &self,
+        x: Tensor<B, 3>,
+        cache: &mut KvCache<B>,
+        start_pos: usize,
+    ) -> Tensor<B, 3> {
+        let residual = x.clone();
+        let x = self.input_norm.forward(x);
+        let x = self.attn.forward_cached(x, cache, start_pos) + residual;
+        self.feed_forward(x).0
+    }
+
+    pub fn new_cache(&self) -> KvCache<B> {
+        self.attn.new_cache()
+    }
+
     /// Forward pass that also returns the MoE load-balancing loss (`None` on
     /// dense layers).
     pub fn forward_with_aux(
@@ -57,8 +73,11 @@ impl<B: Backend> DecoderBlock<B> {
         let x = self.input_norm.forward(x);
         let x = self.attn.forward(x, mask);
         let x = x + residual;
+        self.feed_forward(x)
+    }
 
-        // FFN sub-layer with pre-norm and residual
+    /// FFN (dense or MoE) sub-layer with pre-norm and residual.
+    fn feed_forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         let residual = x.clone();
         let x = self.post_attn_norm.forward(x);
         let (x, aux) = match (&self.moe, &self.ffn) {

@@ -3,10 +3,11 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{activation::softmax, backend::Backend, TensorData, Tensor},
+    tensor::{activation::softmax, backend::Backend, Tensor, TensorData},
 };
 
 use super::config::QuarkConfig;
+use crate::inference::cache::KvCache;
 
 /// Precompute RoPE cos/sin frequency tables.
 ///
@@ -17,6 +18,20 @@ pub fn precompute_rope_freqs<B: Backend>(
     theta: f64,
     device: &B::Device,
 ) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    rope_freqs_at::<B>(head_dim, 0, max_seq_len, theta, device)
+}
+
+/// RoPE cos/sin tables for positions `start_pos..start_pos + len`.
+///
+/// Returns `(cos, sin)` each of shape `[len, head_dim/2]`.
+pub fn rope_freqs_at<B: Backend>(
+    head_dim: usize,
+    start_pos: usize,
+    len: usize,
+    theta: f64,
+    device: &B::Device,
+) -> (Tensor<B, 2>, Tensor<B, 2>) {
+    let max_seq_len = len;
     let half_dim = head_dim / 2;
 
     // inv_freq[i] = 1 / theta^(2i / head_dim)
@@ -27,7 +42,9 @@ pub fn precompute_rope_freqs<B: Backend>(
         Tensor::<B, 1>::from_data(TensorData::new(inv_freq_data, vec![half_dim]), device)
             .reshape([1, half_dim]); // [1, half_dim]
 
-    let positions_data: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
+    let positions_data: Vec<f32> = (start_pos..start_pos + max_seq_len)
+        .map(|i| i as f32)
+        .collect();
     let positions =
         Tensor::<B, 1>::from_data(TensorData::new(positions_data, vec![max_seq_len]), device)
             .reshape([max_seq_len, 1]); // [max_seq_len, 1]
@@ -143,13 +160,66 @@ impl<B: Backend> GroupedQueryAttention<B> {
     /// - `mask` shape (optional): `[1, 1, seq, seq]` — additive causal mask (-inf / 0)
     /// - output shape: `[batch, seq, hidden]`
     pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4>>) -> Tensor<B, 3> {
+        let (q, k, v) = self.project(x, 0);
+        self.attend(q, k, v, mask)
+    }
+
+    /// Incremental forward pass for generation.
+    ///
+    /// `x` holds only the new tokens, at positions `start_pos..start_pos + seq`;
+    /// keys/values for earlier positions come from (and are appended to) `cache`.
+    pub fn forward_cached(
+        &self,
+        x: Tensor<B, 3>,
+        cache: &mut KvCache<B>,
+        start_pos: usize,
+    ) -> Tensor<B, 3> {
+        let device = x.device();
+        let seq = x.dims()[1];
+        let (q, k, v) = self.project(x, start_pos);
+        let (k, v) = cache.update(k, v);
+        let total = k.dims()[2];
+
+        // A single new token may attend to everything; a multi-token chunk
+        // needs a causal mask offset by the cached length.
+        let mask = (seq > 1).then(|| {
+            let past = total - seq;
+            let data: Vec<f32> = (0..seq)
+                .flat_map(|i| {
+                    (0..total).map(move |j| {
+                        if j <= past + i {
+                            0.0
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                })
+                .collect();
+            Tensor::<B, 1>::from_data(TensorData::new(data, vec![seq * total]), &device)
+                .reshape([1, 1, seq, total])
+        });
+        self.attend(q, k, v, mask)
+    }
+
+    /// An empty KV cache sized for this layer.
+    pub fn new_cache(&self) -> KvCache<B> {
+        KvCache::new(usize::MAX, self.num_kv_heads, self.head_dim)
+    }
+
+    /// Project `x` to RoPE-rotated `q` `[batch, heads, seq, head_dim]` and
+    /// `k`, `v` `[batch, kv_heads, seq, head_dim]`.
+    fn project(
+        &self,
+        x: Tensor<B, 3>,
+        start_pos: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
         let device = x.device();
         let [batch, seq, _hidden] = x.dims();
 
         // Linear projections
         let q = self.q_proj.forward(x.clone()); // [batch, seq, num_heads * head_dim]
         let k = self.k_proj.forward(x.clone()); // [batch, seq, num_kv_heads * head_dim]
-        let v = self.v_proj.forward(x);         // [batch, seq, num_kv_heads * head_dim]
+        let v = self.v_proj.forward(x); // [batch, seq, num_kv_heads * head_dim]
 
         // Reshape -> [batch, seq, heads, head_dim], permute -> [batch, heads, seq, head_dim]
         let q = q
@@ -163,14 +233,29 @@ impl<B: Backend> GroupedQueryAttention<B> {
             .permute([0, 2, 1, 3]);
 
         // Apply RoPE
-        let (cos, sin) = precompute_rope_freqs::<B>(self.head_dim, seq, self.rope_theta, &device);
+        let (cos, sin) =
+            rope_freqs_at::<B>(self.head_dim, start_pos, seq, self.rope_theta, &device);
         let (q, k) = apply_rope(q, k, cos, sin);
+        (q, k, v)
+    }
+
+    /// Scaled dot-product attention of `q` over `k`/`v` (which may be longer
+    /// than `q` when cached), followed by the output projection.
+    fn attend(
+        &self,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        mask: Option<Tensor<B, 4>>,
+    ) -> Tensor<B, 3> {
+        let [batch, _, seq, _] = q.dims();
+        let kv_seq = k.dims()[2];
 
         // Expand KV heads for GQA (repeat each KV head num_groups times)
         let (k, v) = if self.num_kv_heads != self.num_heads {
             let groups = self.num_heads / self.num_kv_heads;
-            let k = expand_kv(k, self.num_kv_heads, groups, batch, seq, self.head_dim);
-            let v = expand_kv(v, self.num_kv_heads, groups, batch, seq, self.head_dim);
+            let k = expand_kv(k, self.num_kv_heads, groups, batch, kv_seq, self.head_dim);
+            let v = expand_kv(v, self.num_kv_heads, groups, batch, kv_seq, self.head_dim);
             (k, v)
         } else {
             (k, v)
@@ -178,7 +263,7 @@ impl<B: Backend> GroupedQueryAttention<B> {
 
         // Scaled dot-product attention
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        // k^T: [batch, heads, head_dim, seq]
+        // k^T: [batch, heads, head_dim, kv_seq]
         let scores = q.matmul(k.permute([0, 1, 3, 2])).mul_scalar(scale);
 
         // Apply additive causal mask
@@ -187,8 +272,8 @@ impl<B: Backend> GroupedQueryAttention<B> {
             None => scores,
         };
 
-        let weights = softmax(scores, 3); // [batch, heads, seq, seq]
-        let ctx = weights.matmul(v);      // [batch, heads, seq, head_dim]
+        let weights = softmax(scores, 3); // [batch, heads, seq, kv_seq]
+        let ctx = weights.matmul(v); // [batch, heads, seq, head_dim]
 
         // Permute back and reshape to [batch, seq, hidden]
         let ctx = ctx
@@ -196,5 +281,41 @@ impl<B: Backend> GroupedQueryAttention<B> {
             .reshape([batch, seq, self.num_heads * self.head_dim]);
 
         self.o_proj.forward(ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use burn_ndarray::NdArray;
+
+    use super::*;
+
+    type B = NdArray<f32>;
+
+    #[test]
+    fn expand_kv_repeats_each_head() {
+        let device = Default::default();
+        // [batch=1, kv_heads=2, seq=1, head_dim=2]: head 0 = [1, 2], head 1 = [3, 4]
+        let t = Tensor::<B, 4>::from_data(
+            TensorData::new(vec![1.0f32, 2., 3., 4.], [1, 2, 1, 2]),
+            &device,
+        );
+        let out = expand_kv(t, 2, 3, 1, 1, 2);
+        assert_eq!(out.dims(), [1, 6, 1, 2]);
+        let v: Vec<f32> = out.into_data().into_vec().unwrap();
+        assert_eq!(v, vec![1., 2., 1., 2., 1., 2., 3., 4., 3., 4., 3., 4.]);
+    }
+
+    #[test]
+    fn rope_offset_matches_full_table() {
+        let device = Default::default();
+        let (cos_full, sin_full) = precompute_rope_freqs::<B>(8, 10, 10000.0, &device);
+        let (cos, sin) = rope_freqs_at::<B>(8, 6, 4, 10000.0, &device);
+        let a: Vec<f32> = cos_full.narrow(0, 6, 4).into_data().into_vec().unwrap();
+        let b: Vec<f32> = cos.into_data().into_vec().unwrap();
+        assert_eq!(a, b);
+        let a: Vec<f32> = sin_full.narrow(0, 6, 4).into_data().into_vec().unwrap();
+        let b: Vec<f32> = sin.into_data().into_vec().unwrap();
+        assert_eq!(a, b);
     }
 }

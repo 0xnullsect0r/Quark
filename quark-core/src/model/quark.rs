@@ -6,11 +6,9 @@ use burn::{
     tensor::{backend::Backend, Int, Tensor, TensorData},
 };
 
-use super::{
-    block::DecoderBlock,
-    config::QuarkConfig,
-    norm::RmsNorm,
-};
+use crate::inference::cache::KvCache;
+
+use super::{block::DecoderBlock, config::QuarkConfig, norm::RmsNorm};
 
 /// The full Quark transformer model.
 ///
@@ -49,6 +47,30 @@ impl<B: Backend> QuarkModel<B> {
         self.forward_with_aux(input_ids).0
     }
 
+    /// One empty KV cache per decoder layer, for [`Self::forward_cached`].
+    pub fn new_kv_caches(&self) -> Vec<KvCache<B>> {
+        self.layers.iter().map(|layer| layer.new_cache()).collect()
+    }
+
+    /// Incremental forward pass for generation.
+    ///
+    /// `input_ids` holds only the new tokens, at positions
+    /// `start_pos..start_pos + seq`; earlier positions are read from `caches`
+    /// (one per layer, see [`Self::new_kv_caches`]), which are then extended.
+    /// Returns logits for the new tokens: `[batch, seq, vocab]`.
+    pub fn forward_cached(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+        caches: &mut [KvCache<B>],
+        start_pos: usize,
+    ) -> Tensor<B, 3> {
+        let mut x = self.embed_tokens.forward(input_ids);
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            x = layer.forward_cached(x, cache, start_pos);
+        }
+        self.lm_head.forward(self.norm.forward(x))
+    }
+
     /// Forward pass that also returns the MoE load-balancing loss averaged
     /// over MoE layers (`None` if the model has no MoE layers).
     pub fn forward_with_aux(
@@ -65,9 +87,7 @@ impl<B: Backend> QuarkModel<B> {
         //   0.0   for positions that can attend (lower triangle + diagonal)
         //   -inf  for future positions (upper triangle)
         let mask_flat: Vec<f32> = (0..seq)
-            .flat_map(|i| {
-                (0..seq).map(move |j| if j <= i { 0.0f32 } else { f32::NEG_INFINITY })
-            })
+            .flat_map(|i| (0..seq).map(move |j| if j <= i { 0.0f32 } else { f32::NEG_INFINITY }))
             .collect();
         let mask: Tensor<B, 4> =
             Tensor::<B, 1>::from_data(TensorData::new(mask_flat, vec![seq * seq]), &device)
@@ -135,5 +155,48 @@ mod tests {
         assert_eq!(b, batch);
         assert_eq!(s, seq);
         assert_eq!(v, cfg.vocab_size);
+    }
+
+    fn ids(v: &[i32]) -> Tensor<NdArray<f32>, 2, Int> {
+        Tensor::from_data(
+            TensorData::new(v.to_vec(), [1, v.len()]),
+            &Default::default(),
+        )
+    }
+
+    fn values(t: Tensor<NdArray<f32>, 3>) -> Vec<f32> {
+        t.into_data().into_vec().unwrap()
+    }
+
+    fn assert_close(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b) {
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn future_tokens_do_not_affect_past_logits() {
+        let cfg = test_cfg();
+        let model = QuarkModel::<NdArray<f32>>::new(&cfg, &Default::default());
+        let a = values(model.forward(ids(&[5, 9, 17, 3, 42, 8])).narrow(1, 0, 3));
+        let b = values(model.forward(ids(&[5, 9, 17, 200, 1, 77])).narrow(1, 0, 3));
+        assert_close(&a, &b);
+    }
+
+    #[test]
+    fn kv_cache_matches_full_forward() {
+        let cfg = test_cfg();
+        let model = QuarkModel::<NdArray<f32>>::new(&cfg, &Default::default());
+        let tokens = [5, 9, 17, 3, 42, 8, 11];
+        let full = values(model.forward(ids(&tokens)));
+
+        // Prefill 4 tokens, then feed the remaining 3 one at a time.
+        let mut caches = model.new_kv_caches();
+        let mut cached = values(model.forward_cached(ids(&tokens[..4]), &mut caches, 0));
+        for (pos, &tok) in tokens.iter().enumerate().skip(4) {
+            cached.extend(values(model.forward_cached(ids(&[tok]), &mut caches, pos)));
+        }
+        assert_close(&full, &cached);
     }
 }

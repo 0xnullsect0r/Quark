@@ -34,34 +34,19 @@ impl Default for GenerateConfig {
 
 // ── Shared helper ─────────────────────────────────────────────────────────────
 
-/// Run one forward pass and return the last token's logit vector.
-///
-/// `ids` is the current sequence of token ids.  Returns `None` if the
-/// sequence is empty or if tensor data extraction fails.
-fn last_logits<B: Backend>(
-    model: &crate::model::QuarkModel<B>,
-    ids: &[u32],
-    device: &B::Device,
-) -> Option<Vec<f32>> {
-    if ids.is_empty() {
-        return None;
-    }
+fn id_tensor<B: Backend>(ids: &[u32], device: &B::Device) -> Tensor<B, 2, Int> {
     let int_ids: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
-    let seq = ids.len();
-
-    let input = Tensor::<B, 2, Int>::from_data(
-        burn::tensor::TensorData::new(int_ids, [1, seq]),
+    Tensor::from_data(
+        burn::tensor::TensorData::new(int_ids, [1, ids.len()]),
         device,
-    );
+    )
+}
 
-    // Forward returns [batch=1, seq, vocab].
-    let logits = model.forward(input);
+/// Logit vector for the last position of `[1, seq, vocab]` logits.
+fn last_position<B: Backend>(logits: Tensor<B, 3>) -> Option<Vec<f32>> {
     let seq_len = logits.dims()[1];
-
-    // Extract [1, vocab] for the last position, then flatten to Vec<f32>.
     let last: Tensor<B, 2> = logits.narrow(1, seq_len - 1, 1).squeeze::<2>(1);
-    let data = last.into_data().into_vec::<f32>().ok()?;
-    Some(data)
+    last.into_data().into_vec::<f32>().ok()
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -79,13 +64,34 @@ pub fn generate_with<B: Backend>(
 ) -> Result<Vec<u32>> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
     let mut generated = config.prompt_ids.clone();
+    if generated.is_empty() {
+        return Ok(generated);
+    }
+
+    // Tokens `window_start..processed` of `generated` are in the KV caches,
+    // at positions `0..processed - window_start`.
+    let mut caches = model.new_kv_caches();
+    let mut window_start = 0usize;
+    let mut processed = 0usize;
 
     for _ in 0..config.sampling.max_new_tokens {
-        let window_start = match config.max_context {
-            0 => 0,
-            n => generated.len().saturating_sub(n),
-        };
-        let mut logits = match last_logits(model, &generated[window_start..], device) {
+        // When the context is full, re-prefill a shorter window so the
+        // caches aren't rebuilt on every subsequent token.
+        if config.max_context > 0 && generated.len() - window_start > config.max_context {
+            let keep = if processed == window_start {
+                config.max_context
+            } else {
+                (config.max_context / 2).max(1)
+            };
+            window_start = generated.len() - keep;
+            processed = window_start;
+            caches = model.new_kv_caches();
+        }
+
+        let new_ids = id_tensor::<B>(&generated[processed..], device);
+        let logits = model.forward_cached(new_ids, &mut caches, processed - window_start);
+        processed = generated.len();
+        let mut logits = match last_position(logits) {
             Some(l) => l,
             None => break,
         };
@@ -125,4 +131,52 @@ pub fn generate_streaming<B: Backend>(
     token_sender: std_mpsc::Sender<u32>,
 ) -> Result<Vec<u32>> {
     generate_with(model, config, device, |tok| token_sender.send(tok).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use burn_ndarray::NdArray;
+
+    use super::*;
+    use crate::model::{config::QuarkConfig, QuarkModel};
+
+    #[test]
+    fn generates_past_the_context_window() {
+        let cfg = QuarkConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            intermediate_size: 64,
+            max_position_embeddings: 8,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            num_experts: 2,
+            num_experts_per_tok: 1,
+            num_moe_layers: 1,
+            moe_layer_freq: 2,
+            tie_word_embeddings: false,
+        };
+        let device = Default::default();
+        let model = QuarkModel::<NdArray<f32>>::new(&cfg, &device);
+        let config = GenerateConfig {
+            prompt_ids: (10..22).collect(), // longer than the window
+            sampling: SamplingParams {
+                max_new_tokens: 20,
+                stop_tokens: vec![],
+                ..SamplingParams::default()
+            },
+            seed: 1,
+            max_context: cfg.max_position_embeddings,
+        };
+        let mut streamed = 0;
+        let out = generate_with(&model, config, &device, |_| {
+            streamed += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(out.len() - 12, streamed);
+        assert!(out.iter().all(|&t| (t as usize) < cfg.vocab_size));
+    }
 }
