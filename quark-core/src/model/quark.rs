@@ -27,7 +27,7 @@ impl<B: Backend> QuarkModel<B> {
         // Layer i is a MoE layer iff `i % moe_layer_freq == 0`
         let layers: Vec<DecoderBlock<B>> = (0..cfg.num_hidden_layers)
             .map(|i| {
-                let is_moe = cfg.moe_layer_freq > 0 && i % cfg.moe_layer_freq == 0;
+                let is_moe = cfg.is_moe_layer(i);
                 DecoderBlock::new(cfg, is_moe, device)
             })
             .collect();
@@ -198,5 +198,13 @@ mod tests {
             cached.extend(values(model.forward_cached(ids(&[tok]), &mut caches, pos)));
         }
         assert_close(&full, &cached);
+    }
+
+    #[test]
+    fn param_count_matches_model() {
+        for cfg in [test_cfg(), QuarkConfig::quark_tiny()] {
+            let model = QuarkModel::<NdArray<f32>>::new(&cfg, &Default::default());
+            assert_eq!(model.num_params() as u64, cfg.param_count());
+        }
     }
 }

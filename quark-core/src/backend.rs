@@ -32,3 +32,12 @@ pub type InferBackend = burn_wgpu::Wgpu;
 
 #[cfg(not(any(feature = "backend-cuda", feature = "backend-wgpu")))]
 pub type InferBackend = burn_ndarray::NdArray<f32>;
+
+// ── Compute backends (what autodiff wraps) ───────────────────────────────────
+
+/// f32 compute backend underlying [`TrainBackend`].
+pub type ComputeBackend = <TrainBackend as burn::tensor::backend::AutodiffBackend>::InnerBackend;
+
+/// bf16 compute backend, used for `Precision::Bf16` training (CUDA only).
+#[cfg(feature = "backend-cuda")]
+pub type ComputeBackendBf16 = burn_cuda::Cuda<half::bf16>;

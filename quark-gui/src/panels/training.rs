@@ -11,7 +11,9 @@ use quark_core::memory::budget::HardwareBudget;
 use quark_core::memory::tier::TierConfig;
 use quark_core::model::config::QuarkConfig;
 use quark_core::training::metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics};
-use quark_core::training::trainer::{start_training, TrainerConfig, TrainingHandle};
+use quark_core::training::trainer::{
+    estimate_memory, start_training, Precision, TrainerConfig, TrainingHandle,
+};
 
 use super::config::ConfigPanel;
 use super::dataset::DatasetPanel;
@@ -122,6 +124,29 @@ impl TrainingPanel {
                 ui.heading("🏋 Training");
                 ui.separator();
 
+                // Memory estimate for the current model + batch settings
+                let estimate =
+                    estimate_memory(config_panel.config(), &self.trainer_config, &self.budget);
+                let color = if estimate.fits() {
+                    egui::Color32::from_rgb(120, 200, 120)
+                } else {
+                    egui::Color32::from_rgb(255, 110, 90)
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "≈{} needed to train · {} {} free{}",
+                        super::config::fmt_bytes(estimate.needed_bytes),
+                        super::config::fmt_bytes(estimate.available_bytes),
+                        estimate.device,
+                        if estimate.fits() {
+                            ""
+                        } else {
+                            " — likely too big: pick a smaller preset, batch size or context"
+                        },
+                    ))
+                    .color(color),
+                );
+
                 // Control buttons
                 ui.horizontal(|ui| {
                     if self.is_running {
@@ -214,36 +239,16 @@ impl TrainingPanel {
                         });
                 }
 
-                // Memory tier bars
+                // Process memory (spilling to disk is not implemented, so
+                // everything must fit in RAM/VRAM)
                 if let Some(m) = &self.latest {
                     ui.separator();
-                    ui.label(egui::RichText::new("Memory Tiers").strong());
-                    let vram_lim =
-                        TierConfig::default().vram_limit_bytes(&self.budget).max(1);
-                    let ram_lim =
-                        TierConfig::default().ram_limit_bytes(&self.budget).max(1);
-
-                    let vram_used = m.vram_used_bytes;
+                    ui.label(egui::RichText::new("Memory").strong());
+                    let ram_total = self.budget.ram_total_bytes.max(1);
                     let ram_used = m.ram_used_bytes;
-                    let disk_used = m.disk_used_bytes;
-
                     ui.horizontal(|ui| {
-                        ui.label("🟦 VRAM");
-                        let frac = (vram_used as f64 / vram_lim as f64).min(1.0) as f32;
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(180.0)
-                                .fill(tier_color(frac))
-                                .text(format!(
-                                    "{} / {}",
-                                    fmt_bytes(vram_used),
-                                    fmt_bytes(vram_lim)
-                                )),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("🟩 RAM  ");
-                        let frac = (ram_used as f64 / ram_lim as f64).min(1.0) as f32;
+                        ui.label("🟩 RAM ");
+                        let frac = (ram_used as f64 / ram_total as f64).min(1.0) as f32;
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .desired_width(180.0)
@@ -251,14 +256,28 @@ impl TrainingPanel {
                                 .text(format!(
                                     "{} / {}",
                                     fmt_bytes(ram_used),
-                                    fmt_bytes(ram_lim)
+                                    fmt_bytes(ram_total)
                                 )),
                         );
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("💾 Disk ");
-                        ui.label(format!("{} used", fmt_bytes(disk_used)));
-                    });
+                    if m.vram_used_bytes > 0 && self.budget.vram_total_bytes > 0 {
+                        let vram_total = self.budget.vram_total_bytes;
+                        ui.horizontal(|ui| {
+                            ui.label("🟦 VRAM");
+                            let frac =
+                                (m.vram_used_bytes as f64 / vram_total as f64).min(1.0) as f32;
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .desired_width(180.0)
+                                    .fill(tier_color(frac))
+                                    .text(format!(
+                                        "{} / {}",
+                                        fmt_bytes(m.vram_used_bytes),
+                                        fmt_bytes(vram_total)
+                                    )),
+                            );
+                        });
+                    }
                 }
 
                 // Loss chart
@@ -446,11 +465,25 @@ impl TrainingPanel {
                                 );
                                 ui.end_row();
 
-                                ui.label("Mixed precision");
-                                ui.checkbox(
-                                    &mut self.trainer_config.mixed_precision,
-                                    "bf16/f16",
-                                );
+                                ui.label("Precision");
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.trainer_config.precision,
+                                        Precision::F32,
+                                        "f32",
+                                    );
+                                    ui.add_enabled_ui(Precision::Bf16.is_supported(), |ui| {
+                                        ui.radio_value(
+                                            &mut self.trainer_config.precision,
+                                            Precision::Bf16,
+                                            "bf16",
+                                        )
+                                        .on_disabled_hover_text(
+                                            "bf16 training needs a CUDA build \
+                                             (--features backend-cuda)",
+                                        );
+                                    });
+                                });
                                 ui.end_row();
 
                                 ui.label("Max grad norm");

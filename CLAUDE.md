@@ -129,6 +129,8 @@ Subdirectories: `checkpoints/`, `datasets/`, `the-pile/`, `settings.toml`.
 
 - `DecoderBlock` holds either a dense FFN or a `MoeBlock` (as `Option`s), never both. MoE uses sparse top-k dispatch and returns a Switch-style load-balancing loss via `forward_with_aux`.
 - Training (`training/trainer.rs`) supports grad accumulation, global-norm clipping (`training/grad_clip.rs`), held-out eval (`TrainingEvent::Eval`), and resume from the latest `checkpoint-N.bin`. It writes `config.json` and `tokenizer.json` next to the checkpoints; `QuarkConfig::for_checkpoint` reads the config back.
+- `start_training` runs `dispatch_training`, which picks the autodiff backend for `TrainerConfig::precision` (`Bf16` only in CUDA builds) and runs the generic `run_training_loop::<AB>`. Panics in the training thread become `TrainingEvent::Error("Training crashed: …")`. Burn 0.16's `BalancedCheckpointing` panics on softmax backward passes, so gradient checkpointing is not offered.
+- `QuarkConfig::param_count()` is exact (a test checks it against `num_params()`). `training_memory_bytes` and `trainer::estimate_memory` give the rough memory estimate that the GUI and trainer show.
 - Checkpoints use `checkpoint::CheckpointRecorder` (Burn `BinFileRecorder`, full precision, `.bin`). Optimizer state is not saved, so it restarts fresh on resume.
 - Generation (`inference/generate.rs`) uses per-layer KV caches (`QuarkModel::forward_cached`). When the context window fills, it re-prefills the most recent half window.
 - `quark-core/tests/train_e2e.rs` trains a tiny model end-to-end (train → eval → checkpoint → load → stream → resume). Run it after touching the model, trainer or inference code.

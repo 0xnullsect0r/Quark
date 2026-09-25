@@ -129,3 +129,22 @@ fn train_load_generate_and_resume() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn crash_is_reported_not_hung() {
+    let dir = std::env::temp_dir().join(format!("quark-e2e-crash-{}", std::process::id()));
+    let (corpus, tokenizer) = setup(&dir);
+    // 4 query heads cannot be grouped over 3 KV heads: the forward pass panics.
+    let bad = QuarkConfig { num_key_value_heads: 3, ..tiny_config() };
+    let (_handle, rx) =
+        start_training(bad, trainer_config(&dir.join("ckpt"), 5), vec![corpus], Some(tokenizer));
+    let error = loop {
+        match rx.recv_timeout(Duration::from_secs(120)).expect("no event: training hung") {
+            TrainingEvent::Error(e) => break e,
+            TrainingEvent::Done => panic!("expected a crash"),
+            _ => {}
+        }
+    };
+    assert!(error.starts_with("Training crashed"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

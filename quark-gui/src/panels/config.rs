@@ -10,8 +10,8 @@ pub struct ConfigPanel {
 impl Default for ConfigPanel {
     fn default() -> Self {
         Self {
-            config: QuarkConfig::quark_1b(),
-            preset: ModelPreset::Quark1B,
+            config: QuarkConfig::quark_tiny(),
+            preset: ModelPreset::QuarkTiny,
         }
     }
 }
@@ -19,28 +19,6 @@ impl Default for ConfigPanel {
 impl ConfigPanel {
     pub fn config(&self) -> &QuarkConfig {
         &self.config
-    }
-
-    fn estimated_params(&self) -> u64 {
-        let c = &self.config;
-        let head_dim = c.hidden_size / c.num_attention_heads.max(1);
-        let attn = c.hidden_size
-            * (c.num_attention_heads + c.num_key_value_heads * 2)
-            * head_dim
-            + c.hidden_size * c.hidden_size;
-        let ffn_dense = c.hidden_size * c.intermediate_size * 3;
-        let ffn_moe = ffn_dense * c.num_experts;
-        let moe_layers = c.num_hidden_layers / c.moe_layer_freq.max(1);
-        let dense_layers = c.num_hidden_layers.saturating_sub(moe_layers);
-        let layer = attn
-            + if moe_layers > 0 {
-                (dense_layers * ffn_dense + moe_layers * ffn_moe)
-                    / c.num_hidden_layers.max(1)
-            } else {
-                ffn_dense
-            };
-        let embed = c.vocab_size * c.hidden_size;
-        (embed + c.num_hidden_layers * layer) as u64
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -52,48 +30,28 @@ impl ConfigPanel {
             ui.label("Preset:");
             let old_preset = self.preset;
             egui::ComboBox::from_id_salt("preset_combo")
-                .selected_text(match self.preset {
-                    ModelPreset::Quark1B   => "Quark 1B",
-                    ModelPreset::Quark3B   => "Quark 3B",
-                    ModelPreset::Quark7B   => "Quark 7B",
-                    ModelPreset::Quark20B  => "Quark 20B",
-                    ModelPreset::Quark30B  => "Quark 30B",
-                    ModelPreset::Quark48B  => "Quark 48B",
-                    ModelPreset::Quark74B  => "Quark 74B",
-                    ModelPreset::Quark120B => "Quark 120B",
-                    ModelPreset::Quark249B => "Quark 249B",
-                    ModelPreset::Quark300B => "Quark 300B",
-                    ModelPreset::Quark400B => "Quark 400B",
-                    ModelPreset::Custom    => "Custom",
-                })
+                .selected_text(preset_name(self.preset))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark1B,   "Quark 1B   (~1B params   — 8–16 GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark3B,   "Quark 3B   (~3B params   — 16–32 GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark7B,   "Quark 7B   (~7B params   — 32–48 GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark20B,  "Quark 20B  (~20B params  — 80+ GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark30B,  "Quark 30B  (~30B params  — 120+ GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark48B,  "Quark 48B  (~48B params  — 192+ GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark74B,  "Quark 74B  (~74B params  — 300+ GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark120B, "Quark 120B (~120B params — 480+ GB RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark249B, "Quark 249B (~249B params — 1 TB+ RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark300B, "Quark 300B (~300B params — 1.2 TB+ RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Quark400B, "Quark 400B (~400B params — 1.6 TB+ RAM)");
-                    ui.selectable_value(&mut self.preset, ModelPreset::Custom,    "Custom");
+                    for preset in PRESETS {
+                        let label = match QuarkConfig::from_preset(preset) {
+                            Some(cfg) => format!(
+                                "{:<11} {} params · ≈{} to train (batch 1, f32)",
+                                preset_name(preset),
+                                fmt_count(cfg.param_count()),
+                                fmt_bytes(cfg.training_memory_bytes(
+                                    1,
+                                    cfg.max_position_embeddings,
+                                    4
+                                )),
+                            ),
+                            None => preset_name(preset).to_owned(),
+                        };
+                        ui.selectable_value(&mut self.preset, preset, label);
+                    }
                 });
             if self.preset != old_preset {
-                match self.preset {
-                    ModelPreset::Quark1B   => self.config = QuarkConfig::quark_1b(),
-                    ModelPreset::Quark3B   => self.config = QuarkConfig::quark_3b(),
-                    ModelPreset::Quark7B   => self.config = QuarkConfig::quark_7b(),
-                    ModelPreset::Quark20B  => self.config = QuarkConfig::quark_20b(),
-                    ModelPreset::Quark30B  => self.config = QuarkConfig::quark_30b(),
-                    ModelPreset::Quark48B  => self.config = QuarkConfig::quark_48b(),
-                    ModelPreset::Quark74B  => self.config = QuarkConfig::quark_74b(),
-                    ModelPreset::Quark120B => self.config = QuarkConfig::quark_120b(),
-                    ModelPreset::Quark249B => self.config = QuarkConfig::quark_249b(),
-                    ModelPreset::Quark300B => self.config = QuarkConfig::quark_300b(),
-                    ModelPreset::Quark400B => self.config = QuarkConfig::quark_400b(),
-                    ModelPreset::Custom    => {}
+                if let Some(cfg) = QuarkConfig::from_preset(self.preset) {
+                    self.config = cfg;
                 }
             }
         });
@@ -101,16 +59,18 @@ impl ConfigPanel {
         ui.add_space(4.0);
 
         // Parameter count banner
-        let params = self.estimated_params();
-        let param_str = if params >= 1_000_000_000 {
-            format!("~{:.2}B parameters", params as f64 / 1e9)
-        } else {
-            format!("~{:.0}M parameters", params as f64 / 1e6)
-        };
+        let params = self.config.param_count();
         ui.label(
-            egui::RichText::new(param_str)
+            egui::RichText::new(format!("{} parameters", fmt_count(params)))
                 .strong()
                 .color(egui::Color32::from_rgb(120, 200, 255)),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Training memory depends on batch size too — see the estimate in the Training tab.",
+            )
+            .small()
+            .weak(),
         );
 
         ui.separator();
@@ -316,5 +276,57 @@ impl ConfigPanel {
                 }
             }
         });
+    }
+}
+
+const PRESETS: [ModelPreset; 14] = [
+    ModelPreset::QuarkTiny,
+    ModelPreset::QuarkSmall,
+    ModelPreset::Quark1B,
+    ModelPreset::Quark3B,
+    ModelPreset::Quark7B,
+    ModelPreset::Quark20B,
+    ModelPreset::Quark30B,
+    ModelPreset::Quark48B,
+    ModelPreset::Quark74B,
+    ModelPreset::Quark120B,
+    ModelPreset::Quark249B,
+    ModelPreset::Quark300B,
+    ModelPreset::Quark400B,
+    ModelPreset::Custom,
+];
+
+fn preset_name(preset: ModelPreset) -> &'static str {
+    match preset {
+        ModelPreset::QuarkTiny => "Quark Tiny",
+        ModelPreset::QuarkSmall => "Quark Small",
+        ModelPreset::Quark1B => "Quark 1B",
+        ModelPreset::Quark3B => "Quark 3B",
+        ModelPreset::Quark7B => "Quark 7B",
+        ModelPreset::Quark20B => "Quark 20B",
+        ModelPreset::Quark30B => "Quark 30B",
+        ModelPreset::Quark48B => "Quark 48B",
+        ModelPreset::Quark74B => "Quark 74B",
+        ModelPreset::Quark120B => "Quark 120B",
+        ModelPreset::Quark249B => "Quark 249B",
+        ModelPreset::Quark300B => "Quark 300B",
+        ModelPreset::Quark400B => "Quark 400B",
+        ModelPreset::Custom => "Custom",
+    }
+}
+
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1e9)
+    } else {
+        format!("{:.0}M", n as f64 / 1e6)
+    }
+}
+
+pub fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000_000 {
+        format!("{:.1} TB", bytes as f64 / 1e12)
+    } else {
+        format!("{:.1} GB", bytes as f64 / 1e9)
     }
 }

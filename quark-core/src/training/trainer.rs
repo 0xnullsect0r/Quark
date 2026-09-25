@@ -20,7 +20,7 @@ use crate::checkpoint::CheckpointRecorder;
 use crate::data::batch::{DataBatch, collate_batch};
 use crate::data::loader::TextLoader;
 use crate::data::packing::pack_sequences;
-use crate::memory::tier::TierConfig;
+use crate::memory::{budget::HardwareBudget, tier::TierConfig};
 use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
 use crate::tokenizer::bpe::{PAD_ID, QuarkTokenizer};
@@ -53,8 +53,9 @@ pub struct TrainerConfig {
     pub save_every_steps: u64,
     /// Run evaluation every N steps.
     pub eval_every_steps: u64,
-    /// Whether to use mixed-precision (fp16/bf16) training.
-    pub mixed_precision: bool,
+    /// Numeric precision for training compute.
+    #[serde(default)]
+    pub precision: Precision,
     /// Maximum global gradient norm before clipping.
     pub max_grad_norm: f32,
     /// Random seed for reproducibility.
@@ -75,6 +76,33 @@ fn default_true() -> bool {
     true
 }
 
+/// Numeric precision for training compute. Checkpoints are always saved in
+/// f32, so inference is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Precision {
+    #[default]
+    F32,
+    /// bfloat16 compute: half the memory. Only available in CUDA builds.
+    Bf16,
+}
+
+impl Precision {
+    pub fn bytes_per_elem(self) -> u64 {
+        match self {
+            Precision::F32 => 4,
+            Precision::Bf16 => 2,
+        }
+    }
+
+    /// Whether this build can train at this precision.
+    pub fn is_supported(self) -> bool {
+        match self {
+            Precision::F32 => true,
+            Precision::Bf16 => cfg!(feature = "backend-cuda"),
+        }
+    }
+}
+
 impl Default for TrainerConfig {
     fn default() -> Self {
         Self {
@@ -84,7 +112,7 @@ impl Default for TrainerConfig {
             grad_accum_steps: 8,
             save_every_steps: 500,
             eval_every_steps: 100,
-            mixed_precision: true,
+            precision: Precision::F32,
             max_grad_norm: 1.0,
             seed: 42,
             adamw: AdamWConfig::default(),
@@ -132,17 +160,65 @@ pub fn start_training(
     let tx_clone = tx.clone();
 
     std::thread::spawn(move || {
-        run_training_loop(model_config, trainer_config, corpus_files, tokenizer_path, tx_clone, stop_clone);
+        let panic_tx = tx_clone.clone();
+        let run = std::panic::AssertUnwindSafe(move || {
+            dispatch_training(model_config, trainer_config, corpus_files, tokenizer_path, tx_clone, stop_clone)
+        });
+        // Report crashes (e.g. out of memory, no GPU adapter) instead of
+        // leaving the UI waiting forever.
+        if let Err(panic) = std::panic::catch_unwind(run) {
+            let msg = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            let _ = panic_tx.send(TrainingEvent::Error(format!("Training crashed: {msg}")));
+        }
     });
 
     (TrainingHandle { sender: tx, stop_flag }, rx)
+}
+
+/// Pick the concrete autodiff backend for the requested precision, then run
+/// the loop on it.
+///
+/// Gradient checkpointing (`burn_autodiff::checkpoint`) is not offered: in
+/// Burn 0.16 `BalancedCheckpointing` panics on the backward pass of any
+/// softmax (`(x - max(x)).exp()`).
+fn dispatch_training(
+    model_config: QuarkConfig,
+    mut config: TrainerConfig,
+    corpus_files: Vec<PathBuf>,
+    tokenizer_path: Option<PathBuf>,
+    tx: MetricsSender,
+    stop: Arc<AtomicBool>,
+) {
+    if !config.precision.is_supported() {
+        let _ = tx.send(TrainingEvent::Log(format!(
+            "⚠  {:?} training needs a CUDA build — using F32",
+            config.precision
+        )));
+        config.precision = Precision::F32;
+    }
+
+    macro_rules! run {
+        ($backend:ty) => {
+            run_training_loop::<$backend>(model_config, config, corpus_files, tokenizer_path, tx, stop)
+        };
+    }
+
+    match config.precision {
+        #[cfg(feature = "backend-cuda")]
+        Precision::Bf16 => run!(burn_autodiff::Autodiff<crate::backend::ComputeBackendBf16>),
+        _ => run!(crate::backend::TrainBackend),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Training loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn run_training_loop(
+fn run_training_loop<AB: AutodiffBackend>(
     mut model_config: QuarkConfig,
     config: TrainerConfig,
     corpus_files: Vec<PathBuf>,
@@ -289,13 +365,26 @@ fn run_training_loop(
     // ── Initialise model ──────────────────────────────────────────────────────
     phase!("Initialising model…");
 
-    use crate::backend::TrainBackend;
-    type AB = TrainBackend;
-
     let device = <AB as Backend>::Device::default();
     <AB as Backend>::seed(config.seed);
     let mut model = QuarkModel::<AB>::new(&model_config, &device);
     log!("   Model initialised on {:?}", device);
+
+    let estimate = estimate_memory(&model_config, &config, &HardwareBudget::detect());
+    log!(
+        "   {:.1}M params, ≈{} needed for training ({} {} available)",
+        model_config.param_count() as f64 / 1e6,
+        fmt_gb(estimate.needed_bytes),
+        fmt_gb(estimate.available_bytes),
+        estimate.device
+    );
+    if !estimate.fits() {
+        log!(
+            "⚠  This probably won't fit in {} — if training crashes or swaps, use a smaller \
+             preset, batch size or context length",
+            estimate.device
+        );
+    }
 
     let mut step = 0u64;
     if let Some((path, saved_step)) = resume_from {
@@ -332,6 +421,9 @@ fn run_training_loop(
     let mut batch_idx = (step as usize * accum_steps) % total_batches.max(1);
     let mut epoch = (step as usize * accum_steps / total_batches.max(1)) as u32;
     let mut tokens_seen = 0u64;
+    let mut ram_used_bytes = 0u64;
+    let mut vram_used_bytes = 0u64;
+    let mut sys = sysinfo::System::new();
     let ce_loss = CrossEntropyLossConfig::new()
         .with_pad_tokens(Some(vec![PAD_ID as usize]))
         .init(&device);
@@ -390,14 +482,20 @@ fn run_training_loop(
         let eta_secs =
             (elapsed / steps_this_run as f32 * (config.max_steps - step) as f32) as u64;
 
+        if steps_this_run == 1 || step.is_multiple_of(10) {
+            ram_used_bytes = process_rss(&mut sys).unwrap_or(ram_used_bytes);
+            let (vram_total, vram_free) = crate::memory::budget::detect_vram();
+            vram_used_bytes = vram_total.saturating_sub(vram_free);
+        }
+
         let _ = tx.send(TrainingEvent::Metrics(TrainingMetrics {
             step,
             loss: step_loss,
             learning_rate: lr as f32,
             tokens_per_sec,
             grad_norm,
-            vram_used_bytes: 0,
-            ram_used_bytes: 0,
+            vram_used_bytes,
+            ram_used_bytes,
             disk_used_bytes: 0,
             epoch,
             eta_secs,
@@ -442,6 +540,59 @@ fn run_training_loop(
 
     save_burn_checkpoint(&model, &config.output_dir, step, &tx);
     let _ = tx.send(TrainingEvent::Done);
+}
+
+// ── Memory helpers ────────────────────────────────────────────────────────────
+
+/// Estimated training memory against what the training device has free.
+#[derive(Debug, Clone)]
+pub struct MemoryEstimate {
+    pub needed_bytes: u64,
+    pub available_bytes: u64,
+    /// "VRAM" or "RAM".
+    pub device: &'static str,
+}
+
+impl MemoryEstimate {
+    pub fn fits(&self) -> bool {
+        self.available_bytes == 0 || self.needed_bytes <= self.available_bytes
+    }
+}
+
+/// Rough memory needed to train `model` with `config`, compared with free
+/// VRAM (GPU builds, when detectable) or free RAM.
+pub fn estimate_memory(
+    model: &QuarkConfig,
+    config: &TrainerConfig,
+    budget: &HardwareBudget,
+) -> MemoryEstimate {
+    let precision = if config.precision.is_supported() { config.precision } else { Precision::F32 };
+    let needed_bytes = model.training_memory_bytes(
+        config.batch_size,
+        model.max_position_embeddings,
+        precision.bytes_per_elem(),
+    );
+    let gpu_build = cfg!(any(feature = "backend-cuda", feature = "backend-wgpu"));
+    if gpu_build && budget.vram_total_bytes > 0 {
+        MemoryEstimate { needed_bytes, available_bytes: budget.vram_free_bytes, device: "VRAM" }
+    } else {
+        MemoryEstimate { needed_bytes, available_bytes: budget.ram_free_bytes, device: "RAM" }
+    }
+}
+
+fn fmt_gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+/// Resident memory of this process.
+fn process_rss(sys: &mut sysinfo::System) -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        false,
+        sysinfo::ProcessRefreshKind::new().with_memory(),
+    );
+    sys.process(pid).map(|p| p.memory())
 }
 
 // ── Batch helpers ─────────────────────────────────────────────────────────────
@@ -527,8 +678,8 @@ fn find_resumable_checkpoint(dir: &Path, model_config: &QuarkConfig) -> Option<(
         .max_by_key(|(_, step)| *step)
 }
 
-fn save_burn_checkpoint(
-    model: &QuarkModel<crate::backend::TrainBackend>,
+fn save_burn_checkpoint<B: Backend>(
+    model: &QuarkModel<B>,
     output_dir: &std::path::Path,
     step: u64,
     tx: &MetricsSender,

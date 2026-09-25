@@ -115,30 +115,26 @@ Each transformer block alternates between **dense SwiGLU** layers and **sparse M
 
 ## Model Presets
 
-All presets use the same GQA + MoE architecture. Hardware estimates assume `bfloat16` weights, `batch=1` inference.
+All presets use the same GQA + MoE architecture. The GUI's preset picker shows the exact parameter count and a training-memory estimate for each. The **Training** tab compares that estimate for your batch size with your free RAM or VRAM.
 
-| Preset | Params | Layers | Hidden | Heads | KV heads | MoE layers | Experts | Top-K | Min VRAM | Min RAM |
-|--------|-------:|-------:|-------:|------:|---------:|-----------:|--------:|------:|---------:|--------:|
-| **Quark-1B**   |   1 B |  16 |  2048 | 16 |  4 |  4 |  8 | 2 |  2 GB |  4 GB |
-| **Quark-3B**   |   3 B |  28 |  3072 | 24 |  8 |  6 |  8 | 2 |  6 GB |  8 GB |
-| **Quark-7B**   |   7 B |  32 |  4096 | 32 |  8 |  8 |  8 | 2 |  14 GB | 16 GB |
-| **Quark-20B**  |  20 B |  40 |  5120 | 40 | 10 | 10 | 16 | 4 |  40 GB | 48 GB |
-| **Quark-30B**  |  30 B |  48 |  6144 | 48 | 12 | 12 | 16 | 4 |  60 GB | 80 GB |
-| **Quark-48B**  |  48 B |  56 |  7168 | 56 | 14 | 14 | 32 | 4 |  96 GB | 128 GB |
-| **Quark-74B**  |  74 B |  64 |  8192 | 64 | 16 | 16 | 32 | 4 | 148 GB | 192 GB |
-| **Quark-120B** | 120 B |  80 | 10240 | 80 | 20 | 20 | 64 | 8 | 240 GB | 320 GB |
-| **Quark-249B** | 249 B |  96 | 12288 | 96 | 24 | 24 | 64 | 8 | 498 GB | 640 GB |
-| **Quark-300B** | 300 B | 104 | 14336 | 112| 28 | 28 | 64 | 8 | 600 GB | 768 GB |
-| **Quark-400B** | 400 B | 120 | 16384 | 128| 32 | 32 | 128| 8 | 800 GB |   1 TB |
-| **Custom**     |  —    |   — |    — |  — |   — |   — |   — | — | — | — |
+**Start with Tiny or Small.** "Train" below is the rough peak memory to train at batch size 1 in f32: weights, gradients, AdamW state and activations at the preset's full context length.
 
-> **Tip:** For consumer hardware (≤ 24 GB VRAM) start with **Quark-1B** or **Quark-3B**. Enable memory tiering in Settings to spill layers to RAM/disk and train models that exceed your VRAM.
+| Preset | Params | Layers | Hidden | Context | Experts (top-k) | Train (batch 1, f32) |
+|--------|-------:|-------:|-------:|--------:|----------------:|---------------------:|
+| **Quark Tiny**  |  12 M |  6 |  256 |  512 | 4 (2) | ≈ 0.4 GB |
+| **Quark Small** | 224 M | 12 |  768 | 1024 | 8 (2) | ≈ 8 GB |
+| **Quark 1B**    | 1.8 B | 16 | 2048 | 4096 | 8 (2) | ≈ 100 GB |
+| Quark 3B … 400B | see picker | | | | | far beyond a single machine |
+
+Tiny trains on a laptop CPU. Small wants a GPU with at least 8 GB. The larger presets are defined for completeness, but Quark has no memory offloading yet (see below), so they only train on hardware with enough VRAM for the whole model. Their names are nominal: MoE experts make the real parameter counts higher, and the picker shows the exact numbers.
+
+On CUDA builds, **bf16** precision (Training tab) halves memory. Checkpoints are always saved in f32.
 
 ---
 
 ## Backends
 
-Quark selects the fastest backend available at runtime. Multiple backends can be compiled in simultaneously.
+The backend is chosen at build time: CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is enabled, otherwise the CPU.
 
 | Backend | Hardware | Feature flag | Notes |
 |---------|----------|--------------|-------|
@@ -152,21 +148,7 @@ Pre-built releases ship the `backend-cpu` binary. Build from source with `backen
 
 ## Memory Tiering
 
-Quark implements a three-tier memory system that lets you train models larger than your VRAM — or even larger than your RAM.
-
-```
-┌──────────┐    ┌──────────┐    ┌──────────────────────┐
-│  VRAM    │ ←→ │  RAM     │ ←→ │  Disk (mmap)         │
-│ active   │    │ inactive │    │ optimizer state /    │
-│ layers   │    │ weights  │    │ weight shards        │
-└──────────┘    └──────────┘    └──────────────────────┘
-```
-
-- **Layer streaming** — the next layer is prefetched to VRAM while the current one executes.
-- **Gradient checkpointing** — activations are recomputed during backprop instead of stored.
-- **Offloaded optimizer** — Adam m/v buffers (2× model size) live in RAM; only the current shard is on the GPU during the update step.
-- **JIT quantization** — weights are stored as NF4 (4-bit) or INT8 on disk/RAM, dequantized to bf16 per-layer just before the forward pass.
-- **Memory-mapped shards** — `.safetensors` weight files are `mmap`'d so the OS pages them in/out transparently.
+> **Status: planned, not implemented.** The model, gradients and optimizer state must currently fit in RAM (CPU builds) or VRAM (GPU builds). The `memory/` module holds the budget detection used for the Training tab's estimate. Layer streaming, optimizer offload, quantized storage and gradient checkpointing are not wired into training yet. Burn 0.16's built-in checkpointing panics on softmax backward passes, so enabling it is blocked on a Burn upgrade.
 
 ---
 
@@ -176,7 +158,7 @@ Quark implements a three-tier memory system that lets you train models larger th
 |-------|-------------|
 | **Config** | Select a model preset or fully customize every architecture parameter (layers, hidden size, heads, experts, context length, dtype). |
 | **Dataset** | Add files or folders; preview tokenized samples; set train/validation split; optionally download and build **The Pile** (see below). |
-| **Training** | Start / pause / stop training. Live loss and learning-rate charts. Tokens/sec throughput, ETA to completion, per-tier memory bars (VRAM / RAM / disk). |
+| **Training** | Start / pause / stop training. Live loss and learning-rate charts. Tokens/sec throughput, ETA to completion, gradient norm, eval loss, process RAM (and VRAM on CUDA), and a memory estimate before you start. |
 | **Checkpoints** | Browse all saved checkpoints with timestamps and loss values. Load any checkpoint to resume training or run inference. Export weights as `.safetensors`. |
 | **Chat** | Stream tokens from your trained model. Adjust temperature, top-p, top-k, and max tokens. Edit the system prompt. |
 | **Settings** | Configure resource limits, hardware backend, disk offload path, theme, and log level. |
