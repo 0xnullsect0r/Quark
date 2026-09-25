@@ -10,6 +10,9 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub max_new_tokens: usize,
     pub stop_tokens: Vec<u32>,
+    /// Stop when the decoded response contains any of these; the response is
+    /// cut before the match. See `chat::STOP_STRINGS`.
+    pub stop_strings: Vec<String>,
 }
 
 impl Default for SamplingParams {
@@ -20,6 +23,7 @@ impl Default for SamplingParams {
             top_p: 0.9,
             max_new_tokens: 256,
             stop_tokens: vec![],
+            stop_strings: vec![],
         }
     }
 }

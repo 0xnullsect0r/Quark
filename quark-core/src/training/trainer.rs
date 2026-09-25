@@ -20,6 +20,7 @@ use crate::checkpoint::CheckpointRecorder;
 use crate::data::batch::{DataBatch, collate_batch};
 use crate::data::loader::TextLoader;
 use crate::data::packing::pack_sequences;
+use crate::data::sft::{collate_sft, load_conversations, tokenize_conversation};
 use crate::memory::{budget::HardwareBudget, tier::TierConfig};
 use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
@@ -70,7 +71,25 @@ pub struct TrainerConfig {
     /// saved `config.json` matches the current model config.
     #[serde(default = "default_true")]
     pub resume: bool,
+    /// Pretraining on raw text, or chat fine-tuning of an existing checkpoint.
+    #[serde(default)]
+    pub mode: TrainingMode,
 }
+
+/// What kind of training run this is.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TrainingMode {
+    /// Next-token prediction on raw `.txt` / `.jsonl` text.
+    #[default]
+    Pretrain,
+    /// Supervised fine-tuning on chat conversations (`data::sft` JSONL),
+    /// starting from `base_checkpoint`. The architecture and tokenizer come
+    /// from the `config.json` / `tokenizer.json` next to it.
+    FineTune { base_checkpoint: PathBuf },
+}
+
+/// Learning rate suggested for fine-tuning (lower than pretraining).
+pub const FINE_TUNE_LR: f64 = 5e-5;
 
 fn default_true() -> bool {
     true
@@ -119,6 +138,7 @@ impl Default for TrainerConfig {
             schedule: CosineSchedule::default(),
             tier: TierConfig::default(),
             resume: true,
+            mode: TrainingMode::Pretrain,
         }
     }
 }
@@ -220,9 +240,9 @@ fn dispatch_training(
 
 fn run_training_loop<AB: AutodiffBackend>(
     mut model_config: QuarkConfig,
-    config: TrainerConfig,
+    mut config: TrainerConfig,
     corpus_files: Vec<PathBuf>,
-    tokenizer_path: Option<PathBuf>,
+    mut tokenizer_path: Option<PathBuf>,
     tx: MetricsSender,
     stop: Arc<AtomicBool>,
 ) {
@@ -240,6 +260,24 @@ fn run_training_loop<AB: AutodiffBackend>(
     }
 
     tracing::info!("Starting training for {} steps", config.max_steps);
+
+    // Fine-tuning continues the base model: same architecture and tokenizer,
+    // and never writes into the base checkpoint's folder.
+    if let TrainingMode::FineTune { base_checkpoint } = &config.mode {
+        let Some(base_config) = QuarkConfig::for_checkpoint(base_checkpoint) else {
+            bail!(
+                "No config.json next to {} — fine-tuning needs a checkpoint trained by Quark",
+                base_checkpoint.display()
+            );
+        };
+        model_config = base_config;
+        let base_dir = base_checkpoint.parent().map(Path::to_path_buf).unwrap_or_default();
+        tokenizer_path = Some(base_dir.join("tokenizer.json"));
+        if same_dir(&config.output_dir, &base_dir) {
+            config.output_dir = base_dir.join("finetune");
+        }
+        log!("▶  Fine-tuning {}", base_checkpoint.display());
+    }
 
     if let Err(e) = std::fs::create_dir_all(&config.output_dir) {
         bail!("Cannot create output dir: {e}");
@@ -309,43 +347,24 @@ fn run_training_loop<AB: AutodiffBackend>(
         }
     }
 
-    // ── Load and tokenize corpus ──────────────────────────────────────────────
-    let mut batches = if !corpus_files.is_empty() {
-        phase!("Loading corpus…");
-        log!("   Loading {} corpus file(s)…", corpus_files.len());
-
-        let loader = TextLoader::new(corpus_files, model_config.max_position_embeddings);
-        let texts = match loader.load_texts() {
-            Ok(t) => t,
-            Err(e) => bail!("Corpus load failed: {e}"),
-        };
-        log!("   Loaded {} documents", texts.len());
-
-        phase!("Tokenizing…");
-        let mut token_seqs: Vec<Vec<u32>> = Vec::new();
-        for text in &texts {
-            if let Ok(ids) = tokenizer.encode(text) {
-                if !ids.is_empty() {
-                    token_seqs.push(ids);
-                }
+    // ── Load and tokenize training data ───────────────────────────────────────
+    let mut batches = match &config.mode {
+        TrainingMode::FineTune { .. } => {
+            match sft_batches(&corpus_files, &tokenizer, &model_config, &config, &tx) {
+                Ok(b) => b,
+                Err(e) => bail!("{e}"),
             }
         }
-        log!("   Tokenized {} sequences", token_seqs.len());
-
-        let packed = pack_sequences(token_seqs, model_config.max_position_embeddings);
-        log!("   Packed into {} chunks of {} tokens", packed.len(), model_config.max_position_embeddings);
-
-        if packed.is_empty() {
-            bail!("No training tokens after packing. Check your corpus files.");
+        TrainingMode::Pretrain if corpus_files.is_empty() => {
+            log!("⚠  No corpus files provided — running demo loop with random inputs");
+            vec![]
         }
-
-        packed
-            .chunks(config.batch_size.max(1))
-            .map(|chunk| collate_batch(chunk.to_vec(), PAD_ID))
-            .collect::<Vec<_>>()
-    } else {
-        log!("⚠  No corpus files provided — running demo loop with random inputs");
-        vec![]
+        TrainingMode::Pretrain => {
+            match pretrain_batches(corpus_files, &tokenizer, &model_config, &config, &tx) {
+                Ok(b) => b,
+                Err(e) => bail!("{e}"),
+            }
+        }
     };
 
     // Hold out ~1% of batches for evaluation once there is enough data.
@@ -398,6 +417,15 @@ fn run_training_loop<AB: AutodiffBackend>(
                 );
             }
             Err(e) => log!("⚠  Could not resume from {}: {e} — starting fresh", path.display()),
+        }
+    }
+    if let (0, TrainingMode::FineTune { base_checkpoint }) = (step, &config.mode) {
+        match CheckpointRecorder::new().load(base_checkpoint.with_extension(""), &device) {
+            Ok(record) => {
+                model = model.load_record(record);
+                log!("   Loaded base weights from {}", base_checkpoint.display());
+            }
+            Err(e) => bail!("Could not load base checkpoint {}: {e}", base_checkpoint.display()),
         }
     }
     if step >= config.max_steps {
@@ -540,6 +568,111 @@ fn run_training_loop<AB: AutodiffBackend>(
 
     save_burn_checkpoint(&model, &config.output_dir, step, &tx);
     let _ = tx.send(TrainingEvent::Done);
+}
+
+// ── Data helpers ──────────────────────────────────────────────────────────────
+
+/// Raw text → packed next-token-prediction batches.
+fn pretrain_batches(
+    corpus_files: Vec<PathBuf>,
+    tokenizer: &QuarkTokenizer,
+    model_config: &QuarkConfig,
+    config: &TrainerConfig,
+    tx: &MetricsSender,
+) -> Result<Vec<DataBatch>, String> {
+    let log = |msg: String| {
+        let _ = tx.send(TrainingEvent::Log(msg));
+    };
+    let _ = tx.send(TrainingEvent::Phase("Loading corpus…".into()));
+    log(format!("   Loading {} corpus file(s)…", corpus_files.len()));
+
+    let loader = TextLoader::new(corpus_files, model_config.max_position_embeddings);
+    let texts = loader.load_texts().map_err(|e| format!("Corpus load failed: {e}"))?;
+    log(format!("   Loaded {} documents", texts.len()));
+
+    let _ = tx.send(TrainingEvent::Phase("Tokenizing…".into()));
+    let token_seqs: Vec<Vec<u32>> = texts
+        .iter()
+        .filter_map(|text| tokenizer.encode(text).ok())
+        .filter(|ids| !ids.is_empty())
+        .collect();
+    log(format!("   Tokenized {} sequences", token_seqs.len()));
+
+    let packed = pack_sequences(token_seqs, model_config.max_position_embeddings);
+    log(format!(
+        "   Packed into {} chunks of {} tokens",
+        packed.len(),
+        model_config.max_position_embeddings
+    ));
+    if packed.is_empty() {
+        return Err("No training tokens after packing. Check your corpus files.".into());
+    }
+
+    Ok(packed
+        .chunks(config.batch_size.max(1))
+        .map(|chunk| collate_batch(chunk.to_vec(), PAD_ID))
+        .collect())
+}
+
+/// Chat conversations (JSONL) → shuffled fine-tuning batches that train only
+/// on assistant turns.
+fn sft_batches(
+    files: &[PathBuf],
+    tokenizer: &QuarkTokenizer,
+    model_config: &QuarkConfig,
+    config: &TrainerConfig,
+    tx: &MetricsSender,
+) -> Result<Vec<DataBatch>, String> {
+    use rand::{SeedableRng, seq::SliceRandom};
+
+    let log = |msg: String| {
+        let _ = tx.send(TrainingEvent::Log(msg));
+    };
+    if files.is_empty() {
+        return Err("Fine-tuning needs chat .jsonl files ({\"messages\": [...]} per line)".into());
+    }
+    let _ = tx.send(TrainingEvent::Phase("Loading conversations…".into()));
+    let (conversations, skipped) =
+        load_conversations(files).map_err(|e| format!("Conversation load failed: {e}"))?;
+    log(format!("   Loaded {} conversations ({skipped} unparseable lines skipped)", conversations.len()));
+
+    let _ = tx.send(TrainingEvent::Phase("Tokenizing…".into()));
+    let mut examples = Vec::with_capacity(conversations.len());
+    let mut truncated_away = 0;
+    let mut failed = 0;
+    let mut first_error = None;
+    for messages in &conversations {
+        match tokenize_conversation(tokenizer, messages, model_config.max_position_embeddings) {
+            Ok(Some(ex)) => examples.push(ex),
+            Ok(None) => truncated_away += 1,
+            Err(e) => {
+                failed += 1;
+                first_error.get_or_insert(e.to_string());
+            }
+        }
+    }
+    if let Some(e) = first_error {
+        log(format!("⚠  {failed} conversations could not be tokenized and were skipped: {e}"));
+    }
+    if truncated_away > 0 {
+        log(format!(
+            "⚠  {truncated_away} conversations had no assistant turn within {} tokens and were skipped",
+            model_config.max_position_embeddings
+        ));
+    }
+    if examples.is_empty() {
+        return Err("No usable conversations: each needs at least one assistant message".into());
+    }
+
+    examples.shuffle(&mut rand::rngs::StdRng::seed_from_u64(config.seed));
+    Ok(examples.chunks(config.batch_size.max(1)).map(|c| collate_sft(c, PAD_ID)).collect())
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 // ── Memory helpers ────────────────────────────────────────────────────────────

@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use quark_core::{
+    chat::{default_stop_strings, render_prompt, ChatMessage},
+    data::sft::tokenize_conversation,
     inference::{InferenceEngine, SamplingParams},
     model::config::QuarkConfig,
     tokenizer::bpe::QuarkTokenizer,
     training::{
         lr_schedule::CosineSchedule,
         metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics},
-        start_training, TrainerConfig,
+        start_training, TrainerConfig, TrainingMode,
     },
 };
 
@@ -23,7 +25,7 @@ fn tiny_config() -> QuarkConfig {
         num_attention_heads: 4,
         num_key_value_heads: 2,
         intermediate_size: 64,
-        max_position_embeddings: 32,
+        max_position_embeddings: 96,
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
         num_experts: 4,
@@ -126,6 +128,72 @@ fn train_load_generate_and_resume() {
     assert!(resumed.logs.iter().any(|l| l.contains("Resumed")), "{:#?}", resumed.logs);
     assert_eq!(resumed.metrics.first().unwrap().step, 31);
     assert_eq!(resumed.metrics.len(), 5);
+
+    // ── Chat fine-tune ───────────────────────────────────────────────────────
+    let chat = dir.join("chat.jsonl");
+    let lines: String = (0..200)
+        .map(|i| {
+            let conv = serde_json::json!({ "messages": [
+                { "role": "user", "content": format!("ping {i}") },
+                { "role": "assistant", "content": "pong" },
+            ]});
+            format!("{conv}\n")
+        })
+        .collect();
+    std::fs::write(&chat, lines).unwrap();
+
+    // Only the assistant reply (and its closing tag) is trained on.
+    let tok = QuarkTokenizer::load(&out.join("tokenizer.json")).unwrap();
+    let example = tokenize_conversation(
+        &tok,
+        &[ChatMessage::user("ping 1"), ChatMessage::assistant("pong")],
+        512,
+    )
+    .unwrap()
+    .unwrap();
+    let targets: Vec<u32> = example
+        .ids
+        .iter()
+        .zip(&example.trainable)
+        .filter(|(_, t)| **t)
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(tok.decode(&targets).unwrap(), "pong\n</assistant>");
+
+    let base = out.join("checkpoint-35.bin");
+    let ft_cfg = TrainerConfig {
+        mode: TrainingMode::FineTune { base_checkpoint: base.clone() },
+        batch_size: 8,
+        grad_accum_steps: 1,
+        eval_every_steps: 0,
+        ..trainer_config(&out, 150) // same dir as the base: must be redirected
+    };
+    // Model config and tokenizer come from the base checkpoint.
+    let (_handle, rx) = start_training(QuarkConfig::quark_1b(), ft_cfg, vec![chat], None);
+    let tuned = collect(rx);
+    let first = tuned.metrics[0].loss;
+    let last = tuned.metrics.last().unwrap().loss;
+    assert!(last < first * 0.5, "fine-tune loss did not decrease: {first} → {last}");
+
+    let ft_dir = out.join("finetune");
+    let ft_ckpt = ft_dir.join("checkpoint-150.bin");
+    assert!(ft_ckpt.exists(), "fine-tune must write to {}", ft_dir.display());
+    assert_eq!(QuarkConfig::for_checkpoint(&ft_ckpt).unwrap().hidden_size, 32);
+
+    let engine =
+        InferenceEngine::load(&ft_ckpt, &QuarkConfig::for_checkpoint(&ft_ckpt).unwrap(), &ft_dir.join("tokenizer.json"))
+            .unwrap();
+    let prompt = render_prompt(&[ChatMessage::user("ping 7")]);
+    let params = SamplingParams {
+        temperature: 0.0,
+        max_new_tokens: 30,
+        stop_strings: default_stop_strings(),
+        ..SamplingParams::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reply = engine.generate_streaming(&prompt, params, tx).unwrap();
+    assert_eq!(reply.trim(), "pong", "reply: {reply:?}");
+    assert_eq!(rx.try_iter().collect::<String>(), reply, "no stop-string text may leak");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

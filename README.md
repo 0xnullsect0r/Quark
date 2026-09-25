@@ -168,12 +168,36 @@ Pre-built releases ship the `backend-cpu` binary. Build from source with `backen
 
 ## Training Guide
 
-1. **Configure** — open the **Config** panel, pick a preset, and optionally tweak context length or dtype.
+1. **Configure** — open the **Config** panel and pick a preset. Start with **Quark Tiny** to check that everything works, then move to **Small** on a GPU.
 2. **Load data** — open **Dataset**, click **Add Files/Folder** and point Quark at your code corpus. Quark will tokenize and pack sequences automatically.
 3. **Set resource limits** — open **Settings** and drag the VRAM / RAM / CPU sliders to leave headroom for other applications.
 4. **Start training** — open **Training** and click **▶ Start**. Quark runs the training loop on a background thread; the UI stays responsive.
 5. **Monitor** — watch the loss curve converge. The ETA and tokens/sec update in real time. Checkpoints auto-save every N steps (configurable).
-6. **Chat** — once loss converges (or at any checkpoint), open **Chat** and start a conversation.
+6. **Fine-tune for chat and tools** — a pretrained model only continues text. To make it answer questions and use `quark-code`'s tools, fine-tune it on conversations (next section).
+7. **Chat** — load a checkpoint in **Checkpoints**, then open **Chat**.
+
+### Chat & tool-use fine-tuning
+
+In the **Training** tab, choose **Fine-tune on chat data**, pick a base `checkpoint-N.bin`, and add one or more `.jsonl` files with one conversation per line:
+
+```json
+{"messages": [
+  {"role": "system", "content": "You are Quark Code…"},
+  {"role": "user", "content": "Where is parse_config defined?"},
+  {"role": "assistant", "content": "<tool_call>{\"tool\": \"grep_code\", \"pattern\": \"fn parse_config\"}</tool_call>"},
+  {"role": "tool", "content": "grep_code (ok):\nsrc/config.rs:12:pub fn parse_config(…)"},
+  {"role": "assistant", "content": "It's in src/config.rs at line 12."}
+]}
+```
+
+- **Roles:** `system`, `user`, `assistant` and `tool` (a tool's output, written as `name (ok|error):` followed by the output).
+- **What's trained:** only the assistant turns, so the model learns to answer, to emit `<tool_call>` blocks, and to end its turn.
+- **Template:** conversations use the same chat template (`quark-core/src/chat.rs`) that `quark-chat`, `quark-code` and the Chat panel use at inference time.
+- **Where it writes:** the architecture and tokenizer come from the base checkpoint's folder. The output goes to `<base>/finetune/`, so the base checkpoint is never overwritten.
+- **Learning rate:** the default drops to 5e-5 when you switch to fine-tuning.
+- **Sample data:** [`examples/chat-sft-sample.jsonl`](examples/chat-sft-sample.jsonl) has 30 example conversations (Q&A plus multi-step tool use) showing the format. It is far too small to teach a model on its own. Real instruction-following needs thousands to hundreds of thousands of conversations. You can convert public chat datasets (for example OpenAssistant or Dolly) into this format, and add tool-use examples from your own projects.
+
+> **Tokenizer note:** tokenizers now always include all 256 byte values, so any text can be encoded. Tokenizers trained with older Quark versions only knew the characters in their corpus and silently drop anything else, including the `<`/`>` in chat tags. Retrain the tokenizer (and pretrain again) before fine-tuning. Quark reports conversations that can't be encoded.
 
 ### Hyperparameters (Config panel)
 

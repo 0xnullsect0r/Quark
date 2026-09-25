@@ -11,9 +11,10 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use quark_core::chat::{default_stop_strings, render_prompt, ChatMessage};
 use quark_core::inference::sampling::SamplingParams;
 use quark_core::inference::InferenceEngine;
-use quark_core::mcp::{execute_tool, format_tool_result, parse_tool_calls, McpConfig};
+use quark_core::mcp::{execute_tool, parse_tool_calls, McpConfig};
 use quark_core::model::config::QuarkConfig;
 
 fn main() -> Result<()> {
@@ -85,7 +86,10 @@ fn main() -> Result<()> {
         None
     };
 
-    let sampling = SamplingParams::default();
+    let sampling = SamplingParams {
+        stop_strings: default_stop_strings(),
+        ..SamplingParams::default()
+    };
 
     println!("╔══════════════════════════════════════════╗");
     println!("║  {} — Chat                               ", model_name);
@@ -99,7 +103,7 @@ fn main() -> Result<()> {
     println!("─────────────────────────────────────────────────");
     println!();
 
-    let mut history = format!("<system>\n{system_prompt}\n</system>\n\n");
+    let mut history = vec![ChatMessage::system(system_prompt.as_str())];
 
     let stdin = io::stdin();
     loop {
@@ -123,7 +127,7 @@ fn main() -> Result<()> {
             break;
         }
         if input == "/clear" {
-            history = format!("<system>\n{system_prompt}\n</system>\n\n");
+            history.truncate(1);
             println!("[Conversation cleared]");
             continue;
         }
@@ -136,7 +140,8 @@ fn main() -> Result<()> {
             continue;
         }
 
-        history.push_str(&format!("<user>\n{input}\n</user>\n\n<assistant>\n"));
+        history.push(ChatMessage::user(input));
+        let prompt = render_prompt(&history);
 
         let response = match &engine {
             Some(e) => {
@@ -150,7 +155,7 @@ fn main() -> Result<()> {
                             let _ = io::stdout().flush();
                         }
                     });
-                    e.generate_streaming(&history, sampling.clone(), token_tx)
+                    e.generate_streaming(&prompt, sampling.clone(), token_tx)
                 });
                 match result {
                     Ok(text) => {
@@ -171,19 +176,17 @@ fn main() -> Result<()> {
             }
         };
 
-        history.push_str(&format!("{response}\n</assistant>\n\n"));
+        history.push(ChatMessage::assistant(response.as_str()));
 
         let calls = parse_tool_calls(&response);
         for call in &calls {
             println!();
             println!("[MCP] Calling tool: {} {:?}", call.tool, call.args);
             let result = execute_tool(call, &mcp_cfg);
-            let formatted = format_tool_result(&result);
             println!("[MCP] Result ({}):", if result.ok { "ok" } else { "error" });
             let preview: String = result.content.chars().take(500).collect();
             println!("{preview}");
-            history.push_str(&formatted);
-            history.push('\n');
+            history.push(ChatMessage::tool_result(&result));
         }
         println!();
     }

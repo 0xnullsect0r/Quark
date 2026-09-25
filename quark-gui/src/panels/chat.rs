@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use quark_core::chat::{default_stop_strings, render_prompt, ChatMessage};
 use quark_core::inference::sampling::SamplingParams;
 use quark_core::inference::InferenceEngine;
 use quark_core::model::config::QuarkConfig;
@@ -288,25 +289,20 @@ impl ChatPanel {
                     self.response_rx = Some(token_rx);
                     self.is_generating = true;
 
-                    // Build full prompt from conversation history
-                    let mut full_prompt =
-                        format!("<system>\n{system_prompt}\n</system>\n\n");
-                    for msg in &self.messages {
-                        match msg.role {
-                            Role::User => full_prompt.push_str(&format!(
-                                "<user>\n{}\n</user>\n\n<assistant>\n",
-                                msg.content
-                            )),
-                            Role::Assistant => {
-                                if !msg.content.is_empty() {
-                                    full_prompt.push_str(&format!(
-                                        "{}\n</assistant>\n\n",
-                                        msg.content
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                    // Build full prompt from conversation history (skipping the
+                    // empty assistant placeholder being streamed into)
+                    let mut history = vec![ChatMessage::system(system_prompt)];
+                    history.extend(self.messages.iter().filter(|m| !m.content.is_empty()).map(
+                        |msg| match msg.role {
+                            Role::User => ChatMessage::user(msg.content.as_str()),
+                            Role::Assistant => ChatMessage::assistant(msg.content.as_str()),
+                        },
+                    ));
+                    let full_prompt = render_prompt(&history);
+                    let sampling = SamplingParams {
+                        stop_strings: default_stop_strings(),
+                        ..sampling
+                    };
 
                     std::thread::spawn(move || {
                         let _ = engine.generate_streaming(&full_prompt, sampling, token_tx);

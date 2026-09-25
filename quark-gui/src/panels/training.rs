@@ -11,8 +11,10 @@ use quark_core::memory::budget::HardwareBudget;
 use quark_core::memory::tier::TierConfig;
 use quark_core::model::config::QuarkConfig;
 use quark_core::training::metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics};
+use quark_core::training::lr_schedule::CosineSchedule;
 use quark_core::training::trainer::{
-    estimate_memory, start_training, Precision, TrainerConfig, TrainingHandle,
+    estimate_memory, start_training, Precision, TrainerConfig, TrainingHandle, TrainingMode,
+    FINE_TUNE_LR,
 };
 
 use super::config::ConfigPanel;
@@ -32,6 +34,10 @@ pub struct TrainingPanel {
     phase: String,
     log: Vec<String>,
     budget: HardwareBudget,
+    /// Fine-tune an existing checkpoint on chat data instead of pretraining.
+    finetune: bool,
+    base_checkpoint: Option<PathBuf>,
+    chat_files: Vec<PathBuf>,
 }
 
 impl Default for TrainingPanel {
@@ -48,6 +54,9 @@ impl Default for TrainingPanel {
             phase: String::new(),
             log: Vec::new(),
             budget: HardwareBudget::detect(),
+            finetune: false,
+            base_checkpoint: None,
+            chat_files: Vec::new(),
         }
     }
 }
@@ -63,6 +72,87 @@ impl TrainingPanel {
             flag.store(true, Ordering::SeqCst);
         }
         self.is_running = false;
+    }
+
+    /// Pretrain / fine-tune switch and the fine-tune inputs.
+    fn mode_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let before = self.finetune;
+            ui.radio_value(&mut self.finetune, false, "Pretrain on text");
+            ui.radio_value(&mut self.finetune, true, "Fine-tune on chat data");
+            if self.finetune != before {
+                // Fine-tuning wants a much smaller learning rate.
+                self.trainer_config.schedule = if self.finetune {
+                    CosineSchedule {
+                        max_lr: FINE_TUNE_LR,
+                        min_lr: FINE_TUNE_LR / 10.0,
+                        ..CosineSchedule::default()
+                    }
+                } else {
+                    CosineSchedule::default()
+                };
+            }
+        });
+        if !self.finetune {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("📂 Base checkpoint…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("checkpoint", &["bin"])
+                    .set_title("Pick the checkpoint to fine-tune")
+                    .pick_file()
+                {
+                    if let Some(dir) = path.parent() {
+                        self.trainer_config.output_dir = dir.join("finetune");
+                    }
+                    self.base_checkpoint = Some(path);
+                }
+            }
+            match &self.base_checkpoint {
+                Some(p) if QuarkConfig::for_checkpoint(p).is_none() => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 110, 90),
+                        format!("{} — no config.json next to it", p.display()),
+                    );
+                }
+                Some(p) => {
+                    ui.label(p.display().to_string());
+                }
+                None => {
+                    ui.label(egui::RichText::new("none selected").weak());
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("➕ Chat .jsonl files…").clicked() {
+                if let Some(files) = rfd::FileDialog::new()
+                    .add_filter("chat conversations", &["jsonl"])
+                    .pick_files()
+                {
+                    for f in files {
+                        if !self.chat_files.contains(&f) {
+                            self.chat_files.push(f);
+                        }
+                    }
+                }
+            }
+            ui.label(format!("{} file(s)", self.chat_files.len()));
+            if !self.chat_files.is_empty() && ui.small_button("Clear").clicked() {
+                self.chat_files.clear();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "One conversation per line: {\"messages\": [{\"role\": \"user\", \"content\": …}, \
+                 {\"role\": \"assistant\", …}]}. Roles: system, user, assistant, tool. \
+                 Only assistant turns are trained. See examples/chat-sft-sample.jsonl.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.separator();
     }
 
     fn drain_events(&mut self) {
@@ -125,8 +215,15 @@ impl TrainingPanel {
                 ui.separator();
 
                 // Memory estimate for the current model + batch settings
-                let estimate =
-                    estimate_memory(config_panel.config(), &self.trainer_config, &self.budget);
+                self.mode_ui(ui);
+
+                let base_config = self
+                    .base_checkpoint
+                    .as_deref()
+                    .filter(|_| self.finetune)
+                    .and_then(QuarkConfig::for_checkpoint);
+                let model_config = base_config.as_ref().unwrap_or(config_panel.config());
+                let estimate = estimate_memory(model_config, &self.trainer_config, &self.budget);
                 let color = if estimate.fits() {
                     egui::Color32::from_rgb(120, 200, 120)
                 } else {
@@ -163,12 +260,18 @@ impl TrainingPanel {
                             ui.label(&self.phase);
                         }
                     } else {
+                        let ready = !self.finetune
+                            || (self.base_checkpoint.is_some() && !self.chat_files.is_empty());
                         if ui
-                            .button(
-                                egui::RichText::new("▶ Start Training")
-                                    .color(egui::Color32::GREEN)
-                                    .strong(),
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(
+                                    egui::RichText::new("▶ Start Training")
+                                        .color(egui::Color32::GREEN)
+                                        .strong(),
+                                ),
                             )
+                            .on_disabled_hover_text("Choose a base checkpoint and chat files")
                             .clicked()
                         {
                             self.loss_history.clear();
@@ -178,7 +281,17 @@ impl TrainingPanel {
                             self.phase.clear();
                             self.latest = None;
                             let model_config = config_panel.config().clone();
-                            let corpus_files = dataset_panel.corpus_files();
+                            let corpus_files = if self.finetune {
+                                self.chat_files.clone()
+                            } else {
+                                dataset_panel.corpus_files()
+                            };
+                            self.trainer_config.mode = match &self.base_checkpoint {
+                                Some(base) if self.finetune => TrainingMode::FineTune {
+                                    base_checkpoint: base.clone(),
+                                },
+                                _ => TrainingMode::Pretrain,
+                            };
                             let tokenizer_path = dataset_panel.active_tokenizer_path();
                             let (handle, rx) = start_training(
                                 model_config,

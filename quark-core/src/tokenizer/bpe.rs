@@ -15,6 +15,9 @@ pub const PAD_TOKEN: &str = "<pad>";
 pub const UNK_TOKEN: &str = "<unk>";
 
 pub const BOS_ID: u32 = 1;
+
+/// `(start, end)` byte offsets of a token in the encoded text.
+pub type ByteRange = (usize, usize);
 pub const EOS_ID: u32 = 2;
 pub const PAD_ID: u32 = 0;
 pub const UNK_ID: u32 = 3;
@@ -34,6 +37,9 @@ impl QuarkTokenizer {
         let mut trainer = BpeTrainerBuilder::new()
             .vocab_size(vocab_size)
             .min_frequency(2)
+            // Every byte must be encodable, not just the characters that
+            // happen to appear in the corpus (unknown ones are dropped).
+            .initial_alphabet(ByteLevel::alphabet())
             .special_tokens(vec![
                 AddedToken::from(PAD_TOKEN, true),
                 AddedToken::from(BOS_TOKEN, true),
@@ -87,6 +93,45 @@ impl QuarkTokenizer {
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("encode error: {e}"))?;
         Ok(enc.get_ids().to_vec())
+    }
+
+    /// Encode `text`, also returning each token's byte range in `text`.
+    ///
+    /// With byte-level BPE every character of a token's string stands for one
+    /// input byte, so ranges come from the token lengths (the encoding's own
+    /// offsets refer to the byte-mapped string, not `text`). A space the
+    /// pre-tokenizer adds in front of `text` is not counted.
+    pub fn encode_with_offsets(
+        &self,
+        text: &str,
+    ) -> anyhow::Result<(Vec<u32>, Vec<ByteRange>)> {
+        let ids = self.encode(text)?;
+        let lens: Vec<usize> = ids
+            .iter()
+            .map(|&id| self.inner.id_to_token(id).map_or(0, |t| t.chars().count()))
+            .collect();
+        let total: usize = lens.iter().sum();
+        if total < text.len() {
+            anyhow::bail!(
+                "tokenizer cannot encode {} byte(s) of this text — it was trained without \
+                 the full byte alphabet; retrain the tokenizer",
+                text.len() - total
+            );
+        }
+        let added = total - text.len();
+        let mut pos = 0usize;
+        let mut skip = added; // leading bytes that aren't in `text`
+        let offsets = lens
+            .iter()
+            .map(|&len| {
+                let dropped = skip.min(len);
+                skip -= dropped;
+                let start = pos;
+                pos = (pos + len - dropped).min(text.len());
+                (start, pos)
+            })
+            .collect();
+        Ok((ids, offsets))
     }
 
     /// Decode token ids back to a string.

@@ -10,7 +10,8 @@ use burn::record::Recorder;
 use crate::checkpoint::CheckpointRecorder;
 
 use crate::backend::InferBackend;
-use crate::inference::generate::{GenerateConfig, generate, generate_with};
+use crate::chat::{find_stop, partial_stop_len};
+use crate::inference::generate::{GenerateConfig, generate_with};
 use crate::inference::sampling::SamplingParams;
 use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
@@ -63,16 +64,13 @@ impl InferenceEngine {
 
     /// Generate a response for `prompt`, returning the full decoded string.
     pub fn generate(&self, prompt: &str, params: SamplingParams) -> Result<String> {
-        let ids = self.encode_prompt(prompt)?;
-        let prompt_len = ids.len();
-        let output = generate(&self.model, self.generate_config(ids, params), &self.device)?;
-        // Decode only the newly generated tokens (after the prompt)
-        self.tokenizer.decode(&output[prompt_len..])
+        let (tx, _rx) = mpsc::channel();
+        self.generate_streaming(prompt, params, tx)
     }
 
     /// Stream decoded text pieces through `token_tx` as tokens are generated,
-    /// then return the full decoded response. Stops early if the receiver is
-    /// dropped.
+    /// then return the full decoded response. The response ends before the
+    /// first of `params.stop_strings`. Stops early if the receiver is dropped.
     pub fn generate_streaming(
         &self,
         prompt: &str,
@@ -80,40 +78,41 @@ impl InferenceEngine {
         token_tx: mpsc::Sender<String>,
     ) -> Result<String> {
         let ids = self.encode_prompt(prompt)?;
-        let prompt_len = ids.len();
+        let stops = params.stop_strings.clone();
 
         // Decode the whole response so far and emit only the new suffix, so
         // multi-token characters and merged whitespace come out correctly.
         let mut new_ids: Vec<u32> = Vec::new();
-        let mut emitted = String::new();
-        let output = generate_with(
-            &self.model,
-            self.generate_config(ids, params),
-            &self.device,
-            |tok| {
-                new_ids.push(tok);
-                let Ok(text) = self.tokenizer.decode(&new_ids) else {
-                    return true;
-                };
-                // Hold back incomplete UTF-8 sequences until the next token.
-                if text.ends_with('\u{FFFD}') || !text.starts_with(emitted.as_str()) {
-                    return true;
-                }
-                let piece = &text[emitted.len()..];
-                if piece.is_empty() {
-                    return true;
-                }
-                let ok = token_tx.send(piece.to_owned()).is_ok();
-                emitted = text;
-                ok
-            },
-        )?;
-
-        let text = self.tokenizer.decode(&output[prompt_len..])?;
-        if let Some(rest) = text.strip_prefix(emitted.as_str()) {
-            if !rest.is_empty() {
-                let _ = token_tx.send(rest.to_owned());
+        let mut text = String::new();
+        let mut emitted = 0usize; // bytes of `text` already sent
+        let mut stopped = false;
+        generate_with(&self.model, self.generate_config(ids, params), &self.device, |tok| {
+            new_ids.push(tok);
+            let Ok(decoded) = self.tokenizer.decode(&new_ids) else {
+                return true;
+            };
+            // Hold back incomplete UTF-8 sequences until the next token.
+            if decoded.ends_with('\u{FFFD}') {
+                return true;
             }
+            text = decoded;
+            if let Some(at) = find_stop(&text, &stops) {
+                text.truncate(at);
+                stopped = true;
+            }
+            // Don't send what might be the start of a stop string.
+            let hold = if stopped { 0 } else { partial_stop_len(&text, &stops) };
+            let ready = text.len() - hold;
+            let mut keep_going = !stopped;
+            if ready > emitted && text.is_char_boundary(ready) && text.is_char_boundary(emitted) {
+                keep_going &= token_tx.send(text[emitted..ready].to_owned()).is_ok();
+                emitted = ready;
+            }
+            keep_going
+        })?;
+
+        if !stopped && emitted < text.len() && text.is_char_boundary(emitted) {
+            let _ = token_tx.send(text[emitted..].to_owned());
         }
         Ok(text)
     }

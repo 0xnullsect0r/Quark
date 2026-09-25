@@ -4,6 +4,7 @@
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use quark_core::chat::{default_stop_strings, render_prompt, ChatMessage, ChatRole};
 use quark_core::mcp::{parse_tool_calls, McpConfig, ToolCall, ToolResult};
 
 use crate::app::{App, FileChange, Message, Mode};
@@ -33,14 +34,14 @@ pub enum AgentEvent {
 pub fn start_turn(app: &App) -> StreamHandle {
     let mcp_cfg       = app.mcp_cfg.clone();
     let system_prompt = build_system_prompt(app);
-    let prompt        = build_prompt(app);
+    let history       = build_history(app);
     let mode          = app.mode;
     let engine        = app.engine.clone();
 
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        run_agent_turn(tx, system_prompt, prompt, mcp_cfg, mode, engine);
+        run_agent_turn(tx, system_prompt, history, mcp_cfg, mode, engine);
     });
 
     StreamHandle { rx }
@@ -83,30 +84,29 @@ fn build_system_prompt(app: &App) -> String {
     s
 }
 
-fn build_prompt(app: &App) -> String {
-    let mut prompt = String::new();
+/// Recent conversation (without the system prompt) in the shared chat format.
+fn build_history(app: &App) -> Vec<ChatMessage> {
     // Last N messages for context (keep it reasonable)
-    let history: Vec<&Message> = app.messages
+    let recent: Vec<&Message> = app.messages
         .iter()
         .filter(|m| m.role != crate::app::Role::System)
         .rev()
         .take(30)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .collect();
 
-    for msg in &history {
-        let tag = match msg.role {
-            crate::app::Role::User      => "user",
-            crate::app::Role::Assistant => "assistant",
-            crate::app::Role::Tool      => "tool_result",
-            crate::app::Role::System    => continue,
-        };
-        prompt.push_str(&format!("<{tag}>\n{}\n</{tag}>\n\n", msg.content));
-    }
-    prompt.push_str("<assistant>\n");
-    prompt
+    recent
+        .into_iter()
+        .rev()
+        .map(|msg| {
+            let role = match msg.role {
+                crate::app::Role::User      => ChatRole::User,
+                crate::app::Role::Assistant => ChatRole::Assistant,
+                crate::app::Role::Tool      => ChatRole::Tool,
+                crate::app::Role::System    => unreachable!("filtered above"),
+            };
+            ChatMessage::new(role, msg.content.as_str())
+        })
+        .collect()
 }
 
 // ─── Agent turn execution ─────────────────────────────────────────────────────
@@ -127,20 +127,19 @@ fn is_mutating_tool(name: &str) -> bool {
 fn run_agent_turn(
     tx:             mpsc::Sender<AgentEvent>,
     system_prompt:  String,
-    prompt:         String,
+    mut history:    Vec<ChatMessage>,
     mcp_cfg:        McpConfig,
     mode:           Mode,
     engine:         Option<std::sync::Arc<quark_core::inference::InferenceEngine>>,
 ) {
-    // `transcript` ends with an open `<assistant>` tag; each round appends the
-    // model's reply and the tool results, then reopens `<assistant>`.
-    let mut transcript = prompt;
+    // Each round appends the model's reply and the tool results to `history`
+    // and asks the model again.
     let mut response = String::new();
 
     for round in 0..MAX_TOOL_ROUNDS {
         // ── Generate response ────────────────────────────────────────────────
         response = match &engine {
-            Some(engine) => match generate_streamed(engine, &system_prompt, &transcript, &tx) {
+            Some(engine) => match generate_streamed(engine, &system_prompt, &history, &tx) {
                 Ok(text) => text,
                 Err(e) => {
                     let _ = tx.send(AgentEvent::Error(format!("Inference error: {e}")));
@@ -148,7 +147,7 @@ fn run_agent_turn(
                 }
             },
             None => {
-                let text = generate_stub_response(&transcript, &mcp_cfg);
+                let text = generate_stub_response(&render_prompt(&history), &mcp_cfg);
                 // Stream word-by-word for a typing feel.
                 for word in text.split_inclusive(' ') {
                     let _ = tx.send(AgentEvent::Token(word.to_owned()));
@@ -166,7 +165,7 @@ fn run_agent_turn(
         let _ = tx.send(AgentEvent::Segment(response.clone()));
 
         // ── Execute tool calls ───────────────────────────────────────────────
-        let mut results = String::new();
+        let mut results = Vec::with_capacity(calls.len());
         for call in &calls {
             let preview = format!("{} {:?}", call.tool, call.args);
             let _ = tx.send(AgentEvent::ToolCall {
@@ -185,12 +184,8 @@ fn run_agent_turn(
                 preview: result.content.chars().take(300).collect(),
             });
 
-            let status = if result.ok { "ok" } else { "error" };
             let content: String = result.content.chars().take(MAX_TOOL_RESULT_CHARS).collect();
-            results.push_str(&format!(
-                "<tool_result>\n{} ({status}):\n{content}\n</tool_result>\n",
-                result.tool
-            ));
+            results.push(ChatMessage::tool_result(&ToolResult { content, ..result }));
         }
 
         // The stub can't read tool results, so a second round would repeat itself.
@@ -203,10 +198,8 @@ fn run_agent_turn(
             break;
         }
 
-        transcript.push_str(&response);
-        transcript.push_str("\n</assistant>\n\n");
-        transcript.push_str(&results);
-        transcript.push_str("\n<assistant>\n");
+        history.push(ChatMessage::assistant(response.as_str()));
+        history.extend(results);
     }
 
     let _ = tx.send(AgentEvent::Done(response));
@@ -235,11 +228,16 @@ fn run_tool(call: &ToolCall, mode: Mode, cfg: &McpConfig) -> (ToolResult, Option
 fn generate_streamed(
     engine:        &quark_core::inference::InferenceEngine,
     system_prompt: &str,
-    transcript:    &str,
+    history:       &[ChatMessage],
     tx:            &mpsc::Sender<AgentEvent>,
 ) -> anyhow::Result<String> {
-    let full_prompt = format!("{system_prompt}\n\n{transcript}");
-    let params = quark_core::inference::SamplingParams::default();
+    let mut messages = vec![ChatMessage::system(system_prompt)];
+    messages.extend_from_slice(history);
+    let full_prompt = render_prompt(&messages);
+    let params = quark_core::inference::SamplingParams {
+        stop_strings: default_stop_strings(),
+        ..Default::default()
+    };
     let (token_tx, token_rx) = mpsc::channel::<String>();
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -388,7 +386,7 @@ mod tests {
         run_agent_turn(
             tx,
             String::new(),
-            "<user>\nlist the files\n</user>\n\n<assistant>\n".into(),
+            vec![ChatMessage::user("list the files")],
             cfg,
             Mode::Build,
             None,
