@@ -13,10 +13,10 @@
 
 // ── Training backend (AutodiffBackend required for gradients) ─────────────────
 
-#[cfg(all(feature = "backend-cuda", not(feature = "backend-wgpu")))]
+#[cfg(feature = "backend-cuda")]
 pub type TrainBackend = burn_autodiff::Autodiff<burn_cuda::Cuda<f32>>;
 
-#[cfg(feature = "backend-wgpu")]
+#[cfg(all(feature = "backend-wgpu", not(feature = "backend-cuda")))]
 pub type TrainBackend = burn_autodiff::Autodiff<burn_wgpu::Wgpu>;
 
 #[cfg(not(any(feature = "backend-cuda", feature = "backend-wgpu")))]
@@ -24,10 +24,10 @@ pub type TrainBackend = burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>;
 
 // ── Inference backend (no autodiff, lower memory overhead) ───────────────────
 
-#[cfg(all(feature = "backend-cuda", not(feature = "backend-wgpu")))]
+#[cfg(feature = "backend-cuda")]
 pub type InferBackend = burn_cuda::Cuda<f32>;
 
-#[cfg(feature = "backend-wgpu")]
+#[cfg(all(feature = "backend-wgpu", not(feature = "backend-cuda")))]
 pub type InferBackend = burn_wgpu::Wgpu;
 
 #[cfg(not(any(feature = "backend-cuda", feature = "backend-wgpu")))]

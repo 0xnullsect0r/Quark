@@ -107,7 +107,7 @@ The Burn backend is selected at compile time via Cargo features:
 - `backend-wgpu` → `burn-wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
 - `backend-cuda` → `burn-cuda` (NVIDIA sm_70+)
 
-Multiple backends can coexist; the fastest available is selected at runtime.
+The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise NdArray. CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners).
 
 ### Data directories
 

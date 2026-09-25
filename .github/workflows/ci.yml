@@ -62,3 +62,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
         run: cargo check --workspace --features backend-cpu
+
+  clippy-linux-gpu:
+    name: Clippy (Linux / ${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Compile-only: hosted runners have no GPU. burn-cuda loads the CUDA
+        # driver at runtime, so no toolkit is needed to build.
+        backend: [backend-wgpu, backend-cuda]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.backend }}
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --features "backend-cpu ${{ matrix.backend }}" -- -D warnings
