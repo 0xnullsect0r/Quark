@@ -34,7 +34,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use quark_core::inference::InferenceEngine;
 use quark_core::mcp::McpConfig;
-use quark_core::model::config::QuarkConfig;
 
 fn main() -> Result<()> {
     // Initialise tracing (suppress most output; TUI owns the screen)
@@ -105,30 +104,16 @@ fn main() -> Result<()> {
     // Point MCP working_dir at the project root
     mcp_cfg.working_dir = project_root.clone();
 
-    // ── Load inference engine if checkpoint + tokenizer present ───────────
-    let checkpoint_path = model_dir.join("checkpoint.bin");
-    let tokenizer_path  = model_dir.join("tokenizer.json");
-    let config_json_path = model_dir.join("config.json");
-
-    let model_config: QuarkConfig = if config_json_path.exists() {
-        let txt = std::fs::read_to_string(&config_json_path).unwrap_or_default();
-        serde_json::from_str(&txt).unwrap_or_else(|_| QuarkConfig::quark_1b())
-    } else {
-        QuarkConfig::quark_1b()
-    };
-
-    let engine: Option<Arc<InferenceEngine>> =
-        if checkpoint_path.exists() && tokenizer_path.exists() {
-            match InferenceEngine::load(&checkpoint_path, &model_config, &tokenizer_path) {
-                Ok(e) => Some(Arc::new(e)),
-                Err(e) => {
-                    eprintln!("Warning: model load failed: {e}");
-                    None
-                }
+    // ── Load inference engine if a model is bundled ───────────────────────
+    let engine: Option<Arc<InferenceEngine>> = match InferenceEngine::load_bundle(&model_dir) {
+        Ok(e) => Some(Arc::new(e)),
+        Err(e) => {
+            if has_bundled_model(&model_dir) {
+                eprintln!("Warning: model load failed: {e:#}");
             }
-        } else {
             None
-        };
+        }
+    };
 
     let model_loaded = engine.is_some();
 
@@ -161,3 +146,7 @@ Always read relevant files before making changes.
 In Plan mode, explain what you would do without actually doing it.
 In Build mode, apply changes directly using write_file or write_lines.
 Prefer small, targeted edits. After making changes, summarise what was done.";
+
+fn has_bundled_model(model_dir: &std::path::Path) -> bool {
+    quark_core::checkpoint::export::find_bundled_model(model_dir).is_some()
+}

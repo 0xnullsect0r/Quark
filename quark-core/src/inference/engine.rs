@@ -67,6 +67,25 @@ impl InferenceEngine {
         })
     }
 
+    /// Load the model of an exported app bundle's `model/` directory: the
+    /// sharded (possibly quantized) `checkpoint/`, or a legacy
+    /// `checkpoint.bin` with `config.json` beside it.
+    pub fn load_bundle(model_dir: &Path) -> Result<Self> {
+        let checkpoint = crate::checkpoint::export::find_bundled_model(model_dir)
+            .with_context(|| format!("no model in {} (export one from Quark)", model_dir.display()))?;
+        let config = QuarkConfig::for_checkpoint(&checkpoint)
+            .or_else(|| {
+                let txt = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+                serde_json::from_str(&txt).ok()
+            })
+            .context("model config.json missing")?;
+        let tokenizer = [model_dir.join("tokenizer.json"), checkpoint.join("tokenizer.json")]
+            .into_iter()
+            .find(|p| p.exists())
+            .context("tokenizer.json missing")?;
+        Self::load(&checkpoint, &config, &tokenizer)
+    }
+
     /// Generate a response for `prompt`, returning the full decoded string.
     pub fn generate(&self, prompt: &str, params: SamplingParams) -> Result<String> {
         let (tx, _rx) = mpsc::channel();

@@ -2,7 +2,7 @@
 
 use burn::{
     module::Module,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
+    nn::{Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Int, Tensor, TensorData},
 };
 
@@ -12,6 +12,7 @@ use super::{
     block::DecoderBlock,
     config::QuarkConfig,
     norm::RmsNorm,
+    proj::Proj,
     stages::{EmbedStage, HeadStage},
 };
 
@@ -24,7 +25,7 @@ pub struct QuarkModel<B: Backend> {
     embed_tokens: Embedding<B>,
     layers: Vec<DecoderBlock<B>>,
     norm: RmsNorm<B>,
-    lm_head: Linear<B>,
+    lm_head: Proj<B>,
 }
 
 impl<B: Backend> QuarkModel<B> {
@@ -41,9 +42,7 @@ impl<B: Backend> QuarkModel<B> {
             embed_tokens: EmbeddingConfig::new(cfg.vocab_size, cfg.hidden_size).init(device),
             layers,
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, device),
-            lm_head: LinearConfig::new(cfg.hidden_size, cfg.vocab_size)
-                .with_bias(false)
-                .init(device),
+            lm_head: Proj::new(cfg.hidden_size, cfg.vocab_size, device),
         }
     }
 

@@ -5,11 +5,11 @@
 
 use burn::{
     module::Module,
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
+    nn::{Embedding, EmbeddingConfig},
     tensor::{backend::Backend, Int, Tensor, TensorData},
 };
 
-use super::{config::QuarkConfig, norm::RmsNorm};
+use super::{config::QuarkConfig, norm::RmsNorm, proj::Proj};
 
 /// Stage name of the token embedding.
 pub const EMBED_STAGE: &str = "embed";
@@ -48,22 +48,24 @@ impl<B: Backend> EmbedStage<B> {
 #[derive(Module, Debug)]
 pub struct HeadStage<B: Backend> {
     pub norm: RmsNorm<B>,
-    pub lm_head: Linear<B>,
+    pub lm_head: Proj<B>,
 }
 
 impl<B: Backend> HeadStage<B> {
     pub fn new(cfg: &QuarkConfig, device: &B::Device) -> Self {
         Self {
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, device),
-            lm_head: LinearConfig::new(cfg.hidden_size, cfg.vocab_size)
-                .with_bias(false)
-                .init(device),
+            lm_head: Proj::new(cfg.hidden_size, cfg.vocab_size, device),
         }
     }
 
     /// `[batch, seq, hidden]` → logits `[batch, seq, vocab]`.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         self.lm_head.forward(self.norm.forward(x))
+    }
+
+    pub fn projs_mut(&mut self) -> Vec<(String, &mut Proj<B>)> {
+        vec![("lm_head".to_owned(), &mut self.lm_head)]
     }
 }
 

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use quark_core::{
     chat::{default_stop_strings, render_prompt, ChatMessage},
+    checkpoint::export::{export_for_inference, BUNDLE_CHECKPOINT},
+    model::proj::QuantFormat,
     data::sft::tokenize_conversation,
     inference::{InferenceEngine, SamplingParams},
     model::config::QuarkConfig,
@@ -257,6 +259,15 @@ fn offloaded_training_end_to_end() {
     assert!(resumed.logs.iter().any(|l| l.contains("optimizer state restored")), "{:#?}", resumed.logs);
     assert_eq!(resumed.metrics.first().unwrap().step, 21);
     assert!(!out.join("checkpoint-10").exists(), "old checkpoints are pruned");
+
+    // ── 4-bit export, loaded the way quark-chat / quark-code load a bundle ───
+    let bundle = dir.join("bundle/model");
+    export_for_inference(&out.join("checkpoint-25"), &bundle.join(BUNDLE_CHECKPOINT), Some(QuantFormat::Q4)).unwrap();
+    let engine = InferenceEngine::load_bundle(&bundle).unwrap();
+    let params = SamplingParams { max_new_tokens: 12, ..SamplingParams::default() };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let text = engine.generate_streaming("fn add_3(", params, tx).unwrap();
+    assert_eq!(rx.try_iter().collect::<String>(), text);
 
     // ── Fine-tune from the sharded base: streamed and in memory ──────────────
     let chat = dir.join("chat.jsonl");

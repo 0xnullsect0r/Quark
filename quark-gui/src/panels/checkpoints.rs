@@ -54,10 +54,16 @@ impl CheckpointsPanel {
                 for entry in rd.flatten() {
                     let p = entry.path();
                     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    if ext == "safetensors" || ext == "bin" {
+                    let sharded = quark_core::checkpoint::sharded::is_sharded(&p);
+                    if ext == "bin" || sharded {
                         let meta = std::fs::metadata(&p).ok();
+                        let size_bytes = if sharded {
+                            dir_size(&p)
+                        } else {
+                            meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                        };
                         self.entries.push(CkptEntry {
-                            size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                            size_bytes,
                             modified: meta.and_then(|m| m.modified().ok()),
                             path: p,
                         });
@@ -115,7 +121,7 @@ impl CheckpointsPanel {
 
         if self.entries.is_empty() {
             ui.label(
-                egui::RichText::new("No checkpoints found (.safetensors or .bin).")
+                egui::RichText::new("No checkpoints found (.bin files or checkpoint-N folders).")
                     .weak()
                     .italics(),
             );
@@ -166,8 +172,17 @@ impl CheckpointsPanel {
                                 }
 
                                 if ui.button("📤 Export…").clicked() {
-                                    if let Some(dst) = rfd::FileDialog::new()
-                                        .add_filter("checkpoint", &["safetensors", "bin"])
+                                    if entry.path.is_dir() {
+                                        // Sharded: copy the weights (no optimizer state).
+                                        if let Some(parent) = rfd::FileDialog::new().pick_folder() {
+                                            let dst = parent.join(name.as_ref());
+                                            self.status = match quark_core::checkpoint::export::export_for_inference(&entry.path, &dst, None) {
+                                                Ok(()) => format!("Exported to {}", dst.display()),
+                                                Err(e) => format!("Export failed: {e:#}"),
+                                            };
+                                        }
+                                    } else if let Some(dst) = rfd::FileDialog::new()
+                                        .add_filter("checkpoint", &["bin"])
                                         .set_file_name(name.as_ref())
                                         .save_file()
                                     {
@@ -212,7 +227,7 @@ impl CheckpointsPanel {
         }
         if let Some(i) = to_delete {
             let p = self.entries[i].path.clone();
-            let _ = std::fs::remove_file(&p);
+            let _ = remove_checkpoint(&p);
             self.status = format!(
                 "Deleted {}",
                 p.file_name().unwrap_or_default().to_string_lossy()
@@ -232,5 +247,31 @@ fn fmt_bytes(b: u64) -> String {
         format!("{gib:.2} GiB")
     } else {
         format!("{mib:.0} MiB")
+    }
+}
+
+/// Total size of the files in a (sharded checkpoint) directory tree.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        dir_size(&p)
+                    } else {
+                        e.metadata().map(|m| m.len()).unwrap_or(0)
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn remove_checkpoint(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
     }
 }

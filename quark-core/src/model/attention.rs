@@ -2,7 +2,6 @@
 
 use burn::{
     module::Module,
-    nn::{Linear, LinearConfig},
     tensor::{
         activation::softmax,
         backend::Backend,
@@ -12,7 +11,7 @@ use burn::{
     },
 };
 
-use super::config::QuarkConfig;
+use super::{config::QuarkConfig, proj::Proj};
 use crate::inference::cache::KvCache;
 
 /// Precompute RoPE cos/sin frequency tables.
@@ -135,10 +134,10 @@ enum Scores<B: Backend> {
 /// Grouped-Query Attention with Rotary Position Embedding.
 #[derive(Module, Debug)]
 pub struct GroupedQueryAttention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
+    q_proj: Proj<B>,
+    k_proj: Proj<B>,
+    v_proj: Proj<B>,
+    o_proj: Proj<B>,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -149,18 +148,10 @@ impl<B: Backend> GroupedQueryAttention<B> {
     pub fn new(cfg: &QuarkConfig, device: &B::Device) -> Self {
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         Self {
-            q_proj: LinearConfig::new(cfg.hidden_size, cfg.num_attention_heads * head_dim)
-                .with_bias(false)
-                .init(device),
-            k_proj: LinearConfig::new(cfg.hidden_size, cfg.num_key_value_heads * head_dim)
-                .with_bias(false)
-                .init(device),
-            v_proj: LinearConfig::new(cfg.hidden_size, cfg.num_key_value_heads * head_dim)
-                .with_bias(false)
-                .init(device),
-            o_proj: LinearConfig::new(cfg.num_attention_heads * head_dim, cfg.hidden_size)
-                .with_bias(false)
-                .init(device),
+            q_proj: Proj::new(cfg.hidden_size, cfg.num_attention_heads * head_dim, device),
+            k_proj: Proj::new(cfg.hidden_size, cfg.num_key_value_heads * head_dim, device),
+            v_proj: Proj::new(cfg.hidden_size, cfg.num_key_value_heads * head_dim, device),
+            o_proj: Proj::new(cfg.num_attention_heads * head_dim, cfg.hidden_size, device),
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
@@ -211,6 +202,16 @@ impl<B: Backend> GroupedQueryAttention<B> {
             Scores::Masked(mask)
         };
         self.attend(q, k, v, scores)
+    }
+
+    /// The projections, by path relative to this module.
+    pub fn projs_mut(&mut self, prefix: &str) -> Vec<(String, &mut Proj<B>)> {
+        vec![
+            (format!("{prefix}q_proj"), &mut self.q_proj),
+            (format!("{prefix}k_proj"), &mut self.k_proj),
+            (format!("{prefix}v_proj"), &mut self.v_proj),
+            (format!("{prefix}o_proj"), &mut self.o_proj),
+        ]
     }
 
     /// An empty KV cache sized for this layer.

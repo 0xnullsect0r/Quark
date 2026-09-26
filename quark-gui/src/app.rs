@@ -68,14 +68,14 @@ impl eframe::App for QuarkApp {
         // Wire: when a checkpoint is loaded in the Checkpoints panel, start
         // loading it into the Chat panel's InferenceEngine.
         if let Some(ckpt_path) = self.checkpoints_panel.take_just_loaded() {
-            // Only load .bin checkpoints (the format training writes).
-            if ckpt_path.extension().is_some_and(|e| e == "bin") {
+            // .bin checkpoints and sharded checkpoint-N folders (both written by training).
+            let sharded = quark_core::checkpoint::sharded::is_sharded(&ckpt_path);
+            if sharded || ckpt_path.extension().is_some_and(|e| e == "bin") {
                 // Prefer the architecture + tokenizer saved alongside the checkpoint.
                 let config = quark_core::model::config::QuarkConfig::for_checkpoint(&ckpt_path)
                     .unwrap_or_else(|| self.config_panel.config().clone());
-                let sibling_tok = ckpt_path.with_file_name("tokenizer.json");
-                let tokenizer = if sibling_tok.exists() {
-                    sibling_tok
+                let tokenizer = if let Some(tok) = quark_core::checkpoint::export::tokenizer_for(&ckpt_path) {
+                    tok
                 } else {
                     self.dataset_panel
                         .active_tokenizer_path()

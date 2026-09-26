@@ -35,6 +35,16 @@ pub fn module_to_stage<B: Backend, M: Module<B>>(module: &M) -> Result<StageTens
 /// cover every parameter with matching shapes. Float data is cast to the
 /// backend's float type (e.g. bf16).
 pub fn load_stage<B: Backend, M: Module<B>>(module: &mut M, stage: &StageTensors) -> Result<()> {
+    load_stage_skipping(module, stage, &[])
+}
+
+/// Like [`load_stage`], but the parameters at `skip` may be absent (they stay
+/// uninitialised, e.g. the dense weights of quantized projections).
+pub fn load_stage_skipping<B: Backend, M: Module<B>>(
+    module: &mut M,
+    stage: &StageTensors,
+    skip: &[String],
+) -> Result<()> {
     let float = <B::FloatElem as Element>::dtype();
     let snapshots = stage
         .tensors
@@ -49,7 +59,16 @@ pub fn load_stage<B: Backend, M: Module<B>>(module: &mut M, stage: &StageTensors
             TensorSnapshot::from_data(data, path_stack, vec![], Default::default())
         })
         .collect();
-    let result = module.apply(snapshots, None, None, false);
+    apply_checked(module, snapshots, skip)
+}
+
+fn apply_checked<B: Backend, M: Module<B>>(
+    module: &mut M,
+    snapshots: Vec<TensorSnapshot>,
+    skip: &[String],
+) -> Result<()> {
+    let mut result = module.apply(snapshots, None, None, false);
+    result.missing.retain(|(path, _)| !skip.contains(path));
     if !result.errors.is_empty() || !result.missing.is_empty() || !result.unused.is_empty() {
         anyhow::bail!(
             "stage does not match module: errors={:?} missing={:?} unused={:?}",

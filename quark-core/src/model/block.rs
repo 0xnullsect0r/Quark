@@ -8,6 +8,7 @@ use burn::{
 use super::{
     attention::GroupedQueryAttention, config::QuarkConfig, ffn::SwiGluFfn, moe::MoeBlock,
     norm::RmsNorm,
+    proj::Proj,
 };
 use crate::inference::cache::KvCache;
 
@@ -55,6 +56,18 @@ impl<B: Backend> DecoderBlock<B> {
         let x = self.input_norm.forward(x);
         let x = self.attn.forward_cached(x, cache, start_pos) + residual;
         self.feed_forward(x).0
+    }
+
+    /// Every projection, by path relative to this block.
+    pub fn projs_mut(&mut self) -> Vec<(String, &mut Proj<B>)> {
+        let mut projs = self.attn.projs_mut("attn.");
+        if let Some(ffn) = &mut self.ffn {
+            projs.extend(ffn.projs_mut("ffn."));
+        }
+        if let Some(moe) = &mut self.moe {
+            projs.extend(moe.projs_mut("moe."));
+        }
+        projs
     }
 
     pub fn new_cache(&self) -> KvCache<B> {

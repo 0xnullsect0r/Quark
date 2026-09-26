@@ -6,7 +6,7 @@ use burn::{
     tensor::{activation::softmax, backend::Backend, IndexingUpdateOp, Int, Tensor, TensorData},
 };
 
-use super::{config::QuarkConfig, ffn::SwiGluFfn};
+use super::{config::QuarkConfig, ffn::SwiGluFfn, proj::Proj};
 
 /// Learned router for Mixture-of-Experts.
 ///
@@ -110,6 +110,17 @@ impl<B: Backend> MoeBlock<B> {
         let output = output.reshape([batch, seq, hidden]);
 
         (output, aux)
+    }
+}
+
+impl<B: Backend> MoeBlock<B> {
+    /// The expert projections, by path relative to this module.
+    pub fn projs_mut(&mut self, prefix: &str) -> Vec<(String, &mut Proj<B>)> {
+        self.experts
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, e)| e.projs_mut(&format!("{prefix}experts.{i}.")))
+            .collect()
     }
 }
 

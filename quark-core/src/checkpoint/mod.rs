@@ -1,6 +1,8 @@
 #![allow(dead_code, unused_imports)]
 
+pub mod export;
 pub mod hf_import;
+pub mod quantize;
 pub mod safetensors;
 pub mod sharded;
 

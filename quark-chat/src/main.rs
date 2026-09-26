@@ -1,8 +1,8 @@
 //! quark-chat — standalone terminal chat app exported from Quark GUI.
 //!
 //! Expects model files next to the executable in a `model/` directory:
-//!   model/config.json              QuarkConfig
-//!   model/checkpoint.bin           weights (Burn BinFileRecorder, full precision)
+//!   model/checkpoint/              sharded weights, optionally Q4/Q8-quantized
+//!                                  (or legacy model/checkpoint.bin + config.json)
 //!   model/tokenizer.json           BPE tokenizer
 //!   model/mcp.json                 McpConfig  (optional)
 //!   model/system_prompt.txt        system prompt (optional)
@@ -15,7 +15,6 @@ use quark_core::chat::{default_stop_strings, render_prompt, ChatMessage};
 use quark_core::inference::sampling::SamplingParams;
 use quark_core::inference::InferenceEngine;
 use quark_core::mcp::{execute_tool, parse_tool_calls, McpConfig};
-use quark_core::model::config::QuarkConfig;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -54,36 +53,19 @@ fn main() -> Result<()> {
             .to_string()
     };
 
-    // Load model config
-    let config_path = model_dir.join("config.json");
-    let model_config: QuarkConfig = if config_path.exists() {
-        let txt = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str(&txt).unwrap_or_else(|_| QuarkConfig::quark_1b())
-    } else {
-        QuarkConfig::quark_1b()
-    };
-
     let model_name = "Quark".to_string();
 
     // Load inference engine
-    let checkpoint_path = model_dir.join("checkpoint.bin");
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    let engine = if checkpoint_path.exists() && tokenizer_path.exists() {
-        eprintln!("Loading model from {}…", checkpoint_path.display());
-        match InferenceEngine::load(&checkpoint_path, &model_config, &tokenizer_path) {
-            Ok(e) => {
-                eprintln!("Model loaded.");
-                Some(e)
-            }
-            Err(e) => {
-                eprintln!("Warning: model load failed: {e}");
-                None
-            }
+    eprintln!("Loading model from {}…", model_dir.display());
+    let engine = match InferenceEngine::load_bundle(&model_dir) {
+        Ok(e) => {
+            eprintln!("Model loaded.");
+            Some(e)
         }
-    } else {
-        eprintln!("Warning: checkpoint.bin or tokenizer.json not found — running without model.");
-        None
+        Err(e) => {
+            eprintln!("Warning: {e:#} — running without model.");
+            None
+        }
     };
 
     let sampling = SamplingParams {
