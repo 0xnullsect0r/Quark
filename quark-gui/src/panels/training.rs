@@ -13,7 +13,7 @@ use quark_core::model::config::QuarkConfig;
 use quark_core::training::metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics};
 use quark_core::training::lr_schedule::CosineSchedule;
 use quark_core::training::trainer::{
-    estimate_memory, start_training, Precision, TrainerConfig, TrainingHandle, TrainingMode,
+    start_training, Precision, TrainerConfig, TrainingHandle, TrainingMode,
     FINE_TUNE_LR,
 };
 
@@ -72,6 +72,76 @@ impl TrainingPanel {
             flag.store(true, Ordering::SeqCst);
         }
         self.is_running = false;
+    }
+
+    /// Offloading choice, optimizer, and the resulting memory / disk plan.
+    fn offload_ui(&mut self, ui: &mut egui::Ui, model_config: &QuarkConfig) {
+        use quark_core::training::{optim::OptimizerKind, plan::offload_plan, trainer::OffloadMode};
+        let fmt = super::config::fmt_bytes;
+        let green = egui::Color32::from_rgb(120, 200, 120);
+        let red = egui::Color32::from_rgb(255, 110, 90);
+
+        ui.horizontal(|ui| {
+            ui.label("Offloading:");
+            let c = &mut self.trainer_config.offload;
+            ui.radio_value(c, OffloadMode::Auto, "Auto").on_hover_text("Stream the model through RAM and disk only when it doesn't fit in memory");
+            ui.radio_value(c, OffloadMode::On, "Always");
+            ui.radio_value(c, OffloadMode::Off, "Never");
+            ui.separator();
+            ui.label("Optimizer:");
+            let o = &mut self.trainer_config.optimizer;
+            ui.radio_value(o, OptimizerKind::AdamW, "AdamW").on_hover_text("8 bytes of state per parameter");
+            ui.radio_value(o, OptimizerKind::AdamWCompact, "AdamW compact")
+                .on_hover_text("~3 bytes of state per parameter (int8 + bf16 moments); used when offloading");
+            ui.radio_value(o, OptimizerKind::Adafactor, "Adafactor").on_hover_text("almost no state");
+        });
+
+        let plan = offload_plan(model_config, &self.trainer_config, &self.budget);
+        let est = plan.in_memory;
+        if !plan.streamed {
+            ui.label(
+                egui::RichText::new(format!(
+                    "In memory: ≈{} needed · {} {} free{}",
+                    fmt(est.needed_bytes),
+                    fmt(est.available_bytes),
+                    est.device,
+                    if est.fits() { "" } else { " — likely too big: turn offloading on, or pick a smaller preset / batch" },
+                ))
+                .color(if est.fits() { green } else { red }),
+            );
+            return;
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "Offloaded (layer by layer): ≈{} on the {} at a time instead of ≈{} in memory",
+                fmt(plan.device_bytes),
+                est.device,
+                fmt(est.needed_bytes),
+            ))
+            .color(green),
+        );
+        let free = plan.disk_free.map(fmt).unwrap_or_else(|| "unknown".into());
+        ui.label(
+            egui::RichText::new(format!(
+                "Disk in {}: ≈{} needed (weights {}, optimizer {}, activations {}, 2 checkpoints {}) · {} free",
+                plan.offload_dir.display(),
+                fmt(plan.disk_needed),
+                fmt(plan.weights_bytes),
+                fmt(plan.optimizer_bytes),
+                fmt(plan.activation_bytes),
+                fmt(plan.checkpoint_bytes),
+                free,
+            ))
+            .color(if plan.disk_fits() { green } else { red }),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Offloaded steps are slow (each step reads and writes every layer's weights and optimizer \
+                 state); use an SSD. Set the offload folder and RAM limit in Settings.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     /// Pretrain / fine-tune switch and the fine-tune inputs.
@@ -200,7 +270,10 @@ impl TrainingPanel {
         ui: &mut egui::Ui,
         config_panel: &ConfigPanel,
         dataset_panel: &DatasetPanel,
+        tier: &TierConfig,
     ) {
+        // Resource limits and the offload folder come from the Settings tab.
+        self.trainer_config.tier = tier.clone();
         self.drain_events();
         if self.is_running {
             ui.ctx()
@@ -223,26 +296,7 @@ impl TrainingPanel {
                     .filter(|_| self.finetune)
                     .and_then(QuarkConfig::for_checkpoint);
                 let model_config = base_config.as_ref().unwrap_or(config_panel.config());
-                let estimate = estimate_memory(model_config, &self.trainer_config, &self.budget);
-                let color = if estimate.fits() {
-                    egui::Color32::from_rgb(120, 200, 120)
-                } else {
-                    egui::Color32::from_rgb(255, 110, 90)
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "≈{} needed to train · {} {} free{}",
-                        super::config::fmt_bytes(estimate.needed_bytes),
-                        super::config::fmt_bytes(estimate.available_bytes),
-                        estimate.device,
-                        if estimate.fits() {
-                            ""
-                        } else {
-                            " — likely too big: pick a smaller preset, batch size or context"
-                        },
-                    ))
-                    .color(color),
-                );
+                self.offload_ui(ui, model_config);
 
                 // Control buttons
                 ui.horizontal(|ui| {

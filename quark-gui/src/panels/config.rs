@@ -280,9 +280,10 @@ impl ConfigPanel {
     }
 }
 
-const PRESETS: [ModelPreset; 14] = [
+const PRESETS: [ModelPreset; 15] = [
     ModelPreset::QuarkTiny,
     ModelPreset::QuarkSmall,
+    ModelPreset::Quark10BA2B,
     ModelPreset::Quark1B,
     ModelPreset::Quark3B,
     ModelPreset::Quark7B,
@@ -301,6 +302,7 @@ fn preset_name(preset: ModelPreset) -> &'static str {
     match preset {
         ModelPreset::QuarkTiny => "Quark Tiny",
         ModelPreset::QuarkSmall => "Quark Small",
+        ModelPreset::Quark10BA2B => "Quark 10B-A2B",
         ModelPreset::Quark1B => "Quark 1B",
         ModelPreset::Quark3B => "Quark 3B",
         ModelPreset::Quark7B => "Quark 7B",

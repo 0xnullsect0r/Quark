@@ -22,6 +22,9 @@ pub struct QuarkConfig {
 pub enum ModelPreset {
     QuarkTiny,
     QuarkSmall,
+    /// ~10B total / ~2B active per token: the largest preset meant for one
+    /// machine (trained with offloading, run 4-bit quantized).
+    Quark10BA2B,
     Quark1B,
     Quark3B,
     Quark7B,
@@ -85,10 +88,42 @@ impl QuarkConfig {
         }
     }
 
+    /// ~10.0B parameters, ~2.1B active per token (16 experts, top-2, MoE in
+    /// every layer). Trains with offloading (layer by layer through RAM and
+    /// disk) on one machine; runs at 4 bits in ≈ 6 GB.
+    pub fn quark_10b_a2b() -> Self {
+        Self {
+            vocab_size: 32000,
+            hidden_size: 3072,
+            num_hidden_layers: 30,
+            num_attention_heads: 24,
+            num_key_value_heads: 8,
+            intermediate_size: 2048,
+            max_position_embeddings: 2048,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            num_experts: 16,
+            num_experts_per_tok: 2,
+            num_moe_layers: 30,
+            moe_layer_freq: 1,
+            tie_word_embeddings: false,
+        }
+    }
+
+    /// Parameters used per token (MoE layers count only the routed experts).
+    pub fn active_param_count(&self) -> u64 {
+        let h = self.hidden_size as u64;
+        let ffn = 3 * h * self.intermediate_size as u64;
+        let moe_layers = (0..self.num_hidden_layers).filter(|&i| self.is_moe_layer(i)).count() as u64;
+        let unused_experts = self.num_experts.saturating_sub(self.num_experts_per_tok) as u64;
+        self.param_count() - moe_layers * unused_experts * ffn
+    }
+
     pub fn from_preset(preset: ModelPreset) -> Option<Self> {
         Some(match preset {
             ModelPreset::QuarkTiny => Self::quark_tiny(),
             ModelPreset::QuarkSmall => Self::quark_small(),
+            ModelPreset::Quark10BA2B => Self::quark_10b_a2b(),
             ModelPreset::Quark1B => Self::quark_1b(),
             ModelPreset::Quark3B => Self::quark_3b(),
             ModelPreset::Quark7B => Self::quark_7b(),

@@ -745,7 +745,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 // ── Memory helpers ────────────────────────────────────────────────────────────
 
 /// Estimated training memory against what the training device has free.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct MemoryEstimate {
     pub needed_bytes: u64,
     pub available_bytes: u64,

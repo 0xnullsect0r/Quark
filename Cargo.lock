@@ -5453,10 +5453,12 @@ name = "quark-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "burn",
  "dirs 5.0.1",
  "quark-core",
  "serde",
  "serde_json",
+ "sysinfo 0.32.1",
  "tokio",
  "toml 0.8.23",
  "tracing",

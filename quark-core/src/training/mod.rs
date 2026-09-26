@@ -7,6 +7,7 @@ pub mod loss;
 pub mod lr_schedule;
 pub mod metrics;
 pub mod optim;
+pub mod plan;
 pub mod streamed;
 pub mod trainer;
 

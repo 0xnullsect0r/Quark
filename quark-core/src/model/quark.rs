@@ -221,4 +221,13 @@ mod tests {
             assert_eq!(model.num_params() as u64, cfg.param_count());
         }
     }
+
+    #[test]
+    fn ten_b_preset_size() {
+        let cfg = QuarkConfig::quark_10b_a2b();
+        let total = cfg.param_count() as f64 / 1e9;
+        let active = cfg.active_param_count() as f64 / 1e9;
+        assert!((9.8..10.3).contains(&total), "{total}");
+        assert!((1.9..2.3).contains(&active), "{active}");
+    }
 }

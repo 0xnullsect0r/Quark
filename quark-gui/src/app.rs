@@ -124,12 +124,13 @@ impl eframe::App for QuarkApp {
                 // Disjoint field borrows: the borrow checker allows &mut on
                 // training_panel while taking & on config_panel / dataset_panel
                 // because they are separate fields of QuarkApp.
-                let (tp, cp, dp) = (
+                let (tp, cp, dp, sp) = (
                     &mut self.training_panel,
                     &self.config_panel,
                     &self.dataset_panel,
+                    &self.settings_panel,
                 );
-                tp.ui(ui, cp, dp);
+                tp.ui(ui, cp, dp, sp.tier_config());
             }
             ActivePanel::Checkpoints => self.checkpoints_panel.ui(ui),
             ActivePanel::Chat => self.chat_panel.ui(ui),

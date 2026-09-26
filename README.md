@@ -16,7 +16,7 @@ Quark is a downloadable desktop GUI that guides you from raw data → trained LL
 - [Architecture](#architecture)
 - [Model Presets](#model-presets)
 - [Backends](#backends)
-- [Memory Tiering](#memory-tiering)
+- [Offloading: training models bigger than memory](#offloading-training-models-bigger-than-memory)
 - [GUI Panels](#gui-panels)
 - [Training Guide](#training-guide)
 - [The Pile Dataset](#the-pile-dataset)
@@ -115,20 +115,18 @@ Each transformer block alternates between **dense SwiGLU** layers and **sparse M
 
 ## Model Presets
 
-All presets use the same GQA + MoE architecture. The GUI's preset picker shows the exact parameter count and a training-memory estimate for each. The **Training** tab compares that estimate for your batch size with your free RAM or VRAM.
+All presets use the same GQA + MoE architecture. The GUI's preset picker shows the exact parameter count and a training-memory estimate for each. The **Training** tab shows the plan for your machine: in memory or offloaded, how much device memory and disk it needs.
 
-**Start with Tiny or Small.** "Train" below is the rough peak memory to train at batch size 1 in f32: weights, gradients, AdamW state and activations at the preset's full context length.
+| Preset | Params (active/token) | Layers | Hidden | Context | Experts (top-k) | How it trains |
+|--------|------:|-------:|-------:|--------:|----------------:|---------------|
+| **Quark Tiny**    | 12 M | 6 | 256 | 512 | 4 (2) | in memory, ≈ 0.4 GB — laptop CPU is fine |
+| **Quark Small**   | 224 M | 12 | 768 | 1024 | 8 (2) | in memory, ≈ 8 GB — a GPU with 8 GB+ |
+| **Quark 10B-A2B** | 10.0 B (2.1 B) | 30 | 3072 | 2048 | 16 (2), every layer | **offloaded**: ≈ 6 GB on the GPU at a time, ≈ 75 GB of SSD (+ checkpoints) |
+| Quark 1B … 400B   | see picker | | | | | larger ones need offloading or big hardware |
 
-| Preset | Params | Layers | Hidden | Context | Experts (top-k) | Train (batch 1, f32) |
-|--------|-------:|-------:|-------:|--------:|----------------:|---------------------:|
-| **Quark Tiny**  |  12 M |  6 |  256 |  512 | 4 (2) | ≈ 0.4 GB |
-| **Quark Small** | 224 M | 12 |  768 | 1024 | 8 (2) | ≈ 8 GB |
-| **Quark 1B**    | 1.8 B | 16 | 2048 | 4096 | 8 (2) | ≈ 100 GB |
-| Quark 3B … 400B | see picker | | | | | far beyond a single machine |
+The 10B-A2B preset is the largest meant for a single machine. It is a mixture of experts: 10 B parameters, but each token only uses about 2 B of them, which keeps compute per token near that of a 2 B model. The older 1B … 400B names are nominal: the picker shows the real counts.
 
-Tiny trains on a laptop CPU. Small wants a GPU with at least 8 GB. The larger presets are defined for completeness, but Quark has no memory offloading yet (see below), so they only train on hardware with enough VRAM for the whole model. Their names are nominal: MoE experts make the real parameter counts higher, and the picker shows the exact numbers.
-
-On CUDA builds, **bf16** precision (Training tab) halves memory. Checkpoints are always saved in f32.
+On CUDA builds, **bf16** precision (Training tab) halves memory. Master weights and checkpoints stay f32.
 
 ---
 
@@ -146,9 +144,28 @@ Pre-built releases ship the `backend-cpu` binary. Build from source with `backen
 
 ---
 
-## Memory Tiering
+## Offloading: training models bigger than memory
 
-> **Status: planned, not implemented.** The model, gradients and optimizer state must currently fit in RAM (CPU builds) or VRAM (GPU builds). The `memory/` module holds the budget detection used for the Training tab's estimate. Layer streaming, optimizer offload and quantized storage are not wired into training yet. Gradient checkpointing is available (Training tab, on by default).
+With **Offloading** set to *Auto* (Training tab), a model that doesn't fit in RAM/VRAM is trained **layer by layer**:
+
+1. Weights (f32 master copies) and optimizer state live in an offload folder on disk, with the most recently used layers cached in RAM (the RAM limit is in **Settings**).
+2. **Forward:** each layer is loaded onto the GPU (or CPU) in turn, the batch is run through it, and only the layer's *input* activations are kept (spilling to disk if needed).
+3. **Backward**, last layer first: each layer is reloaded and recomputed from its saved input to get gradients. That layer is then **updated immediately** and written back, so the full model's gradients never exist at once.
+
+Only one layer's weights, gradients and optimizer state are on the device at a time: ≈ 6 GB for the 10B preset. A test checks that one offloaded step matches the in-memory trainer to within float tolerance.
+
+- **Optimizers:** *AdamW* (8 bytes of state per parameter), *AdamW compact* (≈ 3 bytes: int8 first moment + bf16 second moment, tracks AdamW closely) or *Adafactor* (almost no state). For 10B, *AdamW compact* is the sensible default.
+- **Checkpoints** are `checkpoint-N/` folders (one file per layer, optimizer state included; the last 2 are kept). Resuming restores the optimizer state.
+- **Disk:** for 10B-A2B with AdamW compact, ≈ 40 GB of weights + ≈ 30 GB of optimizer state + activations, plus ≈ 70 GB per kept checkpoint. **Use an SSD**: every step reads and writes all of it.
+- **Gradient clipping** is per layer when offloading (each layer's gradient is capped so the total can't exceed *Max grad norm*).
+
+### Honest expectations for 10B
+
+- **It fits and it trains:** one 10B layer at full size (2048 tokens) was measured at 4.3 GB of memory for forward + backward.
+- **It is slow:** on a 4-core CPU one layer's forward + backward takes ≈ 32 s, so ≈ 20 minutes per 2048-token step for the whole model. A modern GPU is 50–100× faster at the compute. Disk I/O (~150 GB per step at 10B) then becomes the limit.
+- **Pretraining a 10B model to a *useful* quality from scratch needs on the order of 10²² operations**, which is years on any single machine. Expect to use the 10B preset for experiments, continued training, or fine-tuning, and the Tiny/Small presets for complete from-scratch runs.
+
+Run `quark-cli bench 10b --layer-only` (or `quark-cli bench small`) to measure your own machine.
 
 ---
 
@@ -253,30 +270,34 @@ All resource constraints are in the **Settings** panel and take effect immediate
 | **Theme** | System | Light / Dark / System |
 | **Log level** | Info | Trace / Debug / Info / Warn / Error |
 
-Reducing VRAM % or RAM % forces more layers to spill to the next tier (slower but prevents OOM).
+The RAM % limit sizes the in-RAM cache used when offloading, and the disk offload path is where offloaded weights, optimizer state and activations go (relative paths are inside the training output folder). Put it on an SSD.
 
 ---
 
 ## Exporting Your Model
 
-Once training is complete, open the **Export** panel to package your model as a standalone application.
+Once training is complete, open the **Export** panel to package your model as a standalone application. Choose the weight format:
+
+| Weights | Size vs f32 | 10B-A2B size | Notes |
+|---------|------------:|-------------:|-------|
+| f32 | 1× | ≈ 40 GB | exact |
+| 8-bit | ≈ ¼ | ≈ 11 GB | near-identical output |
+| 4-bit | ≈ ⅐ | ≈ 6 GB | small quality loss; the one to use for 10B on a laptop |
+
+Quantized models load almost instantly: weights are memory-mapped. On the CPU build a hand-written 4-bit kernel does the decoding. It measured ≈ 9.5 billion weights/s on 4 cores, so a 10B-A2B model (≈ 2 B weights per token) generates a few tokens per second. It also runs when the model is larger than free RAM, because the OS pages weights in from disk. On GPU builds, the quantized weights stay on the GPU and are unpacked just before each layer's matmul.
+
+The same export is available headless:
+
+```bash
+quark-cli export ~/.quark/checkpoints/checkpoint-2000 ./my-model --q4   # or --q8, or neither for f32
+quark-cli infer  ./my-model "Write a Rust function that reverses a string"
+```
 
 ### quark-chat
 
-A lightweight terminal REPL that spins up your model locally and lets you chat with it.
+A lightweight terminal REPL that runs your model locally. It loads the model from the `model/` folder next to the executable (`model/checkpoint/`, written by the Export panel), streams replies, and can call the enabled MCP tools. Commands: `/clear`, `/mcp`, `/help`, `/exit`.
 
-```
-Usage: quark-chat [OPTIONS]
-
-Options:
-  --model <DIR>       Path to model directory (default: bundled)
-  --system <TEXT>     System prompt override
-  --temperature <F>   Sampling temperature (default: 0.7)
-  --top-p <F>         Nucleus sampling threshold (default: 0.9)
-  --max-tokens <N>    Max tokens per response (default: 512)
-```
-
-The exported binary includes the weights, tokenizer, and a hardened config. No Python, no internet access, no dependencies — just run the binary.
+The exported bundle includes the weights, tokenizer and config. No Python, no internet access, no dependencies — just run the binary.
 
 ### quark-code
 
