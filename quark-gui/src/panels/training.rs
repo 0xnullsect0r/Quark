@@ -578,6 +578,13 @@ impl TrainingPanel {
                                 );
                                 ui.end_row();
 
+                                ui.label("Gradient checkpointing");
+                                ui.checkbox(
+                                    &mut self.trainer_config.gradient_checkpointing,
+                                    "recompute activations (less memory, a bit slower)",
+                                );
+                                ui.end_row();
+
                                 ui.label("Precision");
                                 ui.horizontal(|ui| {
                                     ui.radio_value(

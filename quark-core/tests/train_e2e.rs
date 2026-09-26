@@ -122,8 +122,9 @@ fn train_load_generate_and_resume() {
     assert_eq!(streamed, text, "streamed pieces must add up to the full response");
 
     // ── Resume ───────────────────────────────────────────────────────────────
-    let (_handle, rx) =
-        start_training(tiny_config(), trainer_config(&out, 35), vec![corpus], Some(tokenizer));
+    // Resume without gradient checkpointing to exercise the other backend variant.
+    let resume_cfg = TrainerConfig { gradient_checkpointing: false, ..trainer_config(&out, 35) };
+    let (_handle, rx) = start_training(tiny_config(), resume_cfg, vec![corpus], Some(tokenizer));
     let resumed = collect(rx);
     assert!(resumed.logs.iter().any(|l| l.contains("Resumed")), "{:#?}", resumed.logs);
     assert_eq!(resumed.metrics.first().unwrap().step, 31);

@@ -3,7 +3,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{activation::softmax, backend::Backend, Int, Tensor, TensorData},
+    tensor::{activation::softmax, backend::Backend, IndexingUpdateOp, Int, Tensor, TensorData},
 };
 
 use super::{config::QuarkConfig, ffn::SwiGluFfn};
@@ -105,7 +105,7 @@ impl<B: Backend> MoeBlock<B> {
             let expert_out = expert
                 .forward(expert_in.reshape([1, n, hidden]))
                 .reshape([n, hidden]);
-            output = output.select_assign(0, idx, expert_out * w);
+            output = output.select_assign(0, idx, expert_out * w, IndexingUpdateOp::Add);
         }
         let output = output.reshape([batch, seq, hidden]);
 
@@ -117,7 +117,8 @@ impl<B: Backend> MoeBlock<B> {
 /// Input/output shape: `[batch, seq, num_experts]`.
 fn top_k_mask<B: Backend>(weights: Tensor<B, 3>, top_k: usize) -> Tensor<B, 3> {
     // k-th largest weight per token; everything >= it is in the top-k set.
-    let threshold = weights.clone().topk(top_k, 2).narrow(2, top_k - 1, 1); // [batch, seq, 1]
+    // (sort, not topk: Burn 0.21 has no autodiff topk; the mask needs no gradient)
+    let threshold = weights.clone().detach().sort_descending(2).narrow(2, top_k - 1, 1); // [batch, seq, 1]
     weights.greater_equal(threshold).float()
 }
 
@@ -166,11 +167,11 @@ pub fn top_k_weights<B: Backend>(weights: Tensor<B, 3>, top_k: usize) -> Tensor<
 
 #[cfg(test)]
 mod tests {
-    use burn_ndarray::NdArray;
+    use crate::backend::InferBackend as TestBackend;
 
     use super::*;
 
-    type B = NdArray<f32>;
+    type B = TestBackend;
 
     fn weights() -> Tensor<B, 3> {
         let data = TensorData::new(vec![0.1f32, 0.6, 0.3, 0.5, 0.2, 0.3], [1, 2, 3]);

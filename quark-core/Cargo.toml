@@ -9,16 +9,12 @@ repository.workspace = true
 
 [features]
 default = ["backend-cpu"]
-backend-cpu  = ["burn/ndarray",  "burn-ndarray"]
-backend-cuda = ["burn-cuda",     "nvml-wrapper"]
-backend-wgpu = ["burn/wgpu",     "burn-wgpu"]
+backend-cpu  = ["burn/flex"]
+backend-cuda = ["burn/cuda", "nvml-wrapper"]
+backend-wgpu = ["burn/wgpu"]
 
 [dependencies]
 burn          = { workspace = true, features = ["autodiff", "std"] }
-burn-autodiff = { workspace = true }
-burn-ndarray  = { workspace = true, optional = true }
-burn-cuda     = { workspace = true, optional = true }
-burn-wgpu     = { workspace = true, optional = true }
 
 safetensors   = { workspace = true }
 serde         = { workspace = true }

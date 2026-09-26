@@ -118,7 +118,7 @@ impl<B: Backend> QuarkModel<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
+    use crate::backend::InferBackend as TestBackend;
 
     /// A tiny configuration suitable for unit-testing shapes without OOM.
     fn test_cfg() -> QuarkConfig {
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_forward_shapes() {
-        type B = NdArray<f32>;
+        type B = TestBackend;
         let device = Default::default();
         let cfg = test_cfg();
         let model = QuarkModel::<B>::new(&cfg, &device);
@@ -157,14 +157,14 @@ mod tests {
         assert_eq!(v, cfg.vocab_size);
     }
 
-    fn ids(v: &[i32]) -> Tensor<NdArray<f32>, 2, Int> {
+    fn ids(v: &[i32]) -> Tensor<TestBackend, 2, Int> {
         Tensor::from_data(
             TensorData::new(v.to_vec(), [1, v.len()]),
             &Default::default(),
         )
     }
 
-    fn values(t: Tensor<NdArray<f32>, 3>) -> Vec<f32> {
+    fn values(t: Tensor<TestBackend, 3>) -> Vec<f32> {
         t.into_data().into_vec().unwrap()
     }
 
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn future_tokens_do_not_affect_past_logits() {
         let cfg = test_cfg();
-        let model = QuarkModel::<NdArray<f32>>::new(&cfg, &Default::default());
+        let model = QuarkModel::<TestBackend>::new(&cfg, &Default::default());
         let a = values(model.forward(ids(&[5, 9, 17, 3, 42, 8])).narrow(1, 0, 3));
         let b = values(model.forward(ids(&[5, 9, 17, 200, 1, 77])).narrow(1, 0, 3));
         assert_close(&a, &b);
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn kv_cache_matches_full_forward() {
         let cfg = test_cfg();
-        let model = QuarkModel::<NdArray<f32>>::new(&cfg, &Default::default());
+        let model = QuarkModel::<TestBackend>::new(&cfg, &Default::default());
         let tokens = [5, 9, 17, 3, 42, 8, 11];
         let full = values(model.forward(ids(&tokens)));
 
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn param_count_matches_model() {
         for cfg in [test_cfg(), QuarkConfig::quark_tiny()] {
-            let model = QuarkModel::<NdArray<f32>>::new(&cfg, &Default::default());
+            let model = QuarkModel::<TestBackend>::new(&cfg, &Default::default());
             assert_eq!(model.num_params() as u64, cfg.param_count());
         }
     }

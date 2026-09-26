@@ -17,7 +17,7 @@ use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
 use crate::tokenizer::bpe::{BOS_ID, QuarkTokenizer};
 
-type Device = <InferBackend as burn::tensor::backend::Backend>::Device;
+type Device = burn::tensor::Device<InferBackend>;
 
 /// Loaded model + tokenizer ready for text generation.
 pub struct InferenceEngine {

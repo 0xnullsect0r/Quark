@@ -57,6 +57,10 @@ pub struct TrainerConfig {
     /// Numeric precision for training compute.
     #[serde(default)]
     pub precision: Precision,
+    /// Recompute cheap activations in the backward pass instead of storing
+    /// them (Burn's balanced checkpointing): less memory, somewhat slower.
+    #[serde(default = "default_true")]
+    pub gradient_checkpointing: bool,
     /// Maximum global gradient norm before clipping.
     pub max_grad_norm: f32,
     /// Random seed for reproducibility.
@@ -132,6 +136,7 @@ impl Default for TrainerConfig {
             save_every_steps: 500,
             eval_every_steps: 100,
             precision: Precision::F32,
+            gradient_checkpointing: true,
             max_grad_norm: 1.0,
             seed: 42,
             adamw: AdamWConfig::default(),
@@ -202,9 +207,6 @@ pub fn start_training(
 /// Pick the concrete autodiff backend for the requested precision, then run
 /// the loop on it.
 ///
-/// Gradient checkpointing (`burn_autodiff::checkpoint`) is not offered: in
-/// Burn 0.16 `BalancedCheckpointing` panics on the backward pass of any
-/// softmax (`(x - max(x)).exp()`).
 fn dispatch_training(
     model_config: QuarkConfig,
     mut config: TrainerConfig,
@@ -227,10 +229,17 @@ fn dispatch_training(
         };
     }
 
-    match config.precision {
+    use burn::backend::{autodiff::checkpoint::strategy::BalancedCheckpointing, Autodiff};
+
+    match (config.precision, config.gradient_checkpointing) {
         #[cfg(feature = "backend-cuda")]
-        Precision::Bf16 => run!(burn_autodiff::Autodiff<crate::backend::ComputeBackendBf16>),
-        _ => run!(crate::backend::TrainBackend),
+        (Precision::Bf16, true) => {
+            run!(Autodiff<crate::backend::ComputeBackendBf16, BalancedCheckpointing>)
+        }
+        #[cfg(feature = "backend-cuda")]
+        (Precision::Bf16, false) => run!(Autodiff<crate::backend::ComputeBackendBf16>),
+        (_, true) => run!(Autodiff<crate::backend::ComputeBackend, BalancedCheckpointing>),
+        (_, false) => run!(crate::backend::TrainBackend),
     }
 }
 
@@ -384,8 +393,8 @@ fn run_training_loop<AB: AutodiffBackend>(
     // ── Initialise model ──────────────────────────────────────────────────────
     phase!("Initialising model…");
 
-    let device = <AB as Backend>::Device::default();
-    <AB as Backend>::seed(config.seed);
+    let device = burn::tensor::Device::<AB>::default();
+    <AB as Backend>::seed(&device, config.seed);
     let mut model = QuarkModel::<AB>::new(&model_config, &device);
     log!("   Model initialised on {:?}", device);
 
@@ -704,6 +713,7 @@ pub fn estimate_memory(
         config.batch_size,
         model.max_position_embeddings,
         precision.bytes_per_elem(),
+        config.gradient_checkpointing,
     );
     let gpu_build = cfg!(any(feature = "backend-cuda", feature = "backend-wgpu"));
     if gpu_build && budget.vram_total_bytes > 0 {

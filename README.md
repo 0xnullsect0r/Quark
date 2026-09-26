@@ -138,7 +138,7 @@ The backend is chosen at build time: CUDA if `backend-cuda` is enabled, otherwis
 
 | Backend | Hardware | Feature flag | Notes |
 |---------|----------|--------------|-------|
-| **CPU** (ndarray) | Any x86-64 / ARM64 | `backend-cpu` | Default; AVX2 auto-detected |
+| **CPU** (Burn Flex) | Any x86-64 / ARM64 | `backend-cpu` | Default; SIMD + multithreaded |
 | **WGPU / Metal** | Apple Silicon, AMD/Intel GPU | `backend-wgpu` | Recommended for macOS |
 | **CUDA** | NVIDIA GPU (sm_70+) | `backend-cuda` | Best performance on NVIDIA |
 
@@ -148,7 +148,7 @@ Pre-built releases ship the `backend-cpu` binary. Build from source with `backen
 
 ## Memory Tiering
 
-> **Status: planned, not implemented.** The model, gradients and optimizer state must currently fit in RAM (CPU builds) or VRAM (GPU builds). The `memory/` module holds the budget detection used for the Training tab's estimate. Layer streaming, optimizer offload, quantized storage and gradient checkpointing are not wired into training yet. Burn 0.16's built-in checkpointing panics on softmax backward passes, so enabling it is blocked on a Burn upgrade.
+> **Status: planned, not implemented.** The model, gradients and optimizer state must currently fit in RAM (CPU builds) or VRAM (GPU builds). The `memory/` module holds the budget detection used for the Training tab's estimate. Layer streaming, optimizer offload and quantized storage are not wired into training yet. Gradient checkpointing is available (Training tab, on by default).
 
 ---
 

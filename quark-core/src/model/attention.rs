@@ -286,11 +286,11 @@ impl<B: Backend> GroupedQueryAttention<B> {
 
 #[cfg(test)]
 mod tests {
-    use burn_ndarray::NdArray;
+    use crate::backend::InferBackend as TestBackend;
 
     use super::*;
 
-    type B = NdArray<f32>;
+    type B = TestBackend;
 
     #[test]
     fn expand_kv_repeats_each_head() {

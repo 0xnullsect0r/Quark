@@ -41,7 +41,8 @@ impl ConfigPanel {
                                 fmt_bytes(cfg.training_memory_bytes(
                                     1,
                                     cfg.max_position_embeddings,
-                                    4
+                                    4,
+                                    true
                                 )),
                             ),
                             None => preset_name(preset).to_owned(),

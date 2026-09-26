@@ -1,7 +1,7 @@
 //! Global L2 gradient-norm clipping for Burn gradients.
 
 use burn::{
-    module::{AutodiffModule, ModuleVisitor, ParamId},
+    module::{AutodiffModule, ModuleVisitor, Param},
     optim::GradientsParams,
     tensor::{ElementConversion, Tensor, backend::AutodiffBackend},
 };
@@ -13,7 +13,8 @@ struct GradSqNorm<'a, B: AutodiffBackend> {
 }
 
 impl<B: AutodiffBackend> ModuleVisitor<B> for GradSqNorm<'_, B> {
-    fn visit_float<const D: usize>(&mut self, id: ParamId, _tensor: &Tensor<B, D>) {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let id = param.id;
         if let Some(g) = self.grads.get::<B::InnerBackend, D>(id) {
             let sq = g.powf_scalar(2.0).sum();
             self.sq_sum = Some(match self.sq_sum.take() {
@@ -31,7 +32,8 @@ struct GradScale<'a> {
 }
 
 impl<B: AutodiffBackend> ModuleVisitor<B> for GradScale<'_> {
-    fn visit_float<const D: usize>(&mut self, id: ParamId, _tensor: &Tensor<B, D>) {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let id = param.id;
         if let Some(g) = self.grads.remove::<B::InnerBackend, D>(id) {
             self.grads.register::<B::InnerBackend, D>(id, g * self.scale);
         }

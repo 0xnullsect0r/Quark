@@ -45,7 +45,7 @@ fn id_tensor<B: Backend>(ids: &[u32], device: &B::Device) -> Tensor<B, 2, Int> {
 /// Logit vector for the last position of `[1, seq, vocab]` logits.
 fn last_position<B: Backend>(logits: Tensor<B, 3>) -> Option<Vec<f32>> {
     let seq_len = logits.dims()[1];
-    let last: Tensor<B, 2> = logits.narrow(1, seq_len - 1, 1).squeeze::<2>(1);
+    let last: Tensor<B, 2> = logits.narrow(1, seq_len - 1, 1).squeeze_dim::<2>(1);
     last.into_data().into_vec::<f32>().ok()
 }
 
@@ -135,7 +135,7 @@ pub fn generate_streaming<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use burn_ndarray::NdArray;
+    use crate::backend::InferBackend as TestBackend;
 
     use super::*;
     use crate::model::{config::QuarkConfig, QuarkModel};
@@ -159,7 +159,7 @@ mod tests {
             tie_word_embeddings: false,
         };
         let device = Default::default();
-        let model = QuarkModel::<NdArray<f32>>::new(&cfg, &device);
+        let model = QuarkModel::<TestBackend>::new(&cfg, &device);
         let config = GenerateConfig {
             prompt_ids: (10..22).collect(), // longer than the window
             sampling: SamplingParams {

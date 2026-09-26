@@ -128,8 +128,15 @@ impl QuarkConfig {
 
     /// Rough peak memory for training, in bytes: weights, gradients (plus an
     /// accumulation copy) and AdamW moments, plus activations kept for the
-    /// backward pass. `bytes_per_elem` is 4 for f32, 2 for bf16.
-    pub fn training_memory_bytes(&self, batch: usize, seq: usize, bytes_per_elem: u64) -> u64 {
+    /// backward pass. `bytes_per_elem` is 4 for f32, 2 for bf16. Balanced
+    /// gradient checkpointing roughly halves the activation term.
+    pub fn training_memory_bytes(
+        &self,
+        batch: usize,
+        seq: usize,
+        bytes_per_elem: u64,
+        checkpointing: bool,
+    ) -> u64 {
         let state = self.param_count() * 5 * bytes_per_elem;
 
         let tokens = (batch * seq) as u64;
@@ -143,7 +150,8 @@ impl QuarkConfig {
             })
             .sum();
         let logits = tokens * self.vocab_size as u64 * 3;
-        state + (per_layer + logits) * bytes_per_elem
+        let activations = (per_layer + logits) * bytes_per_elem;
+        state + if checkpointing { activations / 2 } else { activations }
     }
 
     pub fn quark_1b() -> Self {

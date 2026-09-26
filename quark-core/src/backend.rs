@@ -4,40 +4,32 @@
 //! `InferBackend` (inference-only, no autodiff overhead) instead of
 //! naming specific Burn backends directly.
 //!
-//! Priority: CUDA > WGPU > NdArray (CPU-only fallback).
+//! Priority: CUDA > WGPU > Flex (pure-Rust CPU fallback).
 //!
 //! Build combinations:
 //!   NVIDIA  →  `--features "backend-cpu backend-cuda"`
-//!   AMD     →  `--features "backend-cpu backend-wgpu"`
+//!   AMD / Intel / Apple  →  `--features "backend-cpu backend-wgpu"`
 //!   CPU     →  `--features backend-cpu`
 
-// ── Training backend (AutodiffBackend required for gradients) ─────────────────
+use burn::backend::Autodiff;
+
+// ── Compute backend (f32) ─────────────────────────────────────────────────────
 
 #[cfg(feature = "backend-cuda")]
-pub type TrainBackend = burn_autodiff::Autodiff<burn_cuda::Cuda<f32>>;
+pub type ComputeBackend = burn::backend::Cuda<f32>;
 
 #[cfg(all(feature = "backend-wgpu", not(feature = "backend-cuda")))]
-pub type TrainBackend = burn_autodiff::Autodiff<burn_wgpu::Wgpu>;
+pub type ComputeBackend = burn::backend::Wgpu;
 
 #[cfg(not(any(feature = "backend-cuda", feature = "backend-wgpu")))]
-pub type TrainBackend = burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>;
+pub type ComputeBackend = burn::backend::Flex;
 
-// ── Inference backend (no autodiff, lower memory overhead) ───────────────────
+/// Training backend (autodiff over [`ComputeBackend`]).
+pub type TrainBackend = Autodiff<ComputeBackend>;
 
-#[cfg(feature = "backend-cuda")]
-pub type InferBackend = burn_cuda::Cuda<f32>;
-
-#[cfg(all(feature = "backend-wgpu", not(feature = "backend-cuda")))]
-pub type InferBackend = burn_wgpu::Wgpu;
-
-#[cfg(not(any(feature = "backend-cuda", feature = "backend-wgpu")))]
-pub type InferBackend = burn_ndarray::NdArray<f32>;
-
-// ── Compute backends (what autodiff wraps) ───────────────────────────────────
-
-/// f32 compute backend underlying [`TrainBackend`].
-pub type ComputeBackend = <TrainBackend as burn::tensor::backend::AutodiffBackend>::InnerBackend;
+/// Inference backend (no autodiff overhead).
+pub type InferBackend = ComputeBackend;
 
 /// bf16 compute backend, used for `Precision::Bf16` training (CUDA only).
 #[cfg(feature = "backend-cuda")]
-pub type ComputeBackendBf16 = burn_cuda::Cuda<half::bf16>;
+pub type ComputeBackendBf16 = burn::backend::Cuda<half::bf16>;

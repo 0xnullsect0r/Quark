@@ -103,11 +103,11 @@ Each panel is a struct implementing a `ui(&mut self, ui: &mut egui::Ui)` method.
 ### Backend feature flags
 
 The Burn backend is selected at compile time via Cargo features:
-- `backend-cpu` → `burn-ndarray`
-- `backend-wgpu` → `burn-wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
-- `backend-cuda` → `burn-cuda` (NVIDIA sm_70+)
+- `backend-cpu` → Burn's `Flex` (pure-Rust CPU; replaced ndarray in the 0.21 upgrade)
+- `backend-wgpu` → `burn/wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
+- `backend-cuda` → `burn/cuda` (NVIDIA sm_70+)
 
-The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise NdArray. CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners).
+The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise Flex. Burn is 0.21; code only names backends through `backend.rs` aliases (tests use `InferBackend`). CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners).
 
 ### Data directories
 
@@ -129,7 +129,7 @@ Subdirectories: `checkpoints/`, `datasets/`, `the-pile/`, `settings.toml`.
 
 - `DecoderBlock` holds either a dense FFN or a `MoeBlock` (as `Option`s), never both. MoE uses sparse top-k dispatch and returns a Switch-style load-balancing loss via `forward_with_aux`.
 - Training (`training/trainer.rs`) supports grad accumulation, global-norm clipping (`training/grad_clip.rs`), held-out eval (`TrainingEvent::Eval`), and resume from the latest `checkpoint-N.bin`. It writes `config.json` and `tokenizer.json` next to the checkpoints; `QuarkConfig::for_checkpoint` reads the config back.
-- `start_training` runs `dispatch_training`, which picks the autodiff backend for `TrainerConfig::precision` (`Bf16` only in CUDA builds) and runs the generic `run_training_loop::<AB>`. Panics in the training thread become `TrainingEvent::Error("Training crashed: …")`. Burn 0.16's `BalancedCheckpointing` panics on softmax backward passes, so gradient checkpointing is not offered.
+- `start_training` runs `dispatch_training`, which picks the autodiff backend for `TrainerConfig::precision` (`Bf16` only in CUDA builds) and runs the generic `run_training_loop::<AB>`. It also wraps the backend in `BalancedCheckpointing` when `gradient_checkpointing` is on (the default). Panics in the training thread become `TrainingEvent::Error("Training crashed: …")`. Burn 0.21 has no autodiff `topk`, so the MoE mask uses `sort_descending`.
 - `QuarkConfig::param_count()` is exact (a test checks it against `num_params()`). `training_memory_bytes` and `trainer::estimate_memory` give the rough memory estimate that the GUI and trainer show.
 - `chat.rs` holds the one chat template (`render_prompt`, `render_training_segments`, `STOP_STRINGS`). quark-chat, quark-code, the GUI chat and SFT data all use it, and `SamplingParams::stop_strings` ends generation at the assistant's closing tag.
 - `TrainingMode::FineTune { base_checkpoint }` runs chat SFT (`data/sft.rs`: JSONL `{"messages": [...]}`, loss only on assistant tokens via byte-range masks from `QuarkTokenizer::encode_with_offsets`). It takes the architecture and tokenizer from the base folder and writes to `<base>/finetune/`.
