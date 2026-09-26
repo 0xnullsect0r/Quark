@@ -31,9 +31,9 @@ use crate::training::lr_schedule::CosineSchedule;
 use crate::training::metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
 
 /// Weight of the MoE load-balancing loss added to the LM loss.
-const AUX_LOSS_COEF: f32 = 0.01;
+pub(crate) const AUX_LOSS_COEF: f32 = 0.01;
 /// Maximum number of held-out batches used per evaluation.
-const MAX_EVAL_BATCHES: usize = 8;
+pub(crate) const MAX_EVAL_BATCHES: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -78,6 +78,25 @@ pub struct TrainerConfig {
     /// Pretraining on raw text, or chat fine-tuning of an existing checkpoint.
     #[serde(default)]
     pub mode: TrainingMode,
+    /// Stream the model layer by layer through RAM/disk (see
+    /// `training::streamed`). `Auto` does so when the model doesn't fit.
+    #[serde(default)]
+    pub offload: OffloadMode,
+    /// Optimizer used when offloading (the in-memory trainer uses AdamW).
+    #[serde(default)]
+    pub optimizer: crate::training::optim::OptimizerKind,
+}
+
+/// Whether to train in memory or streamed through RAM/disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum OffloadMode {
+    /// Stream when the in-memory estimate doesn't fit.
+    #[default]
+    Auto,
+    /// Always train in memory.
+    Off,
+    /// Always stream.
+    On,
 }
 
 /// What kind of training run this is.
@@ -144,6 +163,8 @@ impl Default for TrainerConfig {
             tier: TierConfig::default(),
             resume: true,
             mode: TrainingMode::Pretrain,
+            offload: OffloadMode::Auto,
+            optimizer: crate::training::optim::OptimizerKind::AdamW,
         }
     }
 }
@@ -281,7 +302,12 @@ fn run_training_loop<AB: AutodiffBackend>(
         };
         model_config = base_config;
         let base_dir = base_checkpoint.parent().map(Path::to_path_buf).unwrap_or_default();
-        tokenizer_path = Some(base_dir.join("tokenizer.json"));
+        let own_tokenizer = base_checkpoint.join("tokenizer.json"); // sharded checkpoints
+        tokenizer_path = Some(if own_tokenizer.exists() {
+            own_tokenizer
+        } else {
+            base_dir.join("tokenizer.json")
+        });
         if same_dir(&config.output_dir, &base_dir) {
             config.output_dir = base_dir.join("finetune");
         }
@@ -390,6 +416,47 @@ fn run_training_loop<AB: AutodiffBackend>(
         eval_batches.len()
     );
 
+    let estimate = estimate_memory(&model_config, &config, &HardwareBudget::detect());
+    log!(
+        "   {:.1}M params, ≈{} needed to train in memory ({} {} available)",
+        model_config.param_count() as f64 / 1e6,
+        fmt_gb(estimate.needed_bytes),
+        fmt_gb(estimate.available_bytes),
+        estimate.device
+    );
+    let streamed = match config.offload {
+        OffloadMode::On => true,
+        OffloadMode::Off => false,
+        OffloadMode::Auto => !estimate.fits(),
+    };
+    if streamed {
+        log!("▶  Streaming the model layer by layer through RAM and disk (offload)");
+        let run = crate::training::streamed::run_streamed::<AB>(
+            model_config,
+            &config,
+            batches,
+            eval_batches,
+            &tx,
+            &stop,
+        );
+        match run {
+            Ok(()) => {
+                let _ = tx.send(TrainingEvent::Done);
+            }
+            Err(e) => {
+                let _ = tx.send(TrainingEvent::Error(format!("{e:#}")));
+            }
+        }
+        return;
+    }
+    if !estimate.fits() {
+        log!(
+            "⚠  This probably won't fit in {} — if training crashes or swaps, use a smaller \
+             preset, batch size or context length, or turn on offloading",
+            estimate.device
+        );
+    }
+
     // ── Initialise model ──────────────────────────────────────────────────────
     phase!("Initialising model…");
 
@@ -397,22 +464,6 @@ fn run_training_loop<AB: AutodiffBackend>(
     <AB as Backend>::seed(&device, config.seed);
     let mut model = QuarkModel::<AB>::new(&model_config, &device);
     log!("   Model initialised on {:?}", device);
-
-    let estimate = estimate_memory(&model_config, &config, &HardwareBudget::detect());
-    log!(
-        "   {:.1}M params, ≈{} needed for training ({} {} available)",
-        model_config.param_count() as f64 / 1e6,
-        fmt_gb(estimate.needed_bytes),
-        fmt_gb(estimate.available_bytes),
-        estimate.device
-    );
-    if !estimate.fits() {
-        log!(
-            "⚠  This probably won't fit in {} — if training crashes or swaps, use a smaller \
-             preset, batch size or context length",
-            estimate.device
-        );
-    }
 
     let mut step = 0u64;
     if let Some((path, saved_step)) = resume_from {
@@ -429,12 +480,21 @@ fn run_training_loop<AB: AutodiffBackend>(
         }
     }
     if let (0, TrainingMode::FineTune { base_checkpoint }) = (step, &config.mode) {
-        match CheckpointRecorder::new().load(base_checkpoint.with_extension(""), &device) {
-            Ok(record) => {
-                model = model.load_record(record);
+        let loaded = if crate::checkpoint::sharded::is_sharded(base_checkpoint) {
+            crate::checkpoint::sharded::load_sharded::<AB>(base_checkpoint, &device)
+                .map(|(_, m)| m)
+        } else {
+            CheckpointRecorder::new()
+                .load(base_checkpoint.with_extension(""), &device)
+                .map(|record| model.clone().load_record(record))
+                .map_err(anyhow::Error::from)
+        };
+        match loaded {
+            Ok(m) => {
+                model = m;
                 log!("   Loaded base weights from {}", base_checkpoint.display());
             }
-            Err(e) => bail!("Could not load base checkpoint {}: {e}", base_checkpoint.display()),
+            Err(e) => bail!("Could not load base checkpoint {}: {e:#}", base_checkpoint.display()),
         }
     }
     if step >= config.max_steps {
@@ -534,6 +594,7 @@ fn run_training_loop<AB: AutodiffBackend>(
             vram_used_bytes,
             ram_used_bytes,
             disk_used_bytes: 0,
+            disk_io_bytes: 0,
             epoch,
             eta_secs,
         }));
@@ -723,12 +784,12 @@ pub fn estimate_memory(
     }
 }
 
-fn fmt_gb(bytes: u64) -> String {
+pub(crate) fn fmt_gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
 }
 
 /// Resident memory of this process.
-fn process_rss(sys: &mut sysinfo::System) -> Option<u64> {
+pub(crate) fn process_rss(sys: &mut sysinfo::System) -> Option<u64> {
     let pid = sysinfo::get_current_pid().ok()?;
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[pid]),
@@ -741,7 +802,7 @@ fn process_rss(sys: &mut sysinfo::System) -> Option<u64> {
 // ── Batch helpers ─────────────────────────────────────────────────────────────
 
 /// Convert a collated batch to `(input_ids, labels, non_pad_tokens)`.
-fn batch_tensors<B: Backend>(
+pub(crate) fn batch_tensors<B: Backend>(
     batch: &DataBatch,
     device: &B::Device,
 ) -> (Tensor<B, 2, Int>, Tensor<B, 2, Int>, u64) {

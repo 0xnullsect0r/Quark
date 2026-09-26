@@ -6,6 +6,8 @@ pub mod lora;
 pub mod loss;
 pub mod lr_schedule;
 pub mod metrics;
+pub mod optim;
+pub mod streamed;
 pub mod trainer;
 
 pub use loss::cross_entropy_loss;

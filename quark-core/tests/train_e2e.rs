@@ -13,7 +13,10 @@ use quark_core::{
     training::{
         lr_schedule::CosineSchedule,
         metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics},
-        start_training, TrainerConfig, TrainingMode,
+        optim::OptimizerKind,
+        start_training,
+        trainer::OffloadMode,
+        TrainerConfig, TrainingMode,
     },
 };
 
@@ -215,5 +218,65 @@ fn crash_is_reported_not_hung() {
         }
     };
     assert!(error.starts_with("Training crashed"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn offloaded_training_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("quark-e2e-offload-{}", std::process::id()));
+    let (corpus, tokenizer) = setup(&dir);
+    let out = dir.join("ckpt");
+    let streamed = |max_steps| TrainerConfig {
+        offload: OffloadMode::On,
+        optimizer: OptimizerKind::AdamWCompact,
+        ..trainer_config(&out, max_steps)
+    };
+
+    // ── Streamed pretraining ─────────────────────────────────────────────────
+    let (_h, rx) = start_training(tiny_config(), streamed(20), vec![corpus.clone()], Some(tokenizer.clone()));
+    let run = collect(rx);
+    assert!(run.logs.iter().any(|l| l.contains("layer by layer")), "{:#?}", run.logs);
+    assert_eq!(run.metrics.len(), 20);
+    let first = run.metrics[0].loss;
+    let last = run.metrics[15..].iter().map(|m| m.loss).sum::<f32>() / 5.0;
+    assert!(last < first * 0.8, "offloaded loss did not decrease: {first} → {last}");
+    assert!(!run.evals.is_empty());
+
+    // Sharded checkpoints (only the last two are kept), loadable for inference.
+    let ckpt = out.join("checkpoint-20");
+    assert!(ckpt.join("meta.json").exists() && ckpt.join("optim").exists());
+    assert!(out.join("checkpoint-10").exists() && ckpt.join("tokenizer.json").exists());
+    let cfg = QuarkConfig::for_checkpoint(&ckpt).unwrap();
+    let engine = InferenceEngine::load(&ckpt, &cfg, &ckpt.join("tokenizer.json")).unwrap();
+    let params = SamplingParams { max_new_tokens: 10, ..SamplingParams::default() };
+    assert!(engine.generate("fn add_1(", params).is_ok());
+
+    // ── Resume (optimizer state restored) ────────────────────────────────────
+    let (_h, rx) = start_training(tiny_config(), streamed(25), vec![corpus], Some(tokenizer));
+    let resumed = collect(rx);
+    assert!(resumed.logs.iter().any(|l| l.contains("optimizer state restored")), "{:#?}", resumed.logs);
+    assert_eq!(resumed.metrics.first().unwrap().step, 21);
+    assert!(!out.join("checkpoint-10").exists(), "old checkpoints are pruned");
+
+    // ── Fine-tune from the sharded base: streamed and in memory ──────────────
+    let chat = dir.join("chat.jsonl");
+    let line = serde_json::json!({ "messages": [
+        { "role": "user", "content": "ping" }, { "role": "assistant", "content": "pong" }
+    ]});
+    std::fs::write(&chat, format!("{line}\n").repeat(16)).unwrap();
+    for offload in [OffloadMode::On, OffloadMode::Off] {
+        let ft = TrainerConfig {
+            mode: TrainingMode::FineTune { base_checkpoint: out.join("checkpoint-25") },
+            offload,
+            output_dir: dir.join(format!("ft-{offload:?}")),
+            eval_every_steps: 0,
+            resume: false,
+            ..trainer_config(&out, 5)
+        };
+        let (_h, rx) = start_training(QuarkConfig::quark_1b(), ft, vec![chat.clone()], None);
+        let tuned = collect(rx);
+        assert!(tuned.logs.iter().any(|l| l.contains("Loaded base weights")), "{offload:?}: {:#?}", tuned.logs);
+        assert_eq!(tuned.metrics.len(), 5);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -11,6 +11,9 @@ pub struct TrainingMetrics {
     pub vram_used_bytes: u64,
     pub ram_used_bytes: u64,
     pub disk_used_bytes: u64,
+    /// Bytes read from + written to the offload disk during this step
+    /// (streamed training; 0 in memory).
+    pub disk_io_bytes: u64,
     pub epoch: u32,
     pub eta_secs: u64,
 }
