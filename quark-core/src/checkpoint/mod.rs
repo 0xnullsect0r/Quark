@@ -2,6 +2,7 @@
 
 pub mod hf_import;
 pub mod safetensors;
+pub mod sharded;
 
 pub use safetensors::{load_checkpoint, save_checkpoint, TensorData};
 

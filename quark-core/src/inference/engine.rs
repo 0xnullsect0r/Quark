@@ -35,21 +35,26 @@ unsafe impl Sync for InferenceEngine {}
 impl InferenceEngine {
     /// Load a checkpoint and tokenizer from disk.
     ///
-    /// `checkpoint` must be a `.bin` file produced by the Quark training loop.
+    /// `checkpoint` is a `.bin` file or a sharded `checkpoint-N/` directory
+    /// produced by the Quark training loop.
     /// `tokenizer` must be a `tokenizer.json` produced by Quark tokenizer training.
-    /// `config` is the model architecture; must match the checkpoint.
+    /// `config` is the model architecture; must match the checkpoint (a sharded
+    /// checkpoint's own `config.json` takes precedence).
     pub fn load(checkpoint: &Path, config: &QuarkConfig, tokenizer: &Path) -> Result<Self> {
         let device = Device::default();
 
-        // Init model skeleton
-        let model = QuarkModel::<InferBackend>::new(config, &device);
-
-        // Load checkpoint — The recorder adds the extension to find the file
-        let stem = checkpoint.with_extension("");
-        let record = CheckpointRecorder::new()
-            .load(stem, &device)
-            .with_context(|| format!("Failed to load checkpoint: {}", checkpoint.display()))?;
-        let model = model.load_record(record);
+        let (config, model) = if crate::checkpoint::sharded::is_sharded(checkpoint) {
+            crate::checkpoint::sharded::load_sharded::<InferBackend>(checkpoint, &device)
+                .with_context(|| format!("Failed to load checkpoint: {}", checkpoint.display()))?
+        } else {
+            // Init model skeleton, then load — the recorder adds the extension
+            let model = QuarkModel::<InferBackend>::new(config, &device);
+            let stem = checkpoint.with_extension("");
+            let record = CheckpointRecorder::new()
+                .load(stem, &device)
+                .with_context(|| format!("Failed to load checkpoint: {}", checkpoint.display()))?;
+            (config.clone(), model.load_record(record))
+        };
 
         let tokenizer = QuarkTokenizer::load(tokenizer)
             .with_context(|| format!("Failed to load tokenizer: {}", tokenizer.display()))?;

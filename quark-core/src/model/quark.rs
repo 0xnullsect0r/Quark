@@ -8,7 +8,12 @@ use burn::{
 
 use crate::inference::cache::KvCache;
 
-use super::{block::DecoderBlock, config::QuarkConfig, norm::RmsNorm};
+use super::{
+    block::DecoderBlock,
+    config::QuarkConfig,
+    norm::RmsNorm,
+    stages::{causal_mask, EmbedStage, HeadStage},
+};
 
 /// The full Quark transformer model.
 ///
@@ -39,6 +44,25 @@ impl<B: Backend> QuarkModel<B> {
             lm_head: LinearConfig::new(cfg.hidden_size, cfg.vocab_size)
                 .with_bias(false)
                 .init(device),
+        }
+    }
+
+    /// Split into stages (see [`super::stages`]).
+    pub fn into_stages(self) -> (EmbedStage<B>, Vec<DecoderBlock<B>>, HeadStage<B>) {
+        (
+            EmbedStage { embed_tokens: self.embed_tokens },
+            self.layers,
+            HeadStage { norm: self.norm, lm_head: self.lm_head },
+        )
+    }
+
+    /// Reassemble a model from its stages.
+    pub fn from_stages(embed: EmbedStage<B>, layers: Vec<DecoderBlock<B>>, head: HeadStage<B>) -> Self {
+        Self {
+            embed_tokens: embed.embed_tokens,
+            layers,
+            norm: head.norm,
+            lm_head: head.lm_head,
         }
     }
 
@@ -83,15 +107,7 @@ impl<B: Backend> QuarkModel<B> {
         // Token embeddings: [batch, seq, hidden]
         let mut x = self.embed_tokens.forward(input_ids);
 
-        // Build an additive causal mask [1, 1, seq, seq]:
-        //   0.0   for positions that can attend (lower triangle + diagonal)
-        //   -inf  for future positions (upper triangle)
-        let mask_flat: Vec<f32> = (0..seq)
-            .flat_map(|i| (0..seq).map(move |j| if j <= i { 0.0f32 } else { f32::NEG_INFINITY }))
-            .collect();
-        let mask: Tensor<B, 4> =
-            Tensor::<B, 1>::from_data(TensorData::new(mask_flat, vec![seq * seq]), &device)
-                .reshape([1_usize, 1, seq, seq]);
+        let mask = causal_mask::<B>(seq, &device);
 
         // Forward through all decoder layers
         let mut aux_sum: Option<Tensor<B, 1>> = None;

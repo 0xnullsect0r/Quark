@@ -14,7 +14,7 @@ backend-cuda = ["burn/cuda", "nvml-wrapper"]
 backend-wgpu = ["burn/wgpu"]
 
 [dependencies]
-burn          = { workspace = true, features = ["autodiff", "std"] }
+burn          = { workspace = true, features = ["autodiff", "std", "store"] }
 
 safetensors   = { workspace = true }
 serde         = { workspace = true }
