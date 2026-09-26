@@ -12,7 +12,7 @@ use super::{
     block::DecoderBlock,
     config::QuarkConfig,
     norm::RmsNorm,
-    stages::{causal_mask, EmbedStage, HeadStage},
+    stages::{EmbedStage, HeadStage},
 };
 
 /// The full Quark transformer model.
@@ -107,13 +107,12 @@ impl<B: Backend> QuarkModel<B> {
         // Token embeddings: [batch, seq, hidden]
         let mut x = self.embed_tokens.forward(input_ids);
 
-        let mask = causal_mask::<B>(seq, &device);
 
         // Forward through all decoder layers
         let mut aux_sum: Option<Tensor<B, 1>> = None;
         let mut moe_layers = 0usize;
         for layer in &self.layers {
-            let (out, aux) = layer.forward_with_aux(x, Some(mask.clone()));
+            let (out, aux) = layer.forward_with_aux(x, true);
             x = out;
             if let Some(aux) = aux {
                 moe_layers += 1;

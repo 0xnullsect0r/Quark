@@ -27,7 +27,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use burn::{
     module::Module,
-    nn::loss::CrossEntropyLossConfig,
     optim::GradientsParams,
     store::ModuleSnapshot,
     tensor::{
@@ -36,6 +35,7 @@ use burn::{
     },
 };
 
+use crate::backend::ComputeBackend;
 use crate::checkpoint::sharded::{self, write_meta};
 use crate::data::batch::DataBatch;
 use crate::memory::stage::{load_stage, module_to_stage};
@@ -43,10 +43,11 @@ use crate::memory::store::{StageTensors, TensorStore};
 use crate::model::{
     block::DecoderBlock,
     config::QuarkConfig,
-    stages::{causal_mask, layer_stage, stage_names, EmbedStage, HeadStage, EMBED_STAGE, HEAD_STAGE},
+    stages::{layer_stage, stage_names, EmbedStage, HeadStage, EMBED_STAGE, HEAD_STAGE},
 };
 use crate::tokenizer::bpe::PAD_ID;
 use crate::training::adamw::AdamWConfig;
+use crate::training::loss::masked_cross_entropy;
 use crate::training::optim::{self, OptimizerKind, ParamUpdate};
 use crate::training::trainer::{batch_tensors, AUX_LOSS_COEF};
 
@@ -58,6 +59,23 @@ fn optim_stage(stage: &str) -> String {
 
 fn act_key(layer: usize, micro: usize) -> String {
     format!("act.{layer:04}.{micro:04}")
+}
+
+/// Default logit elements per head chunk (~256 MB in f32).
+const DEFAULT_HEAD_CHUNK_ELEMS: usize = 64 << 20;
+
+/// `(start, len)` ranges covering `0..total` in steps of `size`.
+fn chunks(total: usize, size: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..total).step_by(size.max(1)).map(move |start| (start, size.min(total - start)))
+}
+
+/// Non-padding labels at positions `start..start + len` of `batch`.
+fn target_count(batch: &DataBatch, start: usize, len: usize) -> u64 {
+    batch
+        .labels
+        .iter()
+        .map(|row| row.iter().skip(start).take(len).filter(|&&t| t != PAD_ID).count() as u64)
+        .sum()
 }
 
 /// Result of one optimizer step.
@@ -114,6 +132,8 @@ pub struct StreamedTrainer<AB: AutodiffBackend> {
     optim: StreamedOptim,
     /// Optimizer steps taken so far.
     pub step: u64,
+    /// Logit elements (positions × batch × vocab) per head chunk.
+    head_chunk_elems: usize,
     infer: Skeletons<Inner<AB>>,
     train: Skeletons<AB>,
 }
@@ -132,9 +152,22 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
     ) -> Result<Self> {
         let infer = Skeletons::new(&cfg, &device);
         let train = Skeletons::new(&cfg, &device);
-        let trainer = Self { cfg, store, acts, device, optim, step, infer, train };
+        let head_chunk_elems = DEFAULT_HEAD_CHUNK_ELEMS;
+        let trainer = Self { cfg, store, acts, device, optim, step, head_chunk_elems, infer, train };
         trainer.init_missing_stages()?;
         Ok(trainer)
+    }
+
+    /// Limit the head's logits to about `elems` values per chunk (mainly for
+    /// tests; the default keeps a chunk around 256 MB in f32).
+    pub fn set_head_chunk_elems(&mut self, elems: usize) {
+        self.head_chunk_elems = elems.max(1);
+    }
+
+    /// Sequence positions per head chunk for `batch`.
+    fn head_chunk(&self, batch: &DataBatch) -> usize {
+        let rows = batch.input_ids.len().max(1);
+        (self.head_chunk_elems / (rows * self.cfg.vocab_size).max(1)).max(1)
     }
 
     pub fn config(&self) -> &QuarkConfig {
@@ -181,14 +214,21 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
         }
         self.forward_to_acts(batches)?;
         load_stage(&mut self.infer.head, &*self.store.get(HEAD_STAGE)?)?;
-        let ce = CrossEntropyLossConfig::new().with_pad_tokens(Some(vec![PAD_ID as usize])).init(&self.device);
         let mut total = 0.0;
         for (mb, batch) in batches.iter().enumerate() {
-            let (_, labels, _) = batch_tensors::<Inner<AB>>(batch, &self.device);
-            let x = self.get_act(&act_key(self.cfg.num_hidden_layers, mb))?;
-            let logits = self.infer.head.forward(x);
-            let [b, s, v] = logits.dims();
-            total += ce.forward(logits.reshape([b * s, v]), labels.reshape([b * s])).into_scalar().elem::<f32>();
+            let (_, labels, n_tok) = batch_tensors::<Inner<AB>>(batch, &self.device);
+            let x_all = self.get_act(&act_key(self.cfg.num_hidden_layers, mb))?;
+            for (start, len) in chunks(x_all.dims()[1], self.head_chunk(batch)) {
+                let n_chunk = target_count(batch, start, len);
+                if n_chunk == 0 {
+                    continue;
+                }
+                let logits = self.infer.head.forward(x_all.clone().narrow(1, start, len));
+                let [b, s, v] = logits.dims();
+                let chunk_labels = labels.clone().narrow(1, start, len).reshape([b * s]);
+                let loss = masked_cross_entropy(logits.reshape([b * s, v]), chunk_labels, PAD_ID).into_scalar().elem::<f32>();
+                total += loss * n_chunk as f32 / n_tok.max(1) as f32;
+            }
         }
         self.clear_acts(batches.len())?;
         Ok(total / batches.len() as f32)
@@ -213,8 +253,7 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
             load_stage(layer, &data)?;
             for (mb, _) in micro.iter().enumerate() {
                 let x = self.get_act(&act_key(i, mb))?;
-                let mask = causal_mask::<Inner<AB>>(x.dims()[1], &self.device);
-                let y = self.infer.layer(&cfg, i).forward(x, Some(mask));
+                let y = self.infer.layer(&cfg, i).forward(x, true);
                 self.put_act(&act_key(i + 1, mb), y)?;
             }
         }
@@ -254,7 +293,6 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
         let mut tokens = 0u64;
 
         // ── 2+3. head: loss, backward, update ────────────────────────────────
-        let ce = CrossEntropyLossConfig::new().with_pad_tokens(Some(vec![PAD_ID as usize])).init(&self.device);
         load_stage(&mut self.train.head, &*self.store.get(HEAD_STAGE)?)?;
         self.store.prefetch(&optim_stage(HEAD_STAGE));
         if n_layers > 0 {
@@ -265,14 +303,30 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
         for (mb, batch) in micro.iter().enumerate() {
             let (_, labels, n_tok) = batch_tensors::<AB>(batch, &self.device);
             tokens += n_tok;
-            let x = Tensor::<AB, 3>::from_inner(self.get_act(&act_key(n_layers, mb))?).require_grad();
-            let logits = self.train.head.forward(x.clone());
-            let [b, s, v] = logits.dims();
-            let loss = ce.forward(logits.reshape([b * s, v]), labels.reshape([b * s]));
-            loss_sum += loss.clone().into_scalar().elem::<f32>();
-            let grads = loss.div_scalar(n_micro as f32).backward();
-            upstream.push(x.grad(&grads).context("no gradient for head input")?);
-            acc.add(&self.train.head, grads);
+            let x_all = self.get_act(&act_key(n_layers, mb))?;
+            let [_, seq, _] = x_all.dims();
+            // The head runs on chunks of positions so the full [tokens × vocab]
+            // logits never exist at once. Each chunk's mean loss is weighted
+            // by its share of the micro-batch's real tokens.
+            let mut grads_in = Vec::new();
+            for (start, len) in chunks(seq, self.head_chunk(batch)) {
+                let n_chunk = target_count(batch, start, len);
+                if n_chunk == 0 {
+                    grads_in.push(Tensor::zeros([x_all.dims()[0], len, self.cfg.hidden_size], &self.device));
+                    continue;
+                }
+                let x = Tensor::<AB, 3>::from_inner(x_all.clone().narrow(1, start, len)).require_grad();
+                let logits = self.train.head.forward(x.clone());
+                let [b, s, v] = logits.dims();
+                let chunk_labels = labels.clone().narrow(1, start, len).reshape([b * s]);
+                let weight = n_chunk as f32 / n_tok.max(1) as f32;
+                let loss = masked_cross_entropy(logits.reshape([b * s, v]), chunk_labels, PAD_ID).mul_scalar(weight);
+                loss_sum += loss.clone().into_scalar().elem::<f32>();
+                let grads = loss.div_scalar(n_micro as f32).backward();
+                grads_in.push(x.grad(&grads).context("no gradient for head input")?);
+                acc.add(&self.train.head, grads);
+            }
+            upstream.push(Tensor::cat(grads_in, 1));
         }
         sq_norm += self.apply_update(HEAD_STAGE, acc, stage_clip, lr)?;
 
@@ -289,9 +343,8 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
             let mut next_upstream = Vec::with_capacity(n_micro);
             for (mb, g_out) in upstream.into_iter().enumerate() {
                 let x = Tensor::<AB, 3>::from_inner(self.get_act(&act_key(i, mb))?).require_grad();
-                let mask = causal_mask::<AB>(x.dims()[1], &self.device);
                 let layer = self.train.layer(&cfg, i);
-                let (y, aux) = layer.forward_with_aux(x.clone(), Some(mask));
+                let (y, aux) = layer.forward_with_aux(x.clone(), true);
                 let mut objective = (y * Tensor::from_inner(g_out)).sum();
                 if let Some(aux) = aux {
                     objective = objective + aux.mul_scalar(AUX_LOSS_COEF / (n_moe * n_micro) as f32);
@@ -348,11 +401,16 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
             };
             let shape = data.shape.to_vec();
             let n: usize = shape.iter().product();
-            let param = Tensor::<Inner<AB>, 1>::from_data(
-                TensorData::new(data.clone().convert::<f32>().to_vec::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?, [n]),
-                &self.device,
-            );
-            let grad = if scale < 1.0 { grad.clone().mul_scalar(scale) } else { grad.clone() };
+            // The optimizer always runs in f32 (on the f32 compute backend), even
+            // when the model computes in bf16.
+            let f32_device: Device<ComputeBackend> = Default::default();
+            let to_f32 = |d: TensorData| -> Result<Tensor<ComputeBackend, 1>> {
+                let v = d.convert::<f32>().to_vec::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                Ok(Tensor::from_data(TensorData::new(v, [n]), &f32_device))
+            };
+            let param = to_f32(data.clone())?;
+            let grad = to_f32(grad.clone().into_data())?;
+            let grad = if scale < 1.0 { grad.mul_scalar(scale) } else { grad };
             let update = ParamUpdate { name, shape: &shape, param, grad };
             let updated = optim::update(self.optim.kind, &self.optim.hyper, lr, self.step, update, &state, &mut new_state);
             let host = updated.into_data().convert::<f32>();
@@ -717,14 +775,13 @@ mod tests {
     /// One in-memory step (full autodiff + Burn AdamW, no clipping) for reference.
     fn reference_step(model: QuarkModel<AB>, batches: &[DataBatch], hyper: &AdamWConfig, lr: f64) -> (QuarkModel<AB>, f32) {
         let device = Default::default();
-        let ce = CrossEntropyLossConfig::new().with_pad_tokens(Some(vec![PAD_ID as usize])).init(&device);
         let mut accumulator = GradientsAccumulator::new();
         let mut loss_sum = 0.0;
         for batch in batches {
             let (ids, labels, _) = batch_tensors::<AB>(batch, &device);
             let (logits, aux) = model.forward_with_aux(ids);
             let [b, s, v] = logits.dims();
-            let loss = ce.forward(logits.reshape([b * s, v]), labels.reshape([b * s]));
+            let loss = masked_cross_entropy(logits.reshape([b * s, v]), labels.reshape([b * s]), PAD_ID);
             loss_sum += loss.clone().into_scalar().elem::<f32>();
             let total = loss + aux.unwrap().mul_scalar(AUX_LOSS_COEF);
             let grads = GradientsParams::from_grads(total.div_scalar(batches.len() as f32).backward(), &model);
@@ -773,6 +830,7 @@ mod tests {
         StreamedTrainer::<AB>::restore_into(&store, &init, &cfg, true).unwrap();
         let optim = StreamedOptim { kind: OptimizerKind::AdamW, hyper, max_grad_norm: 0.0 };
         let mut trainer = StreamedTrainer::<AB>::new(cfg.clone(), store, acts, device, optim, 0).unwrap();
+        trainer.set_head_chunk_elems(2 * 3 * cfg.vocab_size); // 3 positions per chunk
         let stats = trainer.train_step(&batches, lr).unwrap();
         assert!((stats.loss - ref_loss).abs() < 1e-5, "{} vs {ref_loss}", stats.loss);
 
@@ -789,7 +847,9 @@ mod tests {
                 }
             }
         }
-        assert!(worst.0 < 1e-5, "max weight difference {} in {}", worst.0, worst.1);
+        // Adam's first step is ~g/(|g|+eps), which amplifies summation-order
+        // noise in near-zero gradients; a real bug would show up at ~lr.
+        assert!(worst.0 < 0.05 * lr as f32, "max weight difference {} in {}", worst.0, worst.1);
 
         // The saved checkpoint loads as a normal model.
         let ckpt = dir.join("checkpoint-1");

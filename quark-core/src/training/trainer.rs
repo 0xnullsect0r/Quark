@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use burn::{
     module::{AutodiffModule, Module},
-    nn::loss::CrossEntropyLossConfig,
     optim::{GradientsAccumulator, GradientsParams, Optimizer},
     record::Recorder,
     tensor::{
@@ -26,6 +25,7 @@ use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
 use crate::tokenizer::bpe::{PAD_ID, QuarkTokenizer};
 use crate::training::adamw::AdamWConfig;
+use crate::training::loss::masked_cross_entropy;
 use crate::training::grad_clip::clip_grad_norm;
 use crate::training::lr_schedule::CosineSchedule;
 use crate::training::metrics::{MetricsReceiver, MetricsSender, TrainingEvent, TrainingMetrics};
@@ -521,9 +521,6 @@ fn run_training_loop<AB: AutodiffBackend>(
     let mut ram_used_bytes = 0u64;
     let mut vram_used_bytes = 0u64;
     let mut sys = sysinfo::System::new();
-    let ce_loss = CrossEntropyLossConfig::new()
-        .with_pad_tokens(Some(vec![PAD_ID as usize]))
-        .init(&device);
 
     while step < config.max_steps && !stop.load(Ordering::SeqCst) {
         let lr = config.schedule.get_lr(step);
@@ -555,7 +552,7 @@ fn run_training_loop<AB: AutodiffBackend>(
             // ── Forward + backward ────────────────────────────────────────────
             let (logits, aux) = model.forward_with_aux(input_ids); // [batch, seq, vocab]
             let [b, s, v] = logits.dims();
-            let ce = ce_loss.forward(logits.reshape([b * s, v]), label_ids.reshape([b * s]));
+            let ce = masked_cross_entropy(logits.reshape([b * s, v]), label_ids.reshape([b * s]), PAD_ID);
             step_loss += ce.clone().into_scalar().elem::<f32>() / accum_steps as f32;
 
             let loss = match aux {
@@ -842,9 +839,6 @@ fn demo_batch<B: Backend>(
 
 /// Mean cross-entropy over (up to `MAX_EVAL_BATCHES`) held-out batches.
 fn evaluate<B: Backend>(model: &QuarkModel<B>, batches: &[DataBatch], device: &B::Device) -> f32 {
-    let ce_loss = CrossEntropyLossConfig::new()
-        .with_pad_tokens(Some(vec![PAD_ID as usize]))
-        .init(device);
     let used = &batches[..batches.len().min(MAX_EVAL_BATCHES)];
     let total: f32 = used
         .iter()
@@ -852,8 +846,7 @@ fn evaluate<B: Backend>(model: &QuarkModel<B>, batches: &[DataBatch], device: &B
             let (input_ids, label_ids, _) = batch_tensors::<B>(batch, device);
             let logits = model.forward(input_ids);
             let [b, s, v] = logits.dims();
-            ce_loss
-                .forward(logits.reshape([b * s, v]), label_ids.reshape([b * s]))
+            masked_cross_entropy(logits.reshape([b * s, v]), label_ids.reshape([b * s]), PAD_ID)
                 .into_scalar()
                 .elem::<f32>()
         })

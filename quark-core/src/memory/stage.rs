@@ -6,12 +6,16 @@
 //! (a "skeleton"), so one skeleton per layer type is reused for every layer.
 
 use anyhow::Result;
-use burn::{module::Module, tensor::backend::Backend};
+use burn::{
+    module::Module,
+    tensor::{backend::Backend, DType, Element},
+};
 use burn::store::{ModuleSnapshot, TensorSnapshot};
 
 use super::store::StageTensors;
 
-/// Copy every parameter of `module` into host memory.
+/// Copy every parameter of `module` into host memory (float parameters as
+/// f32, whatever precision the module computes in).
 pub fn module_to_stage<B: Backend, M: Module<B>>(module: &M) -> Result<StageTensors> {
     let tensors = module
         .collect(None, None, false)
@@ -20,6 +24,7 @@ pub fn module_to_stage<B: Backend, M: Module<B>>(module: &M) -> Result<StageTens
             let data = snapshot
                 .to_data()
                 .map_err(|e| anyhow::anyhow!("reading {}: {e:?}", snapshot.full_path()))?;
+            let data = if data.dtype.is_float() { data.convert_dtype(DType::F32) } else { data };
             Ok((snapshot.full_path(), data))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -27,14 +32,21 @@ pub fn module_to_stage<B: Backend, M: Module<B>>(module: &M) -> Result<StageTens
 }
 
 /// Overwrite `module`'s parameters with the tensors in `stage`, which must
-/// cover every parameter with matching shapes.
+/// cover every parameter with matching shapes. Float data is cast to the
+/// backend's float type (e.g. bf16).
 pub fn load_stage<B: Backend, M: Module<B>>(module: &mut M, stage: &StageTensors) -> Result<()> {
+    let float = <B::FloatElem as Element>::dtype();
     let snapshots = stage
         .tensors
         .iter()
         .map(|(path, data)| {
             let path_stack = path.split('.').map(str::to_owned).collect();
-            TensorSnapshot::from_data(data.clone(), path_stack, vec![], Default::default())
+            let data = if data.dtype.is_float() && data.dtype != float {
+                data.clone().convert_dtype(float)
+            } else {
+                data.clone()
+            };
+            TensorSnapshot::from_data(data, path_stack, vec![], Default::default())
         })
         .collect();
     let result = module.apply(snapshots, None, None, false);
@@ -81,8 +93,8 @@ mod tests {
             let mut skeleton = DecoderBlock::<B>::new(&cfg(), is_moe, &device);
             load_stage(&mut skeleton, &stage).unwrap();
             let x = Tensor::<B, 3>::random([1, 5, 32], Distribution::Normal(0.0, 1.0), &device);
-            let a: Vec<f32> = source.forward(x.clone(), None).into_data().to_vec().unwrap();
-            let b: Vec<f32> = skeleton.forward(x, None).into_data().to_vec().unwrap();
+            let a: Vec<f32> = source.forward(x.clone(), true).into_data().to_vec().unwrap();
+            let b: Vec<f32> = skeleton.forward(x, true).into_data().to_vec().unwrap();
             assert_eq!(a, b);
         }
     }

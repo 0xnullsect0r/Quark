@@ -38,9 +38,9 @@ impl<B: Backend> DecoderBlock<B> {
     /// Forward pass.
     ///
     /// - `x` shape: `[batch, seq, hidden]`
-    /// - `mask`: optional additive causal mask `[1, 1, seq, seq]`
-    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4>>) -> Tensor<B, 3> {
-        self.forward_with_aux(x, mask).0
+    /// - `causal`: causal self-attention (always true for a decoder)
+    pub fn forward(&self, x: Tensor<B, 3>, causal: bool) -> Tensor<B, 3> {
+        self.forward_with_aux(x, causal).0
     }
 
     /// Incremental forward pass for generation; see
@@ -66,12 +66,12 @@ impl<B: Backend> DecoderBlock<B> {
     pub fn forward_with_aux(
         &self,
         x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4>>,
+        causal: bool,
     ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         // Attention sub-layer with pre-norm and residual
         let residual = x.clone();
         let x = self.input_norm.forward(x);
-        let x = self.attn.forward(x, mask);
+        let x = self.attn.forward(x, causal);
         let x = x + residual;
         self.feed_forward(x)
     }

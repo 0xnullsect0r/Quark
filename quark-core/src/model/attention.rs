@@ -3,7 +3,13 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{activation::softmax, backend::Backend, Tensor, TensorData},
+    tensor::{
+        activation::softmax,
+        backend::Backend,
+        module::attention,
+        ops::AttentionModuleOptions,
+        Tensor, TensorData,
+    },
 };
 
 use super::config::QuarkConfig;
@@ -118,6 +124,14 @@ fn expand_kv<B: Backend>(
     Tensor::cat(heads, 1)
 }
 
+/// How attention scores are masked.
+enum Scores<B: Backend> {
+    /// The backend's attention op, optionally causal (query `i` sees keys `..=i`).
+    Fused { causal: bool },
+    /// Explicit additive mask `[1, 1, seq, kv_seq]` (0 / -inf).
+    Masked(Tensor<B, 4>),
+}
+
 /// Grouped-Query Attention with Rotary Position Embedding.
 #[derive(Module, Debug)]
 pub struct GroupedQueryAttention<B: Backend> {
@@ -157,11 +171,11 @@ impl<B: Backend> GroupedQueryAttention<B> {
     /// Forward pass.
     ///
     /// - `x` shape: `[batch, seq, hidden]`
-    /// - `mask` shape (optional): `[1, 1, seq, seq]` — additive causal mask (-inf / 0)
+    /// - `causal`: each position attends only to itself and earlier ones
     /// - output shape: `[batch, seq, hidden]`
-    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4>>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, causal: bool) -> Tensor<B, 3> {
         let (q, k, v) = self.project(x, 0);
-        self.attend(q, k, v, mask)
+        self.attend(q, k, v, Scores::Fused { causal })
     }
 
     /// Incremental forward pass for generation.
@@ -180,25 +194,23 @@ impl<B: Backend> GroupedQueryAttention<B> {
         let (k, v) = cache.update(k, v);
         let total = k.dims()[2];
 
-        // A single new token may attend to everything; a multi-token chunk
-        // needs a causal mask offset by the cached length.
-        let mask = (seq > 1).then(|| {
-            let past = total - seq;
+        // A single new token may attend to everything, and a first chunk is
+        // plain causal attention; a later multi-token chunk needs a causal
+        // mask offset by the cached length.
+        let past = total - seq;
+        let scores = if seq == 1 || past == 0 {
+            Scores::Fused { causal: seq > 1 }
+        } else {
             let data: Vec<f32> = (0..seq)
                 .flat_map(|i| {
-                    (0..total).map(move |j| {
-                        if j <= past + i {
-                            0.0
-                        } else {
-                            f32::NEG_INFINITY
-                        }
-                    })
+                    (0..total).map(move |j| if j <= past + i { 0.0 } else { f32::NEG_INFINITY })
                 })
                 .collect();
-            Tensor::<B, 1>::from_data(TensorData::new(data, vec![seq * total]), &device)
-                .reshape([1, 1, seq, total])
-        });
-        self.attend(q, k, v, mask)
+            let mask = Tensor::<B, 1>::from_data(TensorData::new(data, vec![seq * total]), &device)
+                .reshape([1, 1, seq, total]);
+            Scores::Masked(mask)
+        };
+        self.attend(q, k, v, scores)
     }
 
     /// An empty KV cache sized for this layer.
@@ -241,13 +253,7 @@ impl<B: Backend> GroupedQueryAttention<B> {
 
     /// Scaled dot-product attention of `q` over `k`/`v` (which may be longer
     /// than `q` when cached), followed by the output projection.
-    fn attend(
-        &self,
-        q: Tensor<B, 4>,
-        k: Tensor<B, 4>,
-        v: Tensor<B, 4>,
-        mask: Option<Tensor<B, 4>>,
-    ) -> Tensor<B, 3> {
+    fn attend(&self, q: Tensor<B, 4>, k: Tensor<B, 4>, v: Tensor<B, 4>, scores: Scores<B>) -> Tensor<B, 3> {
         let [batch, _, seq, _] = q.dims();
         let kv_seq = k.dims()[2];
 
@@ -261,19 +267,18 @@ impl<B: Backend> GroupedQueryAttention<B> {
             (k, v)
         };
 
-        // Scaled dot-product attention
-        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        // k^T: [batch, heads, head_dim, kv_seq]
-        let scores = q.matmul(k.permute([0, 1, 3, 2])).mul_scalar(scale);
-
-        // Apply additive causal mask
-        let scores = match mask {
-            Some(m) => scores + m,
-            None => scores,
+        let ctx = match scores {
+            // Backend attention kernel (flash attention on GPU backends).
+            Scores::Fused { causal } => {
+                let options = AttentionModuleOptions { scale: None, softcap: None, is_causal: causal };
+                attention(q, k, v, None, None, options)
+            }
+            Scores::Masked(mask) => {
+                let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+                let scores = q.matmul(k.permute([0, 1, 3, 2])).mul_scalar(scale) + mask;
+                softmax(scores, 3).matmul(v) // [batch, heads, seq, head_dim]
+            }
         };
-
-        let weights = softmax(scores, 3); // [batch, heads, seq, kv_seq]
-        let ctx = weights.matmul(v); // [batch, heads, seq, head_dim]
 
         // Permute back and reshape to [batch, seq, hidden]
         let ctx = ctx
@@ -317,5 +322,25 @@ mod tests {
         let a: Vec<f32> = sin_full.narrow(0, 6, 4).into_data().into_vec().unwrap();
         let b: Vec<f32> = sin.into_data().into_vec().unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fused_causal_matches_masked() {
+        let device = Default::default();
+        let cfg = crate::model::config::QuarkConfig {
+            hidden_size: 32,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            ..crate::model::config::QuarkConfig::quark_tiny()
+        };
+        let attn = GroupedQueryAttention::<B>::new(&cfg, &device);
+        let x = Tensor::<B, 3>::random([2, 7, 32], burn::tensor::Distribution::Normal(0.0, 1.0), &device);
+        let fused: Vec<f32> = attn.forward(x.clone(), true).into_data().to_vec().unwrap();
+        let (q, k, v) = attn.project(x, 0);
+        let mask = crate::model::stages::causal_mask::<B>(7, &device);
+        let manual: Vec<f32> = attn.attend(q, k, v, Scores::Masked(mask)).into_data().to_vec().unwrap();
+        for (a, b) in fused.iter().zip(&manual) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
     }
 }
