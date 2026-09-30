@@ -195,17 +195,43 @@ mod bench {
         println!("  init: {:.1}s, {} of weights", t.elapsed().as_secs_f32(), gb(stage.bytes()));
 
         let x = Tensor::<TrainBackend, 3>::random([1, seq, cfg.hidden_size], Distribution::Normal(0.0, 1.0), &device).require_grad();
-        let t = Instant::now();
-        let (y, _) = layer.forward_with_aux(x.clone(), true);
-        let _ = y.clone().sum().into_scalar();
-        let fwd = t.elapsed().as_secs_f32();
-        let t = Instant::now();
-        let grads = y.sum().backward();
-        let _ = x.grad(&grads);
-        let bwd = t.elapsed().as_secs_f32();
+        let pass = || {
+            let t = Instant::now();
+            let (y, _) = layer.forward_with_aux(x.clone(), true);
+            let _ = y.clone().sum().into_scalar();
+            let fwd = t.elapsed().as_secs_f32();
+            let t = Instant::now();
+            let grads = y.sum().backward();
+            let _ = x.grad(&grads).map(|g| g.sum().into_scalar());
+            (fwd, t.elapsed().as_secs_f32())
+        };
+        // The first pass compiles and autotunes the GPU kernels; time the next ones.
+        let (fwd0, bwd0) = pass();
+        println!("  warm-up (kernel compilation): forward {fwd0:.2}s, backward {bwd0:.2}s");
+        const RUNS: usize = 3;
+        let (mut fwd, mut bwd) = (0.0, 0.0);
+        for _ in 0..RUNS {
+            let (f, b) = pass();
+            fwd += f / RUNS as f32;
+            bwd += b / RUNS as f32;
+        }
         let peak = rss().saturating_sub(before);
+
+        // Matmul FLOPs of one forward pass (active experts only, causal attention).
+        let (h, s) = (cfg.hidden_size as f64, seq as f64);
+        let head_dim = h / cfg.num_attention_heads as f64;
+        let kv = cfg.num_key_value_heads as f64 * head_dim;
+        let ffn = 3.0 * h * cfg.intermediate_size as f64;
+        let ffn = if moe { cfg.num_experts_per_tok as f64 * ffn } else { ffn };
+        let flops = 2.0 * s * (2.0 * h * h + 2.0 * h * kv + ffn) + 2.0 * s * s * h;
+        let tflops = |flops: f64, secs: f32| flops / secs as f64 / 1e12;
+        println!(
+            "  forward {fwd:.3}s ({:.2} TFLOP/s), backward {bwd:.3}s ({:.2} TFLOP/s), process memory +{}",
+            tflops(flops, fwd),
+            tflops(2.0 * flops, bwd),
+            gb(peak)
+        );
         let per_layer = fwd * 2.0 + bwd; // forward, recompute forward, backward
-        println!("  forward {fwd:.2}s, backward {bwd:.2}s, process memory +{}", gb(peak));
         println!(
             "  ⇒ compute per micro-batch of {seq} tokens through all {} layers: ≈{:.0}s (plus disk I/O)",
             cfg.num_hidden_layers,
