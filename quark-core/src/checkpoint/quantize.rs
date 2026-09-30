@@ -119,7 +119,7 @@ mod tests {
             moe_layer_freq: 2,
             ..QuarkConfig::quark_tiny()
         };
-        let device = Default::default();
+        let device = crate::backend::device();
         let dir = std::env::temp_dir().join(format!("quark-quant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let model = QuarkModel::<B>::new(&cfg, &device);

@@ -41,7 +41,7 @@ pub fn export_for_inference(src: &Path, dst: &Path, quant: Option<QuantFormat>) 
     } else {
         let cfg = QuarkConfig::for_checkpoint(src)
             .with_context(|| format!("no config.json next to {}", src.display()))?;
-        let device = Default::default();
+        let device = crate::backend::device();
         let record = CheckpointRecorder::new()
             .load(src.with_extension(""), &device)
             .with_context(|| format!("loading {}", src.display()))?;
@@ -111,7 +111,7 @@ mod tests {
             num_experts_per_tok: 1,
             ..QuarkConfig::quark_tiny()
         };
-        let device = Default::default();
+        let device = crate::backend::device();
         let dir = std::env::temp_dir().join(format!("quark-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("train")).unwrap();

@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_forward_shapes() {
         type B = TestBackend;
-        let device = Default::default();
+        let device = crate::backend::device();
         let cfg = test_cfg();
         let model = QuarkModel::<B>::new(&cfg, &device);
 
@@ -174,7 +174,7 @@ mod tests {
     fn ids(v: &[i32]) -> Tensor<TestBackend, 2, Int> {
         Tensor::from_data(
             TensorData::new(v.to_vec(), [1, v.len()]),
-            &Default::default(),
+            &crate::backend::device(),
         )
     }
 
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn future_tokens_do_not_affect_past_logits() {
         let cfg = test_cfg();
-        let model = QuarkModel::<TestBackend>::new(&cfg, &Default::default());
+        let model = QuarkModel::<TestBackend>::new(&cfg, &crate::backend::device());
         let a = values(model.forward(ids(&[5, 9, 17, 3, 42, 8])).narrow(1, 0, 3));
         let b = values(model.forward(ids(&[5, 9, 17, 200, 1, 77])).narrow(1, 0, 3));
         assert_close(&a, &b);
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn kv_cache_matches_full_forward() {
         let cfg = test_cfg();
-        let model = QuarkModel::<TestBackend>::new(&cfg, &Default::default());
+        let model = QuarkModel::<TestBackend>::new(&cfg, &crate::backend::device());
         let tokens = [5, 9, 17, 3, 42, 8, 11];
         let full = values(model.forward(ids(&tokens)));
 
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn param_count_matches_model() {
         for cfg in [test_cfg(), QuarkConfig::quark_tiny()] {
-            let model = QuarkModel::<TestBackend>::new(&cfg, &Default::default());
+            let model = QuarkModel::<TestBackend>::new(&cfg, &crate::backend::device());
             assert_eq!(model.num_params() as u64, cfg.param_count());
         }
     }

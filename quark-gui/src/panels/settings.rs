@@ -221,44 +221,32 @@ impl SettingsPanel {
         egui::CollapsingHeader::new("🔧 Compute Backend")
             .default_open(false)
             .show(ui, |ui| {
+                let selection = quark_core::backend::selection();
                 ui.label(
-                    egui::RichText::new(
-                        "Backend is selected at build time via Cargo features:",
-                    )
-                    .weak(),
-                );
-                ui.add_space(4.0);
-                egui::Grid::new("backend_grid")
-                    .num_columns(2)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label("backend-cpu");
-                        ui.label("CPU (ndarray) — all platforms");
-                        ui.end_row();
-                        ui.label("backend-wgpu");
-                        ui.label("GPU via WGPU (Metal / Vulkan)");
-                        ui.end_row();
-                        ui.label("backend-cuda");
-                        ui.label("NVIDIA CUDA GPU");
-                        ui.end_row();
-                    });
-                #[cfg(feature = "backend-cuda")]
-                ui.label(
-                    egui::RichText::new("✓ CUDA backend active")
+                    egui::RichText::new(format!("✓ Using {}", selection.kind.label()))
                         .color(egui::Color32::GREEN)
                         .strong(),
                 );
-                #[cfg(feature = "backend-wgpu")]
+                if let Some(error) = &selection.error {
+                    ui.colored_label(egui::Color32::from_rgb(230, 160, 60), error);
+                }
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("✓ WGPU backend active")
-                        .color(egui::Color32::from_rgb(100, 180, 255))
-                        .strong(),
+                    egui::RichText::new(
+                        "Quark tries CUDA, then wgpu (Vulkan / Metal / DX12), then the CPU, \
+                         and uses the first that works:",
+                    )
+                    .weak(),
                 );
-                #[cfg(feature = "backend-cpu")]
+                for line in &selection.report {
+                    ui.label(egui::RichText::new(line).monospace());
+                }
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("✓ CPU backend active")
-                        .color(egui::Color32::GRAY)
-                        .strong(),
+                    egui::RichText::new(
+                        "To force one, start Quark with QUARK_BACKEND=cuda, wgpu or cpu.",
+                    )
+                    .weak(),
                 );
             });
     }

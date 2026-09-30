@@ -12,7 +12,7 @@ name = "quark-cli"
 path = "src/main.rs"
 
 [features]
-default = ["backend-cpu"]
+default = ["backend-cpu", "backend-wgpu", "backend-cuda"]
 backend-cpu  = ["quark-core/backend-cpu"]
 backend-cuda = ["quark-core/backend-cuda"]
 backend-wgpu = ["quark-core/backend-wgpu"]

@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn stage_roundtrip_reproduces_block() {
-        let device = Default::default();
+        let device = crate::backend::device();
         for is_moe in [false, true] {
             let source = DecoderBlock::<B>::new(&cfg(), is_moe, &device);
             let stage = module_to_stage(&source).unwrap();
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn mismatched_stage_is_rejected() {
-        let device = Default::default();
+        let device = crate::backend::device();
         let dense = DecoderBlock::<B>::new(&cfg(), false, &device);
         let mut moe = DecoderBlock::<B>::new(&cfg(), true, &device);
         assert!(load_stage(&mut moe, &module_to_stage(&dense).unwrap()).is_err());

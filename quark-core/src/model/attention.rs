@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn expand_kv_repeats_each_head() {
-        let device = Default::default();
+        let device = crate::backend::device();
         // [batch=1, kv_heads=2, seq=1, head_dim=2]: head 0 = [1, 2], head 1 = [3, 4]
         let t = Tensor::<B, 4>::from_data(
             TensorData::new(vec![1.0f32, 2., 3., 4.], [1, 2, 1, 2]),
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn rope_offset_matches_full_table() {
-        let device = Default::default();
+        let device = crate::backend::device();
         let (cos_full, sin_full) = precompute_rope_freqs::<B>(8, 10, 10000.0, &device);
         let (cos, sin) = rope_freqs_at::<B>(8, 6, 4, 10000.0, &device);
         let a: Vec<f32> = cos_full.narrow(0, 6, 4).into_data().into_vec().unwrap();
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn fused_causal_matches_masked() {
-        let device = Default::default();
+        let device = crate::backend::device();
         let cfg = crate::model::config::QuarkConfig {
             hidden_size: 32,
             num_attention_heads: 4,

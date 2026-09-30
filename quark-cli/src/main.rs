@@ -84,7 +84,11 @@ fn main() -> Result<()> {
             let max = value("--max").map(|v| v.parse()).transpose()?.unwrap_or(256);
             let t = std::time::Instant::now();
             let engine = InferenceEngine::load(&ckpt, &cfg, &tok)?;
-            eprintln!("Loaded in {:.1}s", t.elapsed().as_secs_f32());
+            eprintln!(
+                "Loaded in {:.1}s on {}",
+                t.elapsed().as_secs_f32(),
+                quark_core::backend::selected().label()
+            );
 
             let (text, params) = if flag("--raw") {
                 (prompt.clone(), SamplingParams { max_new_tokens: max, ..SamplingParams::default() })
@@ -127,6 +131,7 @@ fn main() -> Result<()> {
                 cfg.max_position_embeddings = seq.parse()?;
             }
             quark_core::backend::check_device()?;
+            println!("Backend: {}", quark_core::backend::selected().label());
             let steps: u64 = value("--steps").map(|v| v.parse()).transpose()?.unwrap_or(3);
             if flag("--layer-only") {
                 bench::layer(&cfg)?;
@@ -178,7 +183,7 @@ mod bench {
     /// One decoder layer at the preset's real shape: forward + backward
     /// (what the streamed trainer does per layer and micro-batch).
     pub fn layer(cfg: &QuarkConfig) -> Result<()> {
-        let device = burn::tensor::Device::<TrainBackend>::default();
+        let device = quark_core::backend::device();
         let seq = cfg.max_position_embeddings;
         let moe = cfg.is_moe_layer(0);
         println!(
@@ -242,7 +247,7 @@ mod bench {
 
     /// Full streamed training steps on synthetic data.
     pub fn streamed(cfg: &QuarkConfig, steps: u64, dir: &Path) -> Result<()> {
-        let device = burn::tensor::Device::<TrainBackend>::default();
+        let device = quark_core::backend::device();
         <TrainBackend as Backend>::seed(&device, 0);
         let _ = std::fs::remove_dir_all(dir);
         let budget = quark_core::memory::budget::HardwareBudget::detect();

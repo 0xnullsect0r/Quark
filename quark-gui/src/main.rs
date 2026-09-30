@@ -12,6 +12,9 @@ fn main() -> eframe::Result<()> {
         .init();
 
     tracing::info!("Starting Quark GUI");
+    // Pick the compute backend (probing CUDA and the GPU takes a moment) off
+    // the UI thread.
+    std::thread::spawn(quark_core::backend::selection);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

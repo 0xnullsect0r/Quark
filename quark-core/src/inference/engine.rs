@@ -42,7 +42,7 @@ impl InferenceEngine {
     /// checkpoint's own `config.json` takes precedence).
     pub fn load(checkpoint: &Path, config: &QuarkConfig, tokenizer: &Path) -> Result<Self> {
         crate::backend::check_device()?;
-        let device = Device::default();
+        let device = crate::backend::device();
 
         let (config, model) = if crate::checkpoint::sharded::is_sharded(checkpoint) {
             crate::checkpoint::sharded::load_sharded::<InferBackend>(checkpoint, &device)

@@ -136,11 +136,14 @@ impl Precision {
         }
     }
 
-    /// Whether this build can train at this precision.
+    /// Whether the selected backend can train at this precision.
     pub fn is_supported(self) -> bool {
         match self {
             Precision::F32 => true,
-            Precision::Bf16 => cfg!(feature = "backend-cuda"),
+            Precision::Bf16 => {
+                cfg!(feature = "backend-cuda")
+                    && crate::backend::selected() == crate::backend::BackendKind::Cuda
+            }
         }
     }
 }
@@ -243,7 +246,7 @@ fn dispatch_training(
     }
     if !config.precision.is_supported() {
         let _ = tx.send(TrainingEvent::Log(format!(
-            "⚠  {:?} training needs a CUDA build — using F32",
+            "⚠  {:?} training needs the CUDA backend — using F32",
             config.precision
         )));
         config.precision = Precision::F32;
@@ -465,7 +468,7 @@ fn run_training_loop<AB: AutodiffBackend>(
     // ── Initialise model ──────────────────────────────────────────────────────
     phase!("Initialising model…");
 
-    let device = burn::tensor::Device::<AB>::default();
+    let device = crate::backend::default_device::<AB>();
     <AB as Backend>::seed(&device, config.seed);
     let mut model = QuarkModel::<AB>::new(&model_config, &device);
     log!("   Model initialised on {:?}", device);
@@ -778,8 +781,8 @@ pub fn estimate_memory(
         precision.bytes_per_elem(),
         config.gradient_checkpointing,
     );
-    let gpu_build = cfg!(any(feature = "backend-cuda", feature = "backend-wgpu"));
-    if gpu_build && budget.vram_total_bytes > 0 {
+    let on_gpu = crate::backend::selected() != crate::backend::BackendKind::Cpu;
+    if on_gpu && budget.vram_total_bytes > 0 {
         MemoryEstimate { needed_bytes, available_bytes: budget.vram_free_bytes, device: "VRAM" }
     } else {
         MemoryEstimate { needed_bytes, available_bytes: budget.ram_free_bytes, device: "RAM" }
