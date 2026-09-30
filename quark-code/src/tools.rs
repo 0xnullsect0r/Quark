@@ -65,6 +65,9 @@ pub fn execute_extended(call: &ToolCall, cfg: &McpConfig) -> ToolResult {
             let end   = call.args.get("end").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
             read_lines(cfg, &path, start, end)
         }
+        "write_lines" | "apply_diff" if !cfg.write_file => {
+            err_result(&call.tool, "tool is disabled (write_file is off in MCP config)")
+        }
         "write_lines" => {
             let path    = get_str(&call.args, "path");
             let content = get_str(&call.args, "content");
@@ -296,4 +299,22 @@ pub fn expand_mentions(input: &str, working_dir: &Path) -> String {
         result.push(' ');
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_lines_respects_write_flag() {
+        let dir = std::env::temp_dir().join(format!("quark-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = McpConfig { write_file: false, working_dir: dir.clone(), ..McpConfig::default() };
+        let call = ToolCall {
+            tool: "write_lines".into(),
+            args: serde_json::json!({ "path": "blocked.txt", "content": "x" }),
+        };
+        assert!(!execute_extended(&call, &cfg).ok);
+        assert!(!dir.join("blocked.txt").exists());
+    }
 }

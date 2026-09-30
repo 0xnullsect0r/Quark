@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports, unused_variables, unused_mut)]
 
 pub mod backend;
+pub mod chat;
 pub mod checkpoint;
 pub mod data;
 pub mod inference;

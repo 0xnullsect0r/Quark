@@ -47,15 +47,16 @@ impl GettingStartedPanel {
                  • Watch the live loss and LR charts update in real time\n\
                  • Color-coded VRAM/RAM progress bars show memory tier usage\n\n\
                  Training saves a checkpoint every N steps (configurable). You can stop and resume \
-                 at any time — Quark saves the full optimizer state.");
+                 at any time — with **Resume** on, training continues from the latest checkpoint \
+                 (the optimizer state restarts fresh).");
 
             step(ui, "5", "Browse checkpoints",
                 "Go to the **Checkpoints** tab.\n\
                  • Click **Browse…** to point to your output directory\n\
-                 • Select any `.safetensors` checkpoint and click **📥 Load**\n\
+                 • Select a `checkpoint-N.bin` file and click **📥 Load**\n\
                  • Use **📤 Export…** to copy a checkpoint to share it\n\n\
-                 Checkpoints are HuggingFace-compatible `.safetensors` files and can be loaded \
-                 in tools like `transformers` or converted to GGUF for llama.cpp.");
+                 Each output directory also holds the `config.json` and `tokenizer.json` \
+                 the checkpoints were trained with, so they load with the right architecture.");
 
             step(ui, "6", "Chat with your model",
                 "Go to the **Chat** tab after loading a checkpoint.\n\

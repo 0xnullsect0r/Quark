@@ -1,0 +1,293 @@
+//! End-to-end: train a tiny model, reload the checkpoint for inference, then
+//! resume training from it.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use quark_core::{
+    chat::{default_stop_strings, render_prompt, ChatMessage},
+    checkpoint::export::{export_for_inference, BUNDLE_CHECKPOINT},
+    model::proj::QuantFormat,
+    data::sft::tokenize_conversation,
+    inference::{InferenceEngine, SamplingParams},
+    model::config::QuarkConfig,
+    tokenizer::bpe::QuarkTokenizer,
+    training::{
+        lr_schedule::CosineSchedule,
+        metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics},
+        optim::OptimizerKind,
+        start_training,
+        trainer::OffloadMode,
+        TrainerConfig, TrainingMode,
+    },
+};
+
+fn tiny_config() -> QuarkConfig {
+    QuarkConfig {
+        vocab_size: 0, // replaced with the tokenizer's vocab size by the trainer
+        hidden_size: 32,
+        num_hidden_layers: 2,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        intermediate_size: 64,
+        max_position_embeddings: 96,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        num_experts: 4,
+        num_experts_per_tok: 2,
+        num_moe_layers: 1,
+        moe_layer_freq: 2,
+        tie_word_embeddings: false,
+    }
+}
+
+fn trainer_config(output_dir: &Path, max_steps: u64) -> TrainerConfig {
+    TrainerConfig {
+        output_dir: output_dir.to_path_buf(),
+        max_steps,
+        batch_size: 2,
+        grad_accum_steps: 2,
+        save_every_steps: 10,
+        eval_every_steps: 10,
+        schedule: CosineSchedule { warmup_steps: 2, max_steps: 60, max_lr: 3e-3, min_lr: 3e-4 },
+        ..TrainerConfig::default()
+    }
+}
+
+struct Run {
+    metrics: Vec<TrainingMetrics>,
+    evals: Vec<(u64, f32)>,
+    logs: Vec<String>,
+}
+
+fn collect(rx: MetricsReceiver) -> Run {
+    let mut run = Run { metrics: vec![], evals: vec![], logs: vec![] };
+    loop {
+        match rx.recv_timeout(Duration::from_secs(600)).expect("training timed out") {
+            TrainingEvent::Metrics(m) => run.metrics.push(m),
+            TrainingEvent::Eval { step, loss } => run.evals.push((step, loss)),
+            TrainingEvent::Log(l) => run.logs.push(l),
+            TrainingEvent::Phase(_) => {}
+            TrainingEvent::Done => return run,
+            TrainingEvent::Error(e) => panic!("training failed: {e}"),
+        }
+    }
+}
+
+fn setup(dir: &Path) -> (PathBuf, PathBuf) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let corpus = dir.join("corpus.txt");
+    let text: String = (0..400)
+        .map(|i| format!("fn add_{i}(a: u32, b: u32) -> u32 {{ a + b }}\n"))
+        .collect();
+    std::fs::write(&corpus, text).unwrap();
+    let tokenizer = dir.join("tok.json");
+    QuarkTokenizer::train(std::slice::from_ref(&corpus), 400, &tokenizer).unwrap();
+    (corpus, tokenizer)
+}
+
+#[test]
+fn train_load_generate_and_resume() {
+    let dir = std::env::temp_dir().join(format!("quark-e2e-{}", std::process::id()));
+    let (corpus, tokenizer) = setup(&dir);
+    let out = dir.join("ckpt");
+
+    // ── Train ────────────────────────────────────────────────────────────────
+    let (_handle, rx) = start_training(
+        tiny_config(),
+        trainer_config(&out, 30),
+        vec![corpus.clone()],
+        Some(tokenizer.clone()),
+    );
+    let run = collect(rx);
+
+    assert_eq!(run.metrics.len(), 30);
+    assert_eq!(run.metrics.last().unwrap().step, 30);
+    let first = run.metrics[0].loss;
+    let last = run.metrics[25..].iter().map(|m| m.loss).sum::<f32>() / 5.0;
+    assert!(last < first * 0.7, "loss did not decrease: {first} → {last}");
+    assert!(run.metrics.iter().all(|m| m.grad_norm.is_finite() && m.grad_norm > 0.0));
+    assert!(!run.evals.is_empty(), "no eval events");
+    assert!(run.evals.iter().all(|(_, l)| l.is_finite()));
+
+    for f in ["config.json", "tokenizer.json", "checkpoint-10.bin", "checkpoint-30.bin"] {
+        assert!(out.join(f).exists(), "missing {f}");
+    }
+
+    // ── Load for inference ───────────────────────────────────────────────────
+    let ckpt = out.join("checkpoint-30.bin");
+    let config = QuarkConfig::for_checkpoint(&ckpt).expect("config.json next to checkpoint");
+    let engine = InferenceEngine::load(&ckpt, &config, &out.join("tokenizer.json")).unwrap();
+    let params = SamplingParams { max_new_tokens: 40, ..SamplingParams::default() };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let text = engine.generate_streaming("fn add_7(", params, tx).unwrap();
+    let streamed: String = rx.try_iter().collect();
+    assert_eq!(streamed, text, "streamed pieces must add up to the full response");
+
+    // ── Resume ───────────────────────────────────────────────────────────────
+    // Resume without gradient checkpointing to exercise the other backend variant.
+    let resume_cfg = TrainerConfig { gradient_checkpointing: false, ..trainer_config(&out, 35) };
+    let (_handle, rx) = start_training(tiny_config(), resume_cfg, vec![corpus], Some(tokenizer));
+    let resumed = collect(rx);
+    assert!(resumed.logs.iter().any(|l| l.contains("Resumed")), "{:#?}", resumed.logs);
+    assert_eq!(resumed.metrics.first().unwrap().step, 31);
+    assert_eq!(resumed.metrics.len(), 5);
+
+    // ── Chat fine-tune ───────────────────────────────────────────────────────
+    let chat = dir.join("chat.jsonl");
+    let lines: String = (0..200)
+        .map(|i| {
+            let conv = serde_json::json!({ "messages": [
+                { "role": "user", "content": format!("ping {i}") },
+                { "role": "assistant", "content": "pong" },
+            ]});
+            format!("{conv}\n")
+        })
+        .collect();
+    std::fs::write(&chat, lines).unwrap();
+
+    // Only the assistant reply (and its closing tag) is trained on.
+    let tok = QuarkTokenizer::load(&out.join("tokenizer.json")).unwrap();
+    let example = tokenize_conversation(
+        &tok,
+        &[ChatMessage::user("ping 1"), ChatMessage::assistant("pong")],
+        512,
+    )
+    .unwrap()
+    .unwrap();
+    let targets: Vec<u32> = example
+        .ids
+        .iter()
+        .zip(&example.trainable)
+        .filter(|(_, t)| **t)
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(tok.decode(&targets).unwrap(), "pong\n</assistant>");
+
+    let base = out.join("checkpoint-35.bin");
+    let ft_cfg = TrainerConfig {
+        mode: TrainingMode::FineTune { base_checkpoint: base.clone() },
+        batch_size: 8,
+        grad_accum_steps: 1,
+        eval_every_steps: 0,
+        ..trainer_config(&out, 150) // same dir as the base: must be redirected
+    };
+    // Model config and tokenizer come from the base checkpoint.
+    let (_handle, rx) = start_training(QuarkConfig::quark_1b(), ft_cfg, vec![chat], None);
+    let tuned = collect(rx);
+    let first = tuned.metrics[0].loss;
+    let last = tuned.metrics.last().unwrap().loss;
+    assert!(last < first * 0.5, "fine-tune loss did not decrease: {first} → {last}");
+
+    let ft_dir = out.join("finetune");
+    let ft_ckpt = ft_dir.join("checkpoint-150.bin");
+    assert!(ft_ckpt.exists(), "fine-tune must write to {}", ft_dir.display());
+    assert_eq!(QuarkConfig::for_checkpoint(&ft_ckpt).unwrap().hidden_size, 32);
+
+    let engine =
+        InferenceEngine::load(&ft_ckpt, &QuarkConfig::for_checkpoint(&ft_ckpt).unwrap(), &ft_dir.join("tokenizer.json"))
+            .unwrap();
+    let prompt = render_prompt(&[ChatMessage::user("ping 7")]);
+    let params = SamplingParams {
+        temperature: 0.0,
+        max_new_tokens: 30,
+        stop_strings: default_stop_strings(),
+        ..SamplingParams::default()
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reply = engine.generate_streaming(&prompt, params, tx).unwrap();
+    assert_eq!(reply.trim(), "pong", "reply: {reply:?}");
+    assert_eq!(rx.try_iter().collect::<String>(), reply, "no stop-string text may leak");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crash_is_reported_not_hung() {
+    let dir = std::env::temp_dir().join(format!("quark-e2e-crash-{}", std::process::id()));
+    let (corpus, tokenizer) = setup(&dir);
+    // 4 query heads cannot be grouped over 3 KV heads: the forward pass panics.
+    let bad = QuarkConfig { num_key_value_heads: 3, ..tiny_config() };
+    let (_handle, rx) =
+        start_training(bad, trainer_config(&dir.join("ckpt"), 5), vec![corpus], Some(tokenizer));
+    let error = loop {
+        match rx.recv_timeout(Duration::from_secs(120)).expect("no event: training hung") {
+            TrainingEvent::Error(e) => break e,
+            TrainingEvent::Done => panic!("expected a crash"),
+            _ => {}
+        }
+    };
+    assert!(error.starts_with("Training crashed"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn offloaded_training_end_to_end() {
+    let dir = std::env::temp_dir().join(format!("quark-e2e-offload-{}", std::process::id()));
+    let (corpus, tokenizer) = setup(&dir);
+    let out = dir.join("ckpt");
+    let streamed = |max_steps| TrainerConfig {
+        offload: OffloadMode::On,
+        optimizer: OptimizerKind::AdamWCompact,
+        ..trainer_config(&out, max_steps)
+    };
+
+    // ── Streamed pretraining ─────────────────────────────────────────────────
+    let (_h, rx) = start_training(tiny_config(), streamed(20), vec![corpus.clone()], Some(tokenizer.clone()));
+    let run = collect(rx);
+    assert!(run.logs.iter().any(|l| l.contains("layer by layer")), "{:#?}", run.logs);
+    assert_eq!(run.metrics.len(), 20);
+    let first = run.metrics[0].loss;
+    let last = run.metrics[15..].iter().map(|m| m.loss).sum::<f32>() / 5.0;
+    assert!(last < first * 0.8, "offloaded loss did not decrease: {first} → {last}");
+    assert!(!run.evals.is_empty());
+
+    // Sharded checkpoints (only the last two are kept), loadable for inference.
+    let ckpt = out.join("checkpoint-20");
+    assert!(ckpt.join("meta.json").exists() && ckpt.join("optim").exists());
+    assert!(out.join("checkpoint-10").exists() && ckpt.join("tokenizer.json").exists());
+    let cfg = QuarkConfig::for_checkpoint(&ckpt).unwrap();
+    let engine = InferenceEngine::load(&ckpt, &cfg, &ckpt.join("tokenizer.json")).unwrap();
+    let params = SamplingParams { max_new_tokens: 10, ..SamplingParams::default() };
+    assert!(engine.generate("fn add_1(", params).is_ok());
+
+    // ── Resume (optimizer state restored) ────────────────────────────────────
+    let (_h, rx) = start_training(tiny_config(), streamed(25), vec![corpus], Some(tokenizer));
+    let resumed = collect(rx);
+    assert!(resumed.logs.iter().any(|l| l.contains("optimizer state restored")), "{:#?}", resumed.logs);
+    assert_eq!(resumed.metrics.first().unwrap().step, 21);
+    assert!(!out.join("checkpoint-10").exists(), "old checkpoints are pruned");
+
+    // ── 4-bit export, loaded the way quark-chat / quark-code load a bundle ───
+    let bundle = dir.join("bundle/model");
+    export_for_inference(&out.join("checkpoint-25"), &bundle.join(BUNDLE_CHECKPOINT), Some(QuantFormat::Q4)).unwrap();
+    let engine = InferenceEngine::load_bundle(&bundle).unwrap();
+    let params = SamplingParams { max_new_tokens: 12, ..SamplingParams::default() };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let text = engine.generate_streaming("fn add_3(", params, tx).unwrap();
+    assert_eq!(rx.try_iter().collect::<String>(), text);
+
+    // ── Fine-tune from the sharded base: streamed and in memory ──────────────
+    let chat = dir.join("chat.jsonl");
+    let line = serde_json::json!({ "messages": [
+        { "role": "user", "content": "ping" }, { "role": "assistant", "content": "pong" }
+    ]});
+    std::fs::write(&chat, format!("{line}\n").repeat(16)).unwrap();
+    for offload in [OffloadMode::On, OffloadMode::Off] {
+        let ft = TrainerConfig {
+            mode: TrainingMode::FineTune { base_checkpoint: out.join("checkpoint-25") },
+            offload,
+            output_dir: dir.join(format!("ft-{offload:?}")),
+            eval_every_steps: 0,
+            resume: false,
+            ..trainer_config(&out, 5)
+        };
+        let (_h, rx) = start_training(QuarkConfig::quark_1b(), ft, vec![chat.clone()], None);
+        let tuned = collect(rx);
+        assert!(tuned.logs.iter().any(|l| l.contains("Loaded base weights")), "{offload:?}: {:#?}", tuned.logs);
+        assert_eq!(tuned.metrics.len(), 5);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -43,7 +43,8 @@ impl HardwareBudget {
     }
 }
 
-fn detect_vram() -> (u64, u64) {
+/// `(total, free)` VRAM of GPU 0 in bytes, or `(0, 0)` when unknown.
+pub fn detect_vram() -> (u64, u64) {
     // ── NVIDIA via NVML ───────────────────────────────────────────────────────
     #[cfg(feature = "backend-cuda")]
     {

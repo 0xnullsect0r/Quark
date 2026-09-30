@@ -1,7 +1,10 @@
 //! quark-code — terminal AI coding agent powered by a bundled Quark model.
 //!
 //! Usage:
-//!   quark-code [project_dir]
+//!   quark-code [--allow-shell] [project_dir]
+//!
+//! `run_shell` is disabled unless `--allow-shell` is passed or `model/mcp.json`
+//! enables it.
 //!
 //! Looks for model files in a `model/` directory next to the executable
 //! (set by quark-gui's Export panel).  Falls back to a demo/stub mode if
@@ -31,7 +34,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use quark_core::inference::InferenceEngine;
 use quark_core::mcp::McpConfig;
-use quark_core::model::config::QuarkConfig;
 
 fn main() -> Result<()> {
     // Initialise tracing (suppress most output; TUI owns the screen)
@@ -63,14 +65,14 @@ fn main() -> Result<()> {
         let txt = std::fs::read_to_string(&mcp_path)?;
         serde_json::from_str(&txt).unwrap_or_default()
     } else {
-        // Default: enable all read tools + shell for coding use
+        // Default: file tools on; shell stays off unless --allow-shell is passed
         McpConfig {
             read_file:    true,
             write_file:   true,
             list_dir:     true,
             search_files: true,
             get_cwd:      true,
-            run_shell:    true,
+            run_shell:    false,
             working_dir:  std::env::current_dir().unwrap_or_else(|_| exe_dir.clone()),
         }
     };
@@ -83,9 +85,16 @@ fn main() -> Result<()> {
         DEFAULT_SYSTEM_PROMPT.to_owned()
     };
 
-    // ── Project directory (first arg or cwd) ──────────────────────────────
-    let project_root = std::env::args()
-        .nth(1)
+    // ── Command-line flags ─────────────────────────────────────────────────
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--allow-shell") {
+        mcp_cfg.run_shell = true;
+    }
+
+    // ── Project directory (first non-flag arg or cwd) ─────────────────────
+    let project_root = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
@@ -95,30 +104,16 @@ fn main() -> Result<()> {
     // Point MCP working_dir at the project root
     mcp_cfg.working_dir = project_root.clone();
 
-    // ── Load inference engine if checkpoint + tokenizer present ───────────
-    let checkpoint_path = model_dir.join("checkpoint.bin");
-    let tokenizer_path  = model_dir.join("tokenizer.json");
-    let config_json_path = model_dir.join("config.json");
-
-    let model_config: QuarkConfig = if config_json_path.exists() {
-        let txt = std::fs::read_to_string(&config_json_path).unwrap_or_default();
-        serde_json::from_str(&txt).unwrap_or_else(|_| QuarkConfig::quark_1b())
-    } else {
-        QuarkConfig::quark_1b()
-    };
-
-    let engine: Option<Arc<InferenceEngine>> =
-        if checkpoint_path.exists() && tokenizer_path.exists() {
-            match InferenceEngine::load(&checkpoint_path, &model_config, &tokenizer_path) {
-                Ok(e) => Some(Arc::new(e)),
-                Err(e) => {
-                    eprintln!("Warning: model load failed: {e}");
-                    None
-                }
+    // ── Load inference engine if a model is bundled ───────────────────────
+    let engine: Option<Arc<InferenceEngine>> = match InferenceEngine::load_bundle(&model_dir) {
+        Ok(e) => Some(Arc::new(e)),
+        Err(e) => {
+            if has_bundled_model(&model_dir) {
+                eprintln!("Warning: model load failed: {e:#}");
             }
-        } else {
             None
-        };
+        }
+    };
 
     let model_loaded = engine.is_some();
 
@@ -151,3 +146,7 @@ Always read relevant files before making changes.
 In Plan mode, explain what you would do without actually doing it.
 In Build mode, apply changes directly using write_file or write_lines.
 Prefer small, targeted edits. After making changes, summarise what was done.";
+
+fn has_bundled_model(model_dir: &std::path::Path) -> bool {
+    quark_core::checkpoint::export::find_bundled_model(model_dir).is_some()
+}

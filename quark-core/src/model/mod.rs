@@ -6,7 +6,9 @@ pub mod config;
 pub mod ffn;
 pub mod moe;
 pub mod norm;
+pub mod proj;
 pub mod quark;
+pub mod stages;
 
 pub use config::{ModelPreset, QuarkConfig};
 pub use quark::QuarkModel;

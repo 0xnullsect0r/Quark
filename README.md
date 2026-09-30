@@ -16,7 +16,7 @@ Quark is a downloadable desktop GUI that guides you from raw data → trained LL
 - [Architecture](#architecture)
 - [Model Presets](#model-presets)
 - [Backends](#backends)
-- [Memory Tiering](#memory-tiering)
+- [Offloading: training models bigger than memory](#offloading-training-models-bigger-than-memory)
 - [GUI Panels](#gui-panels)
 - [Training Guide](#training-guide)
 - [The Pile Dataset](#the-pile-dataset)
@@ -115,34 +115,28 @@ Each transformer block alternates between **dense SwiGLU** layers and **sparse M
 
 ## Model Presets
 
-All presets use the same GQA + MoE architecture. Hardware estimates assume `bfloat16` weights, `batch=1` inference.
+All presets use the same GQA + MoE architecture. The GUI's preset picker shows the exact parameter count and a training-memory estimate for each. The **Training** tab shows the plan for your machine: in memory or offloaded, how much device memory and disk it needs.
 
-| Preset | Params | Layers | Hidden | Heads | KV heads | MoE layers | Experts | Top-K | Min VRAM | Min RAM |
-|--------|-------:|-------:|-------:|------:|---------:|-----------:|--------:|------:|---------:|--------:|
-| **Quark-1B**   |   1 B |  16 |  2048 | 16 |  4 |  4 |  8 | 2 |  2 GB |  4 GB |
-| **Quark-3B**   |   3 B |  28 |  3072 | 24 |  8 |  6 |  8 | 2 |  6 GB |  8 GB |
-| **Quark-7B**   |   7 B |  32 |  4096 | 32 |  8 |  8 |  8 | 2 |  14 GB | 16 GB |
-| **Quark-20B**  |  20 B |  40 |  5120 | 40 | 10 | 10 | 16 | 4 |  40 GB | 48 GB |
-| **Quark-30B**  |  30 B |  48 |  6144 | 48 | 12 | 12 | 16 | 4 |  60 GB | 80 GB |
-| **Quark-48B**  |  48 B |  56 |  7168 | 56 | 14 | 14 | 32 | 4 |  96 GB | 128 GB |
-| **Quark-74B**  |  74 B |  64 |  8192 | 64 | 16 | 16 | 32 | 4 | 148 GB | 192 GB |
-| **Quark-120B** | 120 B |  80 | 10240 | 80 | 20 | 20 | 64 | 8 | 240 GB | 320 GB |
-| **Quark-249B** | 249 B |  96 | 12288 | 96 | 24 | 24 | 64 | 8 | 498 GB | 640 GB |
-| **Quark-300B** | 300 B | 104 | 14336 | 112| 28 | 28 | 64 | 8 | 600 GB | 768 GB |
-| **Quark-400B** | 400 B | 120 | 16384 | 128| 32 | 32 | 128| 8 | 800 GB |   1 TB |
-| **Custom**     |  —    |   — |    — |  — |   — |   — |   — | — | — | — |
+| Preset | Params (active/token) | Layers | Hidden | Context | Experts (top-k) | How it trains |
+|--------|------:|-------:|-------:|--------:|----------------:|---------------|
+| **Quark Tiny**    | 12 M | 6 | 256 | 512 | 4 (2) | in memory, ≈ 0.4 GB — laptop CPU is fine |
+| **Quark Small**   | 224 M | 12 | 768 | 1024 | 8 (2) | in memory, ≈ 8 GB — a GPU with 8 GB+ |
+| **Quark 10B-A2B** | 10.0 B (2.1 B) | 30 | 3072 | 2048 | 16 (2), every layer | **offloaded**: ≈ 6 GB on the GPU at a time, ≈ 75 GB of SSD (+ checkpoints) |
+| Quark 1B … 400B   | see picker | | | | | larger ones need offloading or big hardware |
 
-> **Tip:** For consumer hardware (≤ 24 GB VRAM) start with **Quark-1B** or **Quark-3B**. Enable memory tiering in Settings to spill layers to RAM/disk and train models that exceed your VRAM.
+The 10B-A2B preset is the largest meant for a single machine. It is a mixture of experts: 10 B parameters, but each token only uses about 2 B of them, which keeps compute per token near that of a 2 B model. The older 1B … 400B names are nominal: the picker shows the real counts.
+
+On CUDA builds, **bf16** precision (Training tab) halves memory. Master weights and checkpoints stay f32.
 
 ---
 
 ## Backends
 
-Quark selects the fastest backend available at runtime. Multiple backends can be compiled in simultaneously.
+The backend is chosen at build time: CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is enabled, otherwise the CPU.
 
 | Backend | Hardware | Feature flag | Notes |
 |---------|----------|--------------|-------|
-| **CPU** (ndarray) | Any x86-64 / ARM64 | `backend-cpu` | Default; AVX2 auto-detected |
+| **CPU** (Burn Flex) | Any x86-64 / ARM64 | `backend-cpu` | Default; SIMD + multithreaded |
 | **WGPU / Metal** | Apple Silicon, AMD/Intel GPU | `backend-wgpu` | Recommended for macOS |
 | **CUDA** | NVIDIA GPU (sm_70+) | `backend-cuda` | Best performance on NVIDIA |
 
@@ -150,23 +144,28 @@ Pre-built releases ship the `backend-cpu` binary. Build from source with `backen
 
 ---
 
-## Memory Tiering
+## Offloading: training models bigger than memory
 
-Quark implements a three-tier memory system that lets you train models larger than your VRAM — or even larger than your RAM.
+With **Offloading** set to *Auto* (Training tab), a model that doesn't fit in RAM/VRAM is trained **layer by layer**:
 
-```
-┌──────────┐    ┌──────────┐    ┌──────────────────────┐
-│  VRAM    │ ←→ │  RAM     │ ←→ │  Disk (mmap)         │
-│ active   │    │ inactive │    │ optimizer state /    │
-│ layers   │    │ weights  │    │ weight shards        │
-└──────────┘    └──────────┘    └──────────────────────┘
-```
+1. Weights (f32 master copies) and optimizer state live in an offload folder on disk, with the most recently used layers cached in RAM (the RAM limit is in **Settings**).
+2. **Forward:** each layer is loaded onto the GPU (or CPU) in turn, the batch is run through it, and only the layer's *input* activations are kept (spilling to disk if needed).
+3. **Backward**, last layer first: each layer is reloaded and recomputed from its saved input to get gradients. That layer is then **updated immediately** and written back, so the full model's gradients never exist at once.
 
-- **Layer streaming** — the next layer is prefetched to VRAM while the current one executes.
-- **Gradient checkpointing** — activations are recomputed during backprop instead of stored.
-- **Offloaded optimizer** — Adam m/v buffers (2× model size) live in RAM; only the current shard is on the GPU during the update step.
-- **JIT quantization** — weights are stored as NF4 (4-bit) or INT8 on disk/RAM, dequantized to bf16 per-layer just before the forward pass.
-- **Memory-mapped shards** — `.safetensors` weight files are `mmap`'d so the OS pages them in/out transparently.
+Only one layer's weights, gradients and optimizer state are on the device at a time: ≈ 6 GB for the 10B preset. A test checks that one offloaded step matches the in-memory trainer to within float tolerance.
+
+- **Optimizers:** *AdamW* (8 bytes of state per parameter), *AdamW compact* (≈ 3 bytes: int8 first moment + bf16 second moment, tracks AdamW closely) or *Adafactor* (almost no state). For 10B, *AdamW compact* is the sensible default.
+- **Checkpoints** are `checkpoint-N/` folders (one file per layer, optimizer state included; the last 2 are kept). Resuming restores the optimizer state.
+- **Disk:** for 10B-A2B with AdamW compact, ≈ 40 GB of weights + ≈ 30 GB of optimizer state + activations, plus ≈ 70 GB per kept checkpoint. **Use an SSD**: every step reads and writes all of it.
+- **Gradient clipping** is per layer when offloading (each layer's gradient is capped so the total can't exceed *Max grad norm*).
+
+### Honest expectations for 10B
+
+- **It fits and it trains:** one 10B layer at full size (2048 tokens) was measured at 4.3 GB of memory for forward + backward.
+- **It is slow:** on a 4-core CPU one layer's forward + backward takes ≈ 32 s, so ≈ 20 minutes per 2048-token step for the whole model. A modern GPU is 50–100× faster at the compute. Disk I/O (~150 GB per step at 10B) then becomes the limit.
+- **Pretraining a 10B model to a *useful* quality from scratch needs on the order of 10²² operations**, which is years on any single machine. Expect to use the 10B preset for experiments, continued training, or fine-tuning, and the Tiny/Small presets for complete from-scratch runs.
+
+Run `quark-cli bench 10b --layer-only` (or `quark-cli bench small`) to measure your own machine.
 
 ---
 
@@ -176,7 +175,7 @@ Quark implements a three-tier memory system that lets you train models larger th
 |-------|-------------|
 | **Config** | Select a model preset or fully customize every architecture parameter (layers, hidden size, heads, experts, context length, dtype). |
 | **Dataset** | Add files or folders; preview tokenized samples; set train/validation split; optionally download and build **The Pile** (see below). |
-| **Training** | Start / pause / stop training. Live loss and learning-rate charts. Tokens/sec throughput, ETA to completion, per-tier memory bars (VRAM / RAM / disk). |
+| **Training** | Start / pause / stop training. Live loss and learning-rate charts. Tokens/sec throughput, ETA to completion, gradient norm, eval loss, process RAM (and VRAM on CUDA), and a memory estimate before you start. |
 | **Checkpoints** | Browse all saved checkpoints with timestamps and loss values. Load any checkpoint to resume training or run inference. Export weights as `.safetensors`. |
 | **Chat** | Stream tokens from your trained model. Adjust temperature, top-p, top-k, and max tokens. Edit the system prompt. |
 | **Settings** | Configure resource limits, hardware backend, disk offload path, theme, and log level. |
@@ -186,12 +185,36 @@ Quark implements a three-tier memory system that lets you train models larger th
 
 ## Training Guide
 
-1. **Configure** — open the **Config** panel, pick a preset, and optionally tweak context length or dtype.
+1. **Configure** — open the **Config** panel and pick a preset. Start with **Quark Tiny** to check that everything works, then move to **Small** on a GPU.
 2. **Load data** — open **Dataset**, click **Add Files/Folder** and point Quark at your code corpus. Quark will tokenize and pack sequences automatically.
 3. **Set resource limits** — open **Settings** and drag the VRAM / RAM / CPU sliders to leave headroom for other applications.
 4. **Start training** — open **Training** and click **▶ Start**. Quark runs the training loop on a background thread; the UI stays responsive.
 5. **Monitor** — watch the loss curve converge. The ETA and tokens/sec update in real time. Checkpoints auto-save every N steps (configurable).
-6. **Chat** — once loss converges (or at any checkpoint), open **Chat** and start a conversation.
+6. **Fine-tune for chat and tools** — a pretrained model only continues text. To make it answer questions and use `quark-code`'s tools, fine-tune it on conversations (next section).
+7. **Chat** — load a checkpoint in **Checkpoints**, then open **Chat**.
+
+### Chat & tool-use fine-tuning
+
+In the **Training** tab, choose **Fine-tune on chat data**, pick a base `checkpoint-N.bin`, and add one or more `.jsonl` files with one conversation per line:
+
+```json
+{"messages": [
+  {"role": "system", "content": "You are Quark Code…"},
+  {"role": "user", "content": "Where is parse_config defined?"},
+  {"role": "assistant", "content": "<tool_call>{\"tool\": \"grep_code\", \"pattern\": \"fn parse_config\"}</tool_call>"},
+  {"role": "tool", "content": "grep_code (ok):\nsrc/config.rs:12:pub fn parse_config(…)"},
+  {"role": "assistant", "content": "It's in src/config.rs at line 12."}
+]}
+```
+
+- **Roles:** `system`, `user`, `assistant` and `tool` (a tool's output, written as `name (ok|error):` followed by the output).
+- **What's trained:** only the assistant turns, so the model learns to answer, to emit `<tool_call>` blocks, and to end its turn.
+- **Template:** conversations use the same chat template (`quark-core/src/chat.rs`) that `quark-chat`, `quark-code` and the Chat panel use at inference time.
+- **Where it writes:** the architecture and tokenizer come from the base checkpoint's folder. The output goes to `<base>/finetune/`, so the base checkpoint is never overwritten.
+- **Learning rate:** the default drops to 5e-5 when you switch to fine-tuning.
+- **Sample data:** [`examples/chat-sft-sample.jsonl`](examples/chat-sft-sample.jsonl) has 30 example conversations (Q&A plus multi-step tool use) showing the format. It is far too small to teach a model on its own. Real instruction-following needs thousands to hundreds of thousands of conversations. You can convert public chat datasets (for example OpenAssistant or Dolly) into this format, and add tool-use examples from your own projects.
+
+> **Tokenizer note:** tokenizers now always include all 256 byte values, so any text can be encoded. Tokenizers trained with older Quark versions only knew the characters in their corpus and silently drop anything else, including the `<`/`>` in chat tags. Retrain the tokenizer (and pretrain again) before fine-tuning. Quark reports conversations that can't be encoded.
 
 ### Hyperparameters (Config panel)
 
@@ -247,30 +270,34 @@ All resource constraints are in the **Settings** panel and take effect immediate
 | **Theme** | System | Light / Dark / System |
 | **Log level** | Info | Trace / Debug / Info / Warn / Error |
 
-Reducing VRAM % or RAM % forces more layers to spill to the next tier (slower but prevents OOM).
+The RAM % limit sizes the in-RAM cache used when offloading, and the disk offload path is where offloaded weights, optimizer state and activations go (relative paths are inside the training output folder). Put it on an SSD.
 
 ---
 
 ## Exporting Your Model
 
-Once training is complete, open the **Export** panel to package your model as a standalone application.
+Once training is complete, open the **Export** panel to package your model as a standalone application. Choose the weight format:
+
+| Weights | Size vs f32 | 10B-A2B size | Notes |
+|---------|------------:|-------------:|-------|
+| f32 | 1× | ≈ 40 GB | exact |
+| 8-bit | ≈ ¼ | ≈ 11 GB | near-identical output |
+| 4-bit | ≈ ⅐ | ≈ 6 GB | small quality loss; the one to use for 10B on a laptop |
+
+Quantized models load almost instantly: weights are memory-mapped. On the CPU build a hand-written 4-bit kernel does the decoding. It measured ≈ 9.5 billion weights/s on 4 cores, so a 10B-A2B model (≈ 2 B weights per token) generates a few tokens per second. It also runs when the model is larger than free RAM, because the OS pages weights in from disk. On GPU builds, the quantized weights stay on the GPU and are unpacked just before each layer's matmul.
+
+The same export is available headless:
+
+```bash
+quark-cli export ~/.quark/checkpoints/checkpoint-2000 ./my-model --q4   # or --q8, or neither for f32
+quark-cli infer  ./my-model "Write a Rust function that reverses a string"
+```
 
 ### quark-chat
 
-A lightweight terminal REPL that spins up your model locally and lets you chat with it.
+A lightweight terminal REPL that runs your model locally. It loads the model from the `model/` folder next to the executable (`model/checkpoint/`, written by the Export panel), streams replies, and can call the enabled MCP tools. Commands: `/clear`, `/mcp`, `/help`, `/exit`.
 
-```
-Usage: quark-chat [OPTIONS]
-
-Options:
-  --model <DIR>       Path to model directory (default: bundled)
-  --system <TEXT>     System prompt override
-  --temperature <F>   Sampling temperature (default: 0.7)
-  --top-p <F>         Nucleus sampling threshold (default: 0.9)
-  --max-tokens <N>    Max tokens per response (default: 512)
-```
-
-The exported binary includes the weights, tokenizer, and a hardened config. No Python, no internet access, no dependencies — just run the binary.
+The exported bundle includes the weights, tokenizer and config. No Python, no internet access, no dependencies — just run the binary.
 
 ### quark-code
 
@@ -306,7 +333,7 @@ Options:
 | `write_file` | Write or overwrite a file |
 | `list_dir` | List directory contents |
 | `search_files` | Search file contents with a pattern |
-| `run_shell` | Execute a shell command and capture output |
+| `run_shell` | Execute a shell command and capture output (off by default; pass `--allow-shell` or enable it in `model/mcp.json`) |
 | `git_status` | Show `git status` |
 | `git_diff` | Show `git diff` (staged or unstaged) |
 | `git_log` | Show recent commit log |
@@ -316,6 +343,8 @@ Options:
 | `find_files` | Glob-pattern file search |
 | `read_lines` | Read specific line ranges from a file |
 | `write_lines` | Replace specific line ranges in a file |
+
+In **Plan** mode, tools that change the project (`write_file`, `write_lines`, `apply_diff`, `git_add`, `git_commit`, `run_shell`) are blocked. Tool results go back to the model, which can make further tool calls (up to 8 rounds per turn) before it gives its answer.
 
 #### Context Injection
 
@@ -353,13 +382,21 @@ cargo build --release --package quark-gui --features backend-cpu
 # GPU — WGPU/Metal (macOS & Linux)
 cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"
 
-# GPU — CUDA (NVIDIA)
+# GPU — CUDA (NVIDIA; needs the CUDA toolkit at runtime, see below)
 cargo build --release --package quark-gui --features "backend-cpu backend-cuda"
 
 # Build companion CLIs
 cargo build --release --package quark-chat --features backend-cpu
 cargo build --release --package quark-code --features backend-cpu
 ```
+
+**CUDA runtime requirements.** A CUDA build compiles without the CUDA toolkit, but it needs the
+toolkit to run: Burn compiles GPU kernels at runtime with NVRTC. It looks in `/usr/local/cuda`
+unless `CUDA_PATH` is set (Arch installs to `/opt/cuda`). The toolkit must not be newer than
+your driver: `nvcc --version` must be ≤ the "CUDA Version" shown by `nvidia-smi`. Otherwise
+kernels fail with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Update the driver and reboot, or point
+`CUDA_PATH` at an older toolkit, then delete `~/.cache/cubecl`. A wgpu build (Vulkan) runs on
+NVIDIA without the toolkit.
 
 Binaries are written to `target/release/`:
 - `quark` — GUI application

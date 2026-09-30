@@ -68,13 +68,19 @@ impl eframe::App for QuarkApp {
         // Wire: when a checkpoint is loaded in the Checkpoints panel, start
         // loading it into the Chat panel's InferenceEngine.
         if let Some(ckpt_path) = self.checkpoints_panel.take_just_loaded() {
-            // Only load .bin checkpoints (CompactRecorder format from training).
-            if ckpt_path.extension().is_some_and(|e| e == "bin") {
-                let config = self.config_panel.config().clone();
-                let tokenizer = self
-                    .dataset_panel
-                    .active_tokenizer_path()
-                    .unwrap_or_else(|| quark_core::paths::datasets_dir().join("tokenizer.json"));
+            // .bin checkpoints and sharded checkpoint-N folders (both written by training).
+            let sharded = quark_core::checkpoint::sharded::is_sharded(&ckpt_path);
+            if sharded || ckpt_path.extension().is_some_and(|e| e == "bin") {
+                // Prefer the architecture + tokenizer saved alongside the checkpoint.
+                let config = quark_core::model::config::QuarkConfig::for_checkpoint(&ckpt_path)
+                    .unwrap_or_else(|| self.config_panel.config().clone());
+                let tokenizer = if let Some(tok) = quark_core::checkpoint::export::tokenizer_for(&ckpt_path) {
+                    tok
+                } else {
+                    self.dataset_panel
+                        .active_tokenizer_path()
+                        .unwrap_or_else(|| quark_core::paths::datasets_dir().join("tokenizer.json"))
+                };
                 self.chat_panel.start_load(ckpt_path, config, tokenizer);
                 self.active = ActivePanel::Chat;
             }
@@ -118,12 +124,13 @@ impl eframe::App for QuarkApp {
                 // Disjoint field borrows: the borrow checker allows &mut on
                 // training_panel while taking & on config_panel / dataset_panel
                 // because they are separate fields of QuarkApp.
-                let (tp, cp, dp) = (
+                let (tp, cp, dp, sp) = (
                     &mut self.training_panel,
                     &self.config_panel,
                     &self.dataset_panel,
+                    &self.settings_panel,
                 );
-                tp.ui(ui, cp, dp);
+                tp.ui(ui, cp, dp, sp.tier_config());
             }
             ActivePanel::Checkpoints => self.checkpoints_panel.ui(ui),
             ActivePanel::Chat => self.chat_panel.ui(ui),

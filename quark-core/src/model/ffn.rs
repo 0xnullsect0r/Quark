@@ -2,34 +2,27 @@
 
 use burn::{
     module::Module,
-    nn::{Linear, LinearConfig},
     tensor::{activation::silu, backend::Backend, Tensor},
 };
 
-use super::config::QuarkConfig;
+use super::{config::QuarkConfig, proj::Proj};
 
 /// SwiGLU Feed-Forward Network.
 ///
 /// Formula: `out = down_proj(silu(gate_proj(x)) * up_proj(x))`
 #[derive(Module, Debug)]
 pub struct SwiGluFfn<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
+    gate_proj: Proj<B>,
+    up_proj: Proj<B>,
+    down_proj: Proj<B>,
 }
 
 impl<B: Backend> SwiGluFfn<B> {
     pub fn new(hidden_size: usize, intermediate_size: usize, device: &B::Device) -> Self {
         Self {
-            gate_proj: LinearConfig::new(hidden_size, intermediate_size)
-                .with_bias(false)
-                .init(device),
-            up_proj: LinearConfig::new(hidden_size, intermediate_size)
-                .with_bias(false)
-                .init(device),
-            down_proj: LinearConfig::new(intermediate_size, hidden_size)
-                .with_bias(false)
-                .init(device),
+            gate_proj: Proj::new(hidden_size, intermediate_size, device),
+            up_proj: Proj::new(hidden_size, intermediate_size, device),
+            down_proj: Proj::new(intermediate_size, hidden_size, device),
         }
     }
 
@@ -38,5 +31,14 @@ impl<B: Backend> SwiGluFfn<B> {
         let gate = silu(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);
         self.down_proj.forward(gate * up)
+    }
+
+    /// The projections, by path relative to this module.
+    pub fn projs_mut(&mut self, prefix: &str) -> Vec<(String, &mut Proj<B>)> {
+        vec![
+            (format!("{prefix}gate_proj"), &mut self.gate_proj),
+            (format!("{prefix}up_proj"), &mut self.up_proj),
+            (format!("{prefix}down_proj"), &mut self.down_proj),
+        ]
     }
 }

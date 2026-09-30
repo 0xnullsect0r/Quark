@@ -11,7 +11,11 @@ use quark_core::memory::budget::HardwareBudget;
 use quark_core::memory::tier::TierConfig;
 use quark_core::model::config::QuarkConfig;
 use quark_core::training::metrics::{MetricsReceiver, TrainingEvent, TrainingMetrics};
-use quark_core::training::trainer::{start_training, TrainerConfig, TrainingHandle};
+use quark_core::training::lr_schedule::CosineSchedule;
+use quark_core::training::trainer::{
+    start_training, Precision, TrainerConfig, TrainingHandle, TrainingMode,
+    FINE_TUNE_LR,
+};
 
 use super::config::ConfigPanel;
 use super::dataset::DatasetPanel;
@@ -24,11 +28,16 @@ pub struct TrainingPanel {
     stop_flag: Option<Arc<AtomicBool>>,
     latest: Option<TrainingMetrics>,
     loss_history: Vec<[f64; 2]>,
+    eval_history: Vec<[f64; 2]>,
     lr_history: Vec<[f64; 2]>,
     is_running: bool,
     phase: String,
     log: Vec<String>,
     budget: HardwareBudget,
+    /// Fine-tune an existing checkpoint on chat data instead of pretraining.
+    finetune: bool,
+    base_checkpoint: Option<PathBuf>,
+    chat_files: Vec<PathBuf>,
 }
 
 impl Default for TrainingPanel {
@@ -39,11 +48,15 @@ impl Default for TrainingPanel {
             stop_flag: None,
             latest: None,
             loss_history: Vec::new(),
+            eval_history: Vec::new(),
             lr_history: Vec::new(),
             is_running: false,
             phase: String::new(),
             log: Vec::new(),
             budget: HardwareBudget::detect(),
+            finetune: false,
+            base_checkpoint: None,
+            chat_files: Vec::new(),
         }
     }
 }
@@ -61,6 +74,157 @@ impl TrainingPanel {
         self.is_running = false;
     }
 
+    /// Offloading choice, optimizer, and the resulting memory / disk plan.
+    fn offload_ui(&mut self, ui: &mut egui::Ui, model_config: &QuarkConfig) {
+        use quark_core::training::{optim::OptimizerKind, plan::offload_plan, trainer::OffloadMode};
+        let fmt = super::config::fmt_bytes;
+        let green = egui::Color32::from_rgb(120, 200, 120);
+        let red = egui::Color32::from_rgb(255, 110, 90);
+
+        ui.horizontal(|ui| {
+            ui.label("Offloading:");
+            let c = &mut self.trainer_config.offload;
+            ui.radio_value(c, OffloadMode::Auto, "Auto").on_hover_text("Stream the model through RAM and disk only when it doesn't fit in memory");
+            ui.radio_value(c, OffloadMode::On, "Always");
+            ui.radio_value(c, OffloadMode::Off, "Never");
+            ui.separator();
+            ui.label("Optimizer:");
+            let o = &mut self.trainer_config.optimizer;
+            ui.radio_value(o, OptimizerKind::AdamW, "AdamW").on_hover_text("8 bytes of state per parameter");
+            ui.radio_value(o, OptimizerKind::AdamWCompact, "AdamW compact")
+                .on_hover_text("~3 bytes of state per parameter (int8 + bf16 moments); used when offloading");
+            ui.radio_value(o, OptimizerKind::Adafactor, "Adafactor").on_hover_text("almost no state");
+        });
+
+        let plan = offload_plan(model_config, &self.trainer_config, &self.budget);
+        let est = plan.in_memory;
+        if !plan.streamed {
+            ui.label(
+                egui::RichText::new(format!(
+                    "In memory: ≈{} needed · {} {} free{}",
+                    fmt(est.needed_bytes),
+                    fmt(est.available_bytes),
+                    est.device,
+                    if est.fits() { "" } else { " — likely too big: turn offloading on, or pick a smaller preset / batch" },
+                ))
+                .color(if est.fits() { green } else { red }),
+            );
+            return;
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "Offloaded (layer by layer): ≈{} on the {} at a time instead of ≈{} in memory",
+                fmt(plan.device_bytes),
+                est.device,
+                fmt(est.needed_bytes),
+            ))
+            .color(green),
+        );
+        let free = plan.disk_free.map(fmt).unwrap_or_else(|| "unknown".into());
+        ui.label(
+            egui::RichText::new(format!(
+                "Disk in {}: ≈{} needed (weights {}, optimizer {}, activations {}, 2 checkpoints {}) · {} free",
+                plan.offload_dir.display(),
+                fmt(plan.disk_needed),
+                fmt(plan.weights_bytes),
+                fmt(plan.optimizer_bytes),
+                fmt(plan.activation_bytes),
+                fmt(plan.checkpoint_bytes),
+                free,
+            ))
+            .color(if plan.disk_fits() { green } else { red }),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Offloaded steps are slow (each step reads and writes every layer's weights and optimizer \
+                 state); use an SSD. Set the offload folder and RAM limit in Settings.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
+    /// Pretrain / fine-tune switch and the fine-tune inputs.
+    fn mode_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let before = self.finetune;
+            ui.radio_value(&mut self.finetune, false, "Pretrain on text");
+            ui.radio_value(&mut self.finetune, true, "Fine-tune on chat data");
+            if self.finetune != before {
+                // Fine-tuning wants a much smaller learning rate.
+                self.trainer_config.schedule = if self.finetune {
+                    CosineSchedule {
+                        max_lr: FINE_TUNE_LR,
+                        min_lr: FINE_TUNE_LR / 10.0,
+                        ..CosineSchedule::default()
+                    }
+                } else {
+                    CosineSchedule::default()
+                };
+            }
+        });
+        if !self.finetune {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button("📂 Base checkpoint…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("checkpoint", &["bin"])
+                    .set_title("Pick the checkpoint to fine-tune")
+                    .pick_file()
+                {
+                    if let Some(dir) = path.parent() {
+                        self.trainer_config.output_dir = dir.join("finetune");
+                    }
+                    self.base_checkpoint = Some(path);
+                }
+            }
+            match &self.base_checkpoint {
+                Some(p) if QuarkConfig::for_checkpoint(p).is_none() => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 110, 90),
+                        format!("{} — no config.json next to it", p.display()),
+                    );
+                }
+                Some(p) => {
+                    ui.label(p.display().to_string());
+                }
+                None => {
+                    ui.label(egui::RichText::new("none selected").weak());
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("➕ Chat .jsonl files…").clicked() {
+                if let Some(files) = rfd::FileDialog::new()
+                    .add_filter("chat conversations", &["jsonl"])
+                    .pick_files()
+                {
+                    for f in files {
+                        if !self.chat_files.contains(&f) {
+                            self.chat_files.push(f);
+                        }
+                    }
+                }
+            }
+            ui.label(format!("{} file(s)", self.chat_files.len()));
+            if !self.chat_files.is_empty() && ui.small_button("Clear").clicked() {
+                self.chat_files.clear();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "One conversation per line: {\"messages\": [{\"role\": \"user\", \"content\": …}, \
+                 {\"role\": \"assistant\", …}]}. Roles: system, user, assistant, tool. \
+                 Only assistant turns are trained. See examples/chat-sft-sample.jsonl.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.separator();
+    }
+
     fn drain_events(&mut self) {
         let Some(rx) = &mut self.metrics_rx else { return };
         while let Ok(event) = rx.try_recv() {
@@ -75,6 +239,9 @@ impl TrainingPanel {
                     self.loss_history.push([m.step as f64, m.loss as f64]);
                     self.lr_history.push([m.step as f64, m.learning_rate as f64]);
                     self.latest = Some(m);
+                }
+                TrainingEvent::Eval { step, loss } => {
+                    self.eval_history.push([step as f64, loss as f64]);
                 }
                 TrainingEvent::Log(s) => {
                     self.log.push(s);
@@ -103,7 +270,10 @@ impl TrainingPanel {
         ui: &mut egui::Ui,
         config_panel: &ConfigPanel,
         dataset_panel: &DatasetPanel,
+        tier: &TierConfig,
     ) {
+        // Resource limits and the offload folder come from the Settings tab.
+        self.trainer_config.tier = tier.clone();
         self.drain_events();
         if self.is_running {
             ui.ctx()
@@ -116,6 +286,17 @@ impl TrainingPanel {
             .show(ui, |ui| {
                 ui.heading("🏋 Training");
                 ui.separator();
+
+                // Memory estimate for the current model + batch settings
+                self.mode_ui(ui);
+
+                let base_config = self
+                    .base_checkpoint
+                    .as_deref()
+                    .filter(|_| self.finetune)
+                    .and_then(QuarkConfig::for_checkpoint);
+                let model_config = base_config.as_ref().unwrap_or(config_panel.config());
+                self.offload_ui(ui, model_config);
 
                 // Control buttons
                 ui.horizontal(|ui| {
@@ -133,21 +314,38 @@ impl TrainingPanel {
                             ui.label(&self.phase);
                         }
                     } else {
+                        let ready = !self.finetune
+                            || (self.base_checkpoint.is_some() && !self.chat_files.is_empty());
                         if ui
-                            .button(
-                                egui::RichText::new("▶ Start Training")
-                                    .color(egui::Color32::GREEN)
-                                    .strong(),
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(
+                                    egui::RichText::new("▶ Start Training")
+                                        .color(egui::Color32::GREEN)
+                                        .strong(),
+                                ),
                             )
+                            .on_disabled_hover_text("Choose a base checkpoint and chat files")
                             .clicked()
                         {
                             self.loss_history.clear();
+                            self.eval_history.clear();
                             self.lr_history.clear();
                             self.log.clear();
                             self.phase.clear();
                             self.latest = None;
                             let model_config = config_panel.config().clone();
-                            let corpus_files = dataset_panel.corpus_files();
+                            let corpus_files = if self.finetune {
+                                self.chat_files.clone()
+                            } else {
+                                dataset_panel.corpus_files()
+                            };
+                            self.trainer_config.mode = match &self.base_checkpoint {
+                                Some(base) if self.finetune => TrainingMode::FineTune {
+                                    base_checkpoint: base.clone(),
+                                },
+                                _ => TrainingMode::Pretrain,
+                            };
                             let tokenizer_path = dataset_panel.active_tokenizer_path();
                             let (handle, rx) = start_training(
                                 model_config,
@@ -197,39 +395,27 @@ impl TrainingPanel {
                             let eta = m.eta_secs;
                             ui.label(format!("{}h {}m", eta / 3600, (eta % 3600) / 60));
                             ui.end_row();
+                            ui.label("Grad norm");
+                            ui.label(format!("{:.3}", m.grad_norm));
+                            ui.label("Eval loss");
+                            ui.label(match self.eval_history.last() {
+                                Some([_, loss]) => format!("{loss:.4}"),
+                                None => "—".to_owned(),
+                            });
+                            ui.end_row();
                         });
                 }
 
-                // Memory tier bars
+                // Process memory (spilling to disk is not implemented, so
+                // everything must fit in RAM/VRAM)
                 if let Some(m) = &self.latest {
                     ui.separator();
-                    ui.label(egui::RichText::new("Memory Tiers").strong());
-                    let vram_lim =
-                        TierConfig::default().vram_limit_bytes(&self.budget).max(1);
-                    let ram_lim =
-                        TierConfig::default().ram_limit_bytes(&self.budget).max(1);
-
-                    let vram_used = m.vram_used_bytes;
+                    ui.label(egui::RichText::new("Memory").strong());
+                    let ram_total = self.budget.ram_total_bytes.max(1);
                     let ram_used = m.ram_used_bytes;
-                    let disk_used = m.disk_used_bytes;
-
                     ui.horizontal(|ui| {
-                        ui.label("🟦 VRAM");
-                        let frac = (vram_used as f64 / vram_lim as f64).min(1.0) as f32;
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(180.0)
-                                .fill(tier_color(frac))
-                                .text(format!(
-                                    "{} / {}",
-                                    fmt_bytes(vram_used),
-                                    fmt_bytes(vram_lim)
-                                )),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("🟩 RAM  ");
-                        let frac = (ram_used as f64 / ram_lim as f64).min(1.0) as f32;
+                        ui.label("🟩 RAM ");
+                        let frac = (ram_used as f64 / ram_total as f64).min(1.0) as f32;
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .desired_width(180.0)
@@ -237,14 +423,28 @@ impl TrainingPanel {
                                 .text(format!(
                                     "{} / {}",
                                     fmt_bytes(ram_used),
-                                    fmt_bytes(ram_lim)
+                                    fmt_bytes(ram_total)
                                 )),
                         );
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("💾 Disk ");
-                        ui.label(format!("{} used", fmt_bytes(disk_used)));
-                    });
+                    if m.vram_used_bytes > 0 && self.budget.vram_total_bytes > 0 {
+                        let vram_total = self.budget.vram_total_bytes;
+                        ui.horizontal(|ui| {
+                            ui.label("🟦 VRAM");
+                            let frac =
+                                (m.vram_used_bytes as f64 / vram_total as f64).min(1.0) as f32;
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .desired_width(180.0)
+                                    .fill(tier_color(frac))
+                                    .text(format!(
+                                        "{} / {}",
+                                        fmt_bytes(m.vram_used_bytes),
+                                        fmt_bytes(vram_total)
+                                    )),
+                            );
+                        });
+                    }
                 }
 
                 // Loss chart
@@ -262,8 +462,18 @@ impl TrainingPanel {
                                 Line::new(pts)
                                     .name("loss")
                                     .color(egui::Color32::from_rgb(255, 140, 50))
-                                    .width(1.5),
+                                    .width(1.5_f32),
                             );
+                            if !self.eval_history.is_empty() {
+                                let pts: PlotPoints =
+                                    self.eval_history.iter().copied().collect();
+                                plot_ui.line(
+                                    Line::new(pts)
+                                        .name("eval loss")
+                                        .color(egui::Color32::from_rgb(120, 220, 120))
+                                        .width(2.0_f32),
+                                );
+                            }
                         });
 
                     ui.label(egui::RichText::new("Learning Rate").strong());
@@ -278,7 +488,7 @@ impl TrainingPanel {
                                 Line::new(pts)
                                     .name("lr")
                                     .color(egui::Color32::from_rgb(80, 180, 255))
-                                    .width(1.5),
+                                    .width(1.5_f32),
                             );
                         });
                 }
@@ -422,11 +632,32 @@ impl TrainingPanel {
                                 );
                                 ui.end_row();
 
-                                ui.label("Mixed precision");
+                                ui.label("Gradient checkpointing");
                                 ui.checkbox(
-                                    &mut self.trainer_config.mixed_precision,
-                                    "bf16/f16",
+                                    &mut self.trainer_config.gradient_checkpointing,
+                                    "recompute activations (less memory, a bit slower)",
                                 );
+                                ui.end_row();
+
+                                ui.label("Precision");
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut self.trainer_config.precision,
+                                        Precision::F32,
+                                        "f32",
+                                    );
+                                    ui.add_enabled_ui(Precision::Bf16.is_supported(), |ui| {
+                                        ui.radio_value(
+                                            &mut self.trainer_config.precision,
+                                            Precision::Bf16,
+                                            "bf16",
+                                        )
+                                        .on_disabled_hover_text(
+                                            "bf16 training needs a CUDA build \
+                                             (--features backend-cuda)",
+                                        );
+                                    });
+                                });
                                 ui.end_row();
 
                                 ui.label("Max grad norm");
@@ -436,6 +667,13 @@ impl TrainingPanel {
                                     )
                                     .range(0.1f32..=10.0f32)
                                     .speed(0.1),
+                                );
+                                ui.end_row();
+
+                                ui.label("Resume");
+                                ui.checkbox(
+                                    &mut self.trainer_config.resume,
+                                    "Continue from latest checkpoint",
                                 );
                                 ui.end_row();
 

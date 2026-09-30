@@ -5,6 +5,7 @@ pub mod hf_downloader;
 pub mod loader;
 pub mod packing;
 pub mod pile;
+pub mod sft;
 pub mod stats;
 
 pub use batch::{collate_batch, DataBatch};

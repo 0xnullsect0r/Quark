@@ -1,6 +1,9 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 use std::path::PathBuf;
+
+use quark_core::checkpoint::export::{export_for_inference, BUNDLE_CHECKPOINT};
+use quark_core::model::proj::QuantFormat;
 use std::sync::mpsc::Receiver;
 use quark_core::mcp::McpConfig;
 
@@ -79,6 +82,8 @@ pub struct ExportPanel {
     checkpoint_path: Option<PathBuf>,
     tokenizer_path:  Option<PathBuf>,
     config_path:     Option<PathBuf>,
+    /// Quantize the exported weights (smaller, faster to run).
+    quantization:    Option<QuantFormat>,
 
     // App settings
     app_name:       String,
@@ -99,6 +104,7 @@ impl Default for ExportPanel {
             checkpoint_path: None,
             tokenizer_path:  None,
             config_path:     None,
+            quantization:    Some(QuantFormat::Q8),
             app_name:        "MyQuarkApp".into(),
             system_prompt:   "You are Quark Code, an expert AI coding assistant running locally on the user's machine.".into(),
             mcp:             McpConfig::default(),
@@ -119,17 +125,21 @@ impl ExportPanel {
 
     /// Called from CheckpointsPanel when user clicks "Export as App" on a checkpoint
     pub fn set_checkpoint(&mut self, path: PathBuf) {
-        // Look for tokenizer.json and config.json in the same directory
-        let dir = path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-        self.checkpoint_path = Some(path);
-        let tok = dir.join("tokenizer.json");
-        if tok.exists() {
+        // tokenizer.json / config.json live inside a sharded checkpoint folder,
+        // or next to a .bin checkpoint.
+        let dir = if path.is_dir() {
+            path.clone()
+        } else {
+            path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+        };
+        if let Some(tok) = quark_core::checkpoint::export::tokenizer_for(&path) {
             self.tokenizer_path = Some(tok);
         }
         let cfg = dir.join("config.json");
         if cfg.exists() {
             self.config_path = Some(cfg);
         }
+        self.checkpoint_path = Some(path);
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -169,17 +179,34 @@ impl ExportPanel {
         // ─── Source files ───────────────────────────────────────────────────────
         egui::CollapsingHeader::new("📁 Source Files").default_open(true).show(ui, |ui| {
             egui::Grid::new("src_grid").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("Checkpoint (.bin / .safetensors)");
+                ui.label("Checkpoint (.bin or checkpoint-N folder)");
                 path_label(ui, &self.checkpoint_path);
-                if ui.button("Browse…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Checkpoint", &["bin", "safetensors"])
-                        .set_title("Pick checkpoint")
-                        .pick_file()
-                    {
-                        self.checkpoint_path = Some(p);
+                ui.horizontal(|ui| {
+                    if ui.button("File…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("Checkpoint", &["bin"])
+                            .set_title("Pick checkpoint")
+                            .pick_file()
+                        {
+                            self.set_checkpoint(p);
+                        }
                     }
-                }
+                    if ui.button("Folder…").on_hover_text("Sharded checkpoint from offloaded training").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().set_title("Pick checkpoint folder").pick_folder() {
+                            self.set_checkpoint(p);
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Weights");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.quantization, None, "f32");
+                    ui.radio_value(&mut self.quantization, Some(QuantFormat::Q8), "8-bit")
+                        .on_hover_text("≈ 1/4 the size, near-identical output");
+                    ui.radio_value(&mut self.quantization, Some(QuantFormat::Q4), "4-bit")
+                        .on_hover_text("≈ 1/7 the size (a 10B model is ≈ 6 GB), slightly lower quality");
+                });
                 ui.end_row();
 
                 ui.label("Tokenizer (tokenizer.json)");
@@ -439,6 +466,7 @@ impl ExportPanel {
         let checkpoint_path = self.checkpoint_path.clone().unwrap();
         let tokenizer_path  = self.tokenizer_path.clone().unwrap();
         let config_path     = self.config_path.clone();
+        let quantization    = self.quantization;
         let app_name        = self.app_name.trim().to_owned();
         let system_prompt   = self.system_prompt.clone();
         let mcp             = self.mcp.clone();
@@ -472,14 +500,18 @@ impl ExportPanel {
             }
             prog!(0.1);
 
-            // Copy checkpoint — always named checkpoint.bin in the bundle
-            log!("Copying checkpoint…");
-            if let Err(e) = fs::copy(&checkpoint_path, model_dir.join("checkpoint.bin")) {
-                let _ = tx.send(ExportMessage::Error(format!("Failed to copy checkpoint: {e}")));
+            // Write the model as a sharded (optionally quantized) checkpoint
+            match quantization {
+                Some(q) => log!("Quantizing weights to {q:?}…"),
+                None => log!("Copying checkpoint…"),
+            }
+            let bundle_ckpt = model_dir.join(BUNDLE_CHECKPOINT);
+            if let Err(e) = export_for_inference(&checkpoint_path, &bundle_ckpt, quantization) {
+                let _ = tx.send(ExportMessage::Error(format!("Failed to export checkpoint: {e:#}")));
                 return;
             }
             prog!(0.35);
-            log!("✔  checkpoint.bin");
+            log!("✔  {BUNDLE_CHECKPOINT}/");
 
             // Copy tokenizer
             log!("Copying tokenizer…");

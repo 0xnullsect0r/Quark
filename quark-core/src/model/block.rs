@@ -6,12 +6,11 @@ use burn::{
 };
 
 use super::{
-    attention::GroupedQueryAttention,
-    config::QuarkConfig,
-    ffn::SwiGluFfn,
-    moe::MoeBlock,
+    attention::GroupedQueryAttention, config::QuarkConfig, ffn::SwiGluFfn, moe::MoeBlock,
     norm::RmsNorm,
+    proj::Proj,
 };
+use crate::inference::cache::KvCache;
 
 /// A single transformer decoder block (dense or MoE depending on `is_moe`).
 #[derive(Module, Debug)]
@@ -19,12 +18,10 @@ pub struct DecoderBlock<B: Backend> {
     input_norm: RmsNorm<B>,
     attn: GroupedQueryAttention<B>,
     post_attn_norm: RmsNorm<B>,
-    /// Dense FFN (used when `is_moe` is false).
-    ffn: SwiGluFfn<B>,
-    /// MoE block (used when `is_moe` is true).
-    moe: MoeBlock<B>,
-    /// Selects between dense FFN and MoE; set at construction time.
-    is_moe: bool,
+    /// Dense FFN (present on dense layers only).
+    ffn: Option<SwiGluFfn<B>>,
+    /// MoE block (present on MoE layers only).
+    moe: Option<MoeBlock<B>>,
 }
 
 impl<B: Backend> DecoderBlock<B> {
@@ -33,31 +30,77 @@ impl<B: Backend> DecoderBlock<B> {
             input_norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, device),
             attn: GroupedQueryAttention::new(cfg, device),
             post_attn_norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, device),
-            ffn: SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, device),
-            moe: MoeBlock::new(cfg, device),
-            is_moe: is_moe_layer,
+            ffn: (!is_moe_layer)
+                .then(|| SwiGluFfn::new(cfg.hidden_size, cfg.intermediate_size, device)),
+            moe: is_moe_layer.then(|| MoeBlock::new(cfg, device)),
         }
     }
 
     /// Forward pass.
     ///
     /// - `x` shape: `[batch, seq, hidden]`
-    /// - `mask`: optional additive causal mask `[1, 1, seq, seq]`
-    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4>>) -> Tensor<B, 3> {
+    /// - `causal`: causal self-attention (always true for a decoder)
+    pub fn forward(&self, x: Tensor<B, 3>, causal: bool) -> Tensor<B, 3> {
+        self.forward_with_aux(x, causal).0
+    }
+
+    /// Incremental forward pass for generation; see
+    /// [`GroupedQueryAttention::forward_cached`].
+    pub fn forward_cached(
+        &self,
+        x: Tensor<B, 3>,
+        cache: &mut KvCache<B>,
+        start_pos: usize,
+    ) -> Tensor<B, 3> {
+        let residual = x.clone();
+        let x = self.input_norm.forward(x);
+        let x = self.attn.forward_cached(x, cache, start_pos) + residual;
+        self.feed_forward(x).0
+    }
+
+    /// Every projection, by path relative to this block.
+    pub fn projs_mut(&mut self) -> Vec<(String, &mut Proj<B>)> {
+        let mut projs = self.attn.projs_mut("attn.");
+        if let Some(ffn) = &mut self.ffn {
+            projs.extend(ffn.projs_mut("ffn."));
+        }
+        if let Some(moe) = &mut self.moe {
+            projs.extend(moe.projs_mut("moe."));
+        }
+        projs
+    }
+
+    pub fn new_cache(&self) -> KvCache<B> {
+        self.attn.new_cache()
+    }
+
+    /// Forward pass that also returns the MoE load-balancing loss (`None` on
+    /// dense layers).
+    pub fn forward_with_aux(
+        &self,
+        x: Tensor<B, 3>,
+        causal: bool,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         // Attention sub-layer with pre-norm and residual
         let residual = x.clone();
         let x = self.input_norm.forward(x);
-        let x = self.attn.forward(x, mask);
+        let x = self.attn.forward(x, causal);
         let x = x + residual;
+        self.feed_forward(x)
+    }
 
-        // FFN sub-layer with pre-norm and residual
+    /// FFN (dense or MoE) sub-layer with pre-norm and residual.
+    fn feed_forward(&self, x: Tensor<B, 3>) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         let residual = x.clone();
         let x = self.post_attn_norm.forward(x);
-        let x = if self.is_moe {
-            self.moe.forward(x)
-        } else {
-            self.ffn.forward(x)
+        let (x, aux) = match (&self.moe, &self.ffn) {
+            (Some(moe), _) => {
+                let (x, aux) = moe.forward_with_aux(x);
+                (x, Some(aux))
+            }
+            (None, Some(ffn)) => (ffn.forward(x), None),
+            (None, None) => unreachable!("decoder block has neither FFN nor MoE"),
         };
-        x + residual
+        (x + residual, aux)
     }
 }

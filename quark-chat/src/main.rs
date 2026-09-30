@@ -1,8 +1,8 @@
 //! quark-chat — standalone terminal chat app exported from Quark GUI.
 //!
 //! Expects model files next to the executable in a `model/` directory:
-//!   model/config.json              QuarkConfig
-//!   model/checkpoint.bin           weights (CompactRecorder format)
+//!   model/checkpoint/              sharded weights, optionally Q4/Q8-quantized
+//!                                  (or legacy model/checkpoint.bin + config.json)
 //!   model/tokenizer.json           BPE tokenizer
 //!   model/mcp.json                 McpConfig  (optional)
 //!   model/system_prompt.txt        system prompt (optional)
@@ -11,10 +11,10 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use quark_core::chat::{default_stop_strings, render_prompt, ChatMessage};
 use quark_core::inference::sampling::SamplingParams;
 use quark_core::inference::InferenceEngine;
-use quark_core::mcp::{execute_tool, format_tool_result, parse_tool_calls, McpConfig};
-use quark_core::model::config::QuarkConfig;
+use quark_core::mcp::{execute_tool, parse_tool_calls, McpConfig};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -53,39 +53,25 @@ fn main() -> Result<()> {
             .to_string()
     };
 
-    // Load model config
-    let config_path = model_dir.join("config.json");
-    let model_config: QuarkConfig = if config_path.exists() {
-        let txt = std::fs::read_to_string(&config_path)?;
-        serde_json::from_str(&txt).unwrap_or_else(|_| QuarkConfig::quark_1b())
-    } else {
-        QuarkConfig::quark_1b()
-    };
-
     let model_name = "Quark".to_string();
 
     // Load inference engine
-    let checkpoint_path = model_dir.join("checkpoint.bin");
-    let tokenizer_path = model_dir.join("tokenizer.json");
-
-    let engine = if checkpoint_path.exists() && tokenizer_path.exists() {
-        eprintln!("Loading model from {}…", checkpoint_path.display());
-        match InferenceEngine::load(&checkpoint_path, &model_config, &tokenizer_path) {
-            Ok(e) => {
-                eprintln!("Model loaded.");
-                Some(e)
-            }
-            Err(e) => {
-                eprintln!("Warning: model load failed: {e}");
-                None
-            }
+    eprintln!("Loading model from {}…", model_dir.display());
+    let engine = match InferenceEngine::load_bundle(&model_dir) {
+        Ok(e) => {
+            eprintln!("Model loaded.");
+            Some(e)
         }
-    } else {
-        eprintln!("Warning: checkpoint.bin or tokenizer.json not found — running without model.");
-        None
+        Err(e) => {
+            eprintln!("Warning: {e:#} — running without model.");
+            None
+        }
     };
 
-    let sampling = SamplingParams::default();
+    let sampling = SamplingParams {
+        stop_strings: default_stop_strings(),
+        ..SamplingParams::default()
+    };
 
     println!("╔══════════════════════════════════════════╗");
     println!("║  {} — Chat                               ", model_name);
@@ -99,7 +85,7 @@ fn main() -> Result<()> {
     println!("─────────────────────────────────────────────────");
     println!();
 
-    let mut history = format!("<system>\n{system_prompt}\n</system>\n\n");
+    let mut history = vec![ChatMessage::system(system_prompt.as_str())];
 
     let stdin = io::stdin();
     loop {
@@ -123,7 +109,7 @@ fn main() -> Result<()> {
             break;
         }
         if input == "/clear" {
-            history = format!("<system>\n{system_prompt}\n</system>\n\n");
+            history.truncate(1);
             println!("[Conversation cleared]");
             continue;
         }
@@ -136,15 +122,26 @@ fn main() -> Result<()> {
             continue;
         }
 
-        history.push_str(&format!("<user>\n{input}\n</user>\n\n<assistant>\n"));
+        history.push(ChatMessage::user(input));
+        let prompt = render_prompt(&history);
 
         let response = match &engine {
             Some(e) => {
                 print!("Quark: ");
                 io::stdout().flush()?;
-                match e.generate(&history, sampling.clone()) {
+                let (token_tx, token_rx) = std::sync::mpsc::channel::<String>();
+                let result = std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        for piece in token_rx {
+                            print!("{piece}");
+                            let _ = io::stdout().flush();
+                        }
+                    });
+                    e.generate_streaming(&prompt, sampling.clone(), token_tx)
+                });
+                match result {
                     Ok(text) => {
-                        println!("{text}");
+                        println!();
                         text
                     }
                     Err(err) => {
@@ -161,20 +158,18 @@ fn main() -> Result<()> {
             }
         };
 
+        history.push(ChatMessage::assistant(response.as_str()));
+
         let calls = parse_tool_calls(&response);
         for call in &calls {
             println!();
             println!("[MCP] Calling tool: {} {:?}", call.tool, call.args);
             let result = execute_tool(call, &mcp_cfg);
-            let formatted = format_tool_result(&result);
             println!("[MCP] Result ({}):", if result.ok { "ok" } else { "error" });
             let preview: String = result.content.chars().take(500).collect();
             println!("{preview}");
-            history.push_str(&formatted);
-            history.push('\n');
+            history.push(ChatMessage::tool_result(&result));
         }
-
-        history.push_str(&format!("{response}\n</assistant>\n\n"));
         println!();
     }
 

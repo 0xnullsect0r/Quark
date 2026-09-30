@@ -74,9 +74,9 @@ quark-cli/    — thin CLI entry point
 | `training` | Training loop, optimizer, gradient checkpointing |
 | `inference` | Token generation, sampling |
 | `data` | Dataset loading and tokenization |
-| `checkpoint` | Safetensors serialization |
+| `checkpoint` | `.bin` recorder, sharded checkpoints, Q4/Q8 quantization, inference export |
 | `tokenizer` | HuggingFace BPE tokenizer wrapper |
-| `memory` | Three-tier VRAM/RAM/disk spilling |
+| `memory` | Hardware budget, `TensorStore` (RAM cache over disk), module ↔ stage conversion |
 | `mcp` | MCP tool definitions and XML tool-call parser |
 | `paths` | Platform-specific app data directories |
 | `updater` | Background GitHub release check |
@@ -91,11 +91,10 @@ The model emits tool calls as `<tool_call>{"tool":"name",...}</tool_call>` XML i
 
 `start_turn()` spawns a background thread that:
 1. Builds a system prompt injecting available tools, current mode (Plan/Build), and `AGENTS.md` context
-2. Runs inference (currently a keyword-matching stub — real model wiring is a TODO)
-3. Streams `AgentEvent` tokens back over `mpsc::channel`
-4. Parses tool calls from the response, executes them, and emits `FileChanged` events for undo tracking
+2. Runs inference with the loaded `InferenceEngine` and streams real tokens as `AgentEvent::Token`, falling back to a keyword-matching stub (`generate_stub_response`) when no model is bundled
+3. Parses tool calls, executes them, emits `FileChanged` events for undo tracking, and feeds `<tool_result>` blocks back to the model for up to `MAX_TOOL_ROUNDS` rounds
 
-Plan mode blocks all write/git tools. Build mode allows full filesystem access.
+Plan mode blocks mutating tools (`is_mutating_tool`) in code, not just in the prompt. Build mode allows full filesystem access. `run_shell` is off unless `--allow-shell` is passed or `mcp.json` enables it.
 
 ### GUI panels (`quark-gui/src/panels/`)
 
@@ -104,11 +103,11 @@ Each panel is a struct implementing a `ui(&mut self, ui: &mut egui::Ui)` method.
 ### Backend feature flags
 
 The Burn backend is selected at compile time via Cargo features:
-- `backend-cpu` → `burn-ndarray`
-- `backend-wgpu` → `burn-wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
-- `backend-cuda` → `burn-cuda` (NVIDIA sm_70+)
+- `backend-cpu` → Burn's `Flex` (pure-Rust CPU; replaced ndarray in the 0.21 upgrade)
+- `backend-wgpu` → `burn/wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
+- `backend-cuda` → `burn/cuda` (NVIDIA sm_70+)
 
-Multiple backends can coexist; the fastest available is selected at runtime.
+The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise Flex. Burn is 0.21; code only names backends through `backend.rs` aliases (tests use `InferBackend`). CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners). Running a CUDA build needs the CUDA toolkit (NVRTC, via `/usr/local/cuda` or `CUDA_PATH`) no newer than the driver. `backend::check_device()` runs a test kernel before training/inference and turns the usual failures into one readable error.
 
 ### Data directories
 
@@ -126,6 +125,22 @@ Subdirectories: `checkpoints/`, `datasets/`, `the-pile/`, `settings.toml`.
 - Error handling uses `anyhow` for applications and `thiserror` for library types
 - Logging uses `tracing`; log level is controlled by `RUST_LOG` env var (default: `quark=info`)
 
-## Key TODOs in the Codebase
+## Model, training and inference notes
 
-The inference path in `quark-code/src/agent.rs` is a heuristic stub (`generate_stub_response`). The comment at line 121 marks where real `quark-core` inference needs to be wired in once model weights are loadable.
+- `DecoderBlock` holds either a dense FFN or a `MoeBlock` (as `Option`s), never both. MoE uses sparse top-k dispatch and returns a Switch-style load-balancing loss via `forward_with_aux`.
+- Training (`training/trainer.rs`) supports grad accumulation, global-norm clipping (`training/grad_clip.rs`), held-out eval (`TrainingEvent::Eval`), and resume from the latest `checkpoint-N.bin`. It writes `config.json` and `tokenizer.json` next to the checkpoints; `QuarkConfig::for_checkpoint` reads the config back.
+- `start_training` runs `dispatch_training`, which picks the autodiff backend for `TrainerConfig::precision` (`Bf16` only in CUDA builds) and runs the generic `run_training_loop::<AB>`. It also wraps the backend in `BalancedCheckpointing` when `gradient_checkpointing` is on (the default). Panics in the training thread become `TrainingEvent::Error("Training crashed: …")`. Burn 0.21 has no autodiff `topk`, so the MoE mask uses `sort_descending`.
+- `QuarkConfig::param_count()` is exact (a test checks it against `num_params()`). `training_memory_bytes` and `trainer::estimate_memory` give the rough memory estimate that the GUI and trainer show.
+- `chat.rs` holds the one chat template (`render_prompt`, `render_training_segments`, `STOP_STRINGS`). quark-chat, quark-code, the GUI chat and SFT data all use it, and `SamplingParams::stop_strings` ends generation at the assistant's closing tag.
+- `TrainingMode::FineTune { base_checkpoint }` runs chat SFT (`data/sft.rs`: JSONL `{"messages": [...]}`, loss only on assistant tokens via byte-range masks from `QuarkTokenizer::encode_with_offsets`). It takes the architecture and tokenizer from the base folder and writes to `<base>/finetune/`.
+- Tokenizers are trained with the full `ByteLevel::alphabet()`. Older ones silently drop unseen characters, and `encode_with_offsets` reports this as an error.
+- **Offloaded ("streamed") training** (`training/streamed.rs`): `TrainerConfig::offload` (`Auto` = when the in-memory estimate doesn't fit). Weights and optimizer state live in `memory::store::TensorStore` (an LRU RAM cache over per-stage safetensors files under `<output>/offload/`). Each step runs a forward pass stage by stage (saving each layer's input activations to a second store), then a layer-major backward that recomputes each stage with autodiff, and updates it right away with the per-stage optimizers in `training/optim.rs` (`AdamW` matches Burn's exactly; `AdamWCompact` = companded int8 m + bf16 v; `Adafactor`). Clipping is per stage (`max_grad_norm/sqrt(stages)`). Checkpoints are sharded (`checkpoint/sharded.rs`, `checkpoint-N/` dirs incl. optimizer state; only the last 2 are kept). `streamed_step_matches_in_memory_step` checks one streamed step against the in-memory maths to 1e-5.
+- Model stages (`model/stages.rs`): `EmbedStage` / `DecoderBlock` / `HeadStage` keep `QuarkModel`'s parameter paths. `memory/stage.rs` moves them in and out of `StageTensors` via burn-store. Don't clone a model before its lazily initialised params have been read: the clone draws new random weights.
+- Attention: `forward(x, causal: bool)` uses Burn's fused `attention` op (flash attention on GPU backends). Only a multi-token chunk on top of a KV cache uses an explicit mask.
+- Loss: `training::loss::masked_cross_entropy` averages over non-padding targets only. Don't use Burn's `CrossEntropyLoss` with pad tokens: it divides by all positions. The streamed head computes the loss in chunks of positions (`set_head_chunk_elems`) so the full logits never exist at once.
+- Stage weights on the host are always f32 (`module_to_stage` converts). `load_stage` casts to the backend's float dtype, and streamed optimizer math runs in f32 on `ComputeBackend`, so bf16 (CUDA) keeps f32 master weights.
+- Projections (`model/proj.rs::Proj`, used instead of `Linear` in attention, FFN, experts and LM head) are dense for training, or hold block-quantized Q4/Q8 weights for inference. `checkpoint/quantize.rs` writes quantized sharded checkpoints (`meta.json` `quantization`), and `load_sharded` loads them by memory-mapping the stage files. On CPU (`HOST_QUANT`), the decode kernel `HostQuant::matvec` (int8-quantized input × packed weights, integer dot products) reads the mapped pages directly. GPU backends unpack on the device with bitwise ops. `checkpoint/export.rs::export_for_inference` builds app bundles (`model/checkpoint/`), and `InferenceEngine::load_bundle` loads them.
+- `training/plan.rs::offload_plan` is the single source for "in memory or offloaded, device bytes, disk bytes" (used by the Training tab). `QuarkConfig::quark_10b_a2b()` is the 10B MoE preset (10.0B total / 2.1B active). `quark-cli bench <tiny|small|10b> [--layer-only]` measures a machine; `quark-cli export|infer` exports and runs checkpoints headless.
+- Checkpoints use `checkpoint::CheckpointRecorder` (Burn `BinFileRecorder`, full precision, `.bin`). Optimizer state is not saved, so it restarts fresh on resume.
+- Generation (`inference/generate.rs`) uses per-layer KV caches (`QuarkModel::forward_cached`). When the context window fills, it re-prefills the most recent half window.
+- `quark-core/tests/train_e2e.rs` trains a tiny model end-to-end (train → eval → checkpoint → load → stream → resume → chat fine-tune → stop at `</assistant>`). Run it after touching the model, trainer, tokenizer or inference code.
