@@ -250,8 +250,8 @@ impl HostQuant {
 fn dot_q4(bytes: &[u8], x: &[i8]) -> i32 {
     bytes
         .iter()
-        .zip(x.chunks_exact(2))
-        .map(|(&b, xs)| (b & 15) as i32 * xs[0] as i32 + (b >> 4) as i32 * xs[1] as i32)
+        .zip(x.as_chunks::<2>().0)
+        .map(|(&b, &[lo, hi])| (b & 15) as i32 * lo as i32 + (b >> 4) as i32 * hi as i32)
         .sum()
 }
 

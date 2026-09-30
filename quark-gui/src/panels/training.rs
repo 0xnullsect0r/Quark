@@ -462,7 +462,7 @@ impl TrainingPanel {
                                 Line::new(pts)
                                     .name("loss")
                                     .color(egui::Color32::from_rgb(255, 140, 50))
-                                    .width(1.5),
+                                    .width(1.5_f32),
                             );
                             if !self.eval_history.is_empty() {
                                 let pts: PlotPoints =
@@ -471,7 +471,7 @@ impl TrainingPanel {
                                     Line::new(pts)
                                         .name("eval loss")
                                         .color(egui::Color32::from_rgb(120, 220, 120))
-                                        .width(2.0),
+                                        .width(2.0_f32),
                                 );
                             }
                         });
@@ -488,7 +488,7 @@ impl TrainingPanel {
                                 Line::new(pts)
                                     .name("lr")
                                     .color(egui::Color32::from_rgb(80, 180, 255))
-                                    .width(1.5),
+                                    .width(1.5_f32),
                             );
                         });
                 }

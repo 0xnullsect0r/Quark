@@ -485,7 +485,7 @@ impl DatasetPanel {
                 if self.hf_enabled {
                     ui.add_space(4.0);
                     egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+                        .stroke(egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color))
                         .corner_radius(6.0)
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
