@@ -280,7 +280,7 @@ mod tests {
     }
 
     fn setup() -> (AdamWConfig, Linear<AB>, Tensor<AB, 2>) {
-        let device = Default::default();
+        let device = crate::backend::device();
         <AB as Backend>::seed(&device, 7);
         let hyper = AdamWConfig { weight_decay: 0.1, ..AdamWConfig::default() };
         let layer = LinearConfig::new(16, 8).with_bias(false).init::<AB>(&device);
@@ -306,7 +306,7 @@ mod tests {
 
     fn loss_with(layer: &Linear<AB>, w: &[f32], x: &Tensor<AB, 2>) -> f32 {
         let mut l = layer.clone();
-        let t = Tensor::<AB, 1>::from_data(TensorData::new(w.to_vec(), [w.len()]), &Default::default());
+        let t = Tensor::<AB, 1>::from_data(TensorData::new(w.to_vec(), [w.len()]), &crate::backend::device());
         l.weight = l.weight.map(|_| t.reshape([16, 8]));
         loss(&l, x).into_scalar()
     }
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn int8_roundtrip() {
-        let device = Default::default();
+        let device = crate::backend::device();
         let x = Tensor::<IB, 1>::random([300], Distribution::Normal(0.0, 1.0), &device);
         let mut out = Vec::new();
         quantize_i8("m", x.clone(), &mut out);

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # build/linux/deb.sh — Build a .deb package for Quark on Debian/Ubuntu
 # Assumes all three binaries have already been built with:
-#   cargo build --release --package quark-gui --features backend-cpu
-#   cargo build --release --package quark-chat --features backend-cpu
-#   cargo build --release --package quark-code --features backend-cpu
+#   cargo build --release --package quark-gui --features "backend-cpu backend-wgpu backend-cuda"
+#   cargo build --release --package quark-chat --features "backend-cpu backend-wgpu backend-cuda"
+#   cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
 # Usage: bash build/linux/deb.sh
 set -euo pipefail
 

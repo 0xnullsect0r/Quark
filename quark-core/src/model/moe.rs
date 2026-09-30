@@ -186,7 +186,7 @@ mod tests {
 
     fn weights() -> Tensor<B, 3> {
         let data = TensorData::new(vec![0.1f32, 0.6, 0.3, 0.5, 0.2, 0.3], [1, 2, 3]);
-        Tensor::from_data(data, &Default::default())
+        Tensor::from_data(data, &crate::backend::device())
     }
 
     #[test]
@@ -211,16 +211,16 @@ mod tests {
     fn balanced_routing_has_unit_aux_loss() {
         // Two tokens, each routed (top-1) to a different expert with p = 0.5 / 0.5.
         let data = TensorData::new(vec![0.5f32, 0.5, 0.5, 0.5], [1, 2, 2]);
-        let probs: Tensor<B, 3> = Tensor::from_data(data, &Default::default());
+        let probs: Tensor<B, 3> = Tensor::from_data(data, &crate::backend::device());
         let mask_data = TensorData::new(vec![1.0f32, 0.0, 0.0, 1.0], [1, 2, 2]);
-        let mask: Tensor<B, 3> = Tensor::from_data(mask_data, &Default::default());
+        let mask: Tensor<B, 3> = Tensor::from_data(mask_data, &crate::backend::device());
         let aux: f32 = load_balance_loss(probs, mask, 1).into_scalar();
         assert!((aux - 1.0).abs() < 1e-5, "{aux}");
     }
 
     #[test]
     fn sparse_dispatch_matches_dense_mixture() {
-        let device = Default::default();
+        let device = crate::backend::device();
         let cfg = QuarkConfig {
             hidden_size: 16,
             intermediate_size: 32,

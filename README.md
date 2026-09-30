@@ -126,21 +126,21 @@ All presets use the same GQA + MoE architecture. The GUI's preset picker shows t
 
 The 10B-A2B preset is the largest meant for a single machine. It is a mixture of experts: 10 B parameters, but each token only uses about 2 B of them, which keeps compute per token near that of a 2 B model. The older 1B … 400B names are nominal: the picker shows the real counts.
 
-On CUDA builds, **bf16** precision (Training tab) halves memory. Master weights and checkpoints stay f32.
+With the CUDA backend, **bf16** precision (Training tab) halves memory. Master weights and checkpoints stay f32.
 
 ---
 
 ## Backends
 
-The backend is chosen at build time: CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is enabled, otherwise the CPU.
+Every binary includes all backends and picks one when it starts: **CUDA** if it runs, otherwise **wgpu** (Vulkan / DX12 / Metal, discrete GPU first, then integrated), otherwise the **CPU**. Settings → Compute Backend shows which one is in use and why the others were skipped. To force one, start Quark with `QUARK_BACKEND=cuda`, `wgpu` or `cpu`.
 
-| Backend | Hardware | Feature flag | Notes |
-|---------|----------|--------------|-------|
-| **CPU** (Burn Flex) | Any x86-64 / ARM64 | `backend-cpu` | Default; SIMD + multithreaded |
-| **WGPU / Metal** | Apple Silicon, AMD/Intel GPU | `backend-wgpu` | Recommended for macOS |
-| **CUDA** | NVIDIA GPU (sm_70+) | `backend-cuda` | Best performance on NVIDIA |
+| Backend | Hardware | Notes |
+|---------|----------|-------|
+| **CUDA** | NVIDIA GPU (sm_70+) | Fastest on NVIDIA; needs the CUDA toolkit (see below). bf16 training |
+| **wgpu** | Any GPU with Vulkan, DX12 or Metal (NVIDIA, AMD, Intel, Apple) | No toolkit needed |
+| **CPU** (Burn Flex) | Any x86-64 / ARM64 | Always available; fast Q4/Q8 decode kernel |
 
-Pre-built releases ship the `backend-cpu` binary. Build from source with `backend-wgpu` or `backend-cuda` for GPU acceleration.
+Pre-built releases and the AUR package include all three (macOS: wgpu/Metal and CPU; CUDA doesn't exist there). The Cargo features `backend-cpu`, `backend-wgpu` and `backend-cuda` choose which backends are compiled in; the binaries enable all three by default.
 
 ---
 
@@ -266,7 +266,7 @@ All resource constraints are in the **Settings** panel and take effect immediate
 | **CPU thread %** | 80% | Fraction of logical cores handed to training workers |
 | **GPU compute %** | 90% | Fraction of GPU compute budget reserved for Quark |
 | **Disk offload path** | app-data dir | Where to write weight shards that don't fit in RAM |
-| **Backend** | Auto | Force a specific backend (CPU / WGPU / CUDA) |
+| **Backend** | Auto | Shows the backend in use; force one with `QUARK_BACKEND=cuda\|wgpu\|cpu` |
 | **Theme** | System | Light / Dark / System |
 | **Log level** | Info | Trace / Debug / Info / Warn / Error |
 
@@ -376,27 +376,20 @@ sudo apt-get install -y \
 git clone https://github.com/0xnullsect0r/Quark.git
 cd Quark
 
-# CPU-only (all platforms)
-cargo build --release --package quark-gui --features backend-cpu
+# Linux / Windows: all backends (CUDA, wgpu, CPU), picked at runtime
+cargo build --release
 
-# GPU — WGPU/Metal (macOS & Linux)
-cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"
-
-# GPU — CUDA (NVIDIA; needs the CUDA toolkit at runtime, see below)
-cargo build --release --package quark-gui --features "backend-cpu backend-cuda"
-
-# Build companion CLIs
-cargo build --release --package quark-chat --features backend-cpu
-cargo build --release --package quark-code --features backend-cpu
+# macOS: wgpu (Metal) and CPU
+cargo build --release --no-default-features --features "backend-cpu backend-wgpu"
 ```
 
-**CUDA runtime requirements.** A CUDA build compiles without the CUDA toolkit, but it needs the
+**CUDA runtime requirements.** Building needs no CUDA toolkit, but the CUDA backend needs the
 toolkit to run: Burn compiles GPU kernels at runtime with NVRTC. It looks in `/usr/local/cuda`
 unless `CUDA_PATH` is set (Arch installs to `/opt/cuda`). The toolkit must not be newer than
 your driver: `nvcc --version` must be ≤ the "CUDA Version" shown by `nvidia-smi`. Otherwise
 kernels fail with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Update the driver and reboot, or point
-`CUDA_PATH` at an older toolkit, then delete `~/.cache/cubecl`. A wgpu build (Vulkan) runs on
-NVIDIA without the toolkit.
+`CUDA_PATH` at an older toolkit, then delete `~/.cache/cubecl`. Until then Quark falls back to
+wgpu (Vulkan), which runs on NVIDIA without the toolkit.
 
 Binaries are written to `target/release/`:
 - `quark` — GUI application

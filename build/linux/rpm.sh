@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # build/linux/rpm.sh — Build a .rpm package for Quark on Fedora/RHEL/openSUSE
 # Assumes all three binaries have already been built with:
-#   cargo build --release --package quark-gui --features backend-cpu
-#   cargo build --release --package quark-chat --features backend-cpu
-#   cargo build --release --package quark-code --features backend-cpu
+#   cargo build --release --package quark-gui --features "backend-cpu backend-wgpu backend-cuda"
+#   cargo build --release --package quark-chat --features "backend-cpu backend-wgpu backend-cuda"
+#   cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
 # Requires: rpm-build
 # Usage: bash build/linux/rpm.sh
 set -euo pipefail

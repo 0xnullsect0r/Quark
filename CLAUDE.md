@@ -8,21 +8,23 @@ Quark is a desktop application for training and running Llama 4-style Mixture-of
 
 ## Build Commands
 
-All builds require a backend feature flag. `backend-cpu` works everywhere; `backend-wgpu` adds GPU on macOS/Linux; `backend-cuda` adds NVIDIA GPU support.
+Backends are Cargo features: `backend-cpu` (always), `backend-wgpu`, `backend-cuda`. The binary crates enable all three by default and pick one at runtime (macOS: build with `--no-default-features --features "backend-cpu backend-wgpu"`).
 
 ```bash
-# Development build (fast compile, opt-level 1)
-cargo build --package quark-gui --features backend-cpu
+# Development build (fast compile, opt-level 1); all backends, picked at runtime
+cargo build --package quark-gui
 
 # Release build (lto, strip, codegen-units=1 — slow)
-cargo build --release --package quark-gui --features backend-cpu
+cargo build --release --package quark-gui
 
-# Build all three binaries
-cargo build --release --features backend-cpu
+# Build all binaries
+cargo build --release
 
-# GPU variants
-cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"   # macOS/Linux
-cargo build --release --package quark-gui --features "backend-cpu backend-cuda"   # NVIDIA
+# CPU only (faster to compile)
+cargo build --release --no-default-features --features backend-cpu
+
+# macOS (no CUDA)
+cargo build --release --no-default-features --features "backend-cpu backend-wgpu"
 ```
 
 Binaries land in `target/release/`: `quark`, `quark-chat`, `quark-code`.
@@ -100,14 +102,13 @@ Plan mode blocks mutating tools (`is_mutating_tool`) in code, not just in the pr
 
 Each panel is a struct implementing a `ui(&mut self, ui: &mut egui::Ui)` method. `QuarkApp` in `app.rs` owns all panel instances and dispatches to the active one. The `DatasetPanel` has a background `update(ctx)` call for polling live download logs.
 
-### Backend feature flags
+### Backends
 
-The Burn backend is selected at compile time via Cargo features:
-- `backend-cpu` → Burn's `Flex` (pure-Rust CPU; replaced ndarray in the 0.21 upgrade)
-- `backend-wgpu` → `burn/wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
-- `backend-cuda` → `burn/cuda` (NVIDIA sm_70+)
+`ComputeBackend` is Burn's `Dispatch` backend (`quark-core/src/backend.rs`); its `DispatchDevice` says which real backend runs the ops. `backend::selection()` picks one once per process: `QUARK_BACKEND=cuda|wgpu|cpu` or `set_preference` forces one, otherwise the first that runs a test kernel of CUDA → wgpu (discrete, then integrated GPU; never wgpu's software adapter) → Flex CPU. Probe panics (often on GPU worker threads) are captured and turned into readable reasons (`explain_device_error`). Features choose what is compiled in: `backend-cpu` → Flex, `backend-wgpu` → `burn/wgpu` (WGSL), `backend-cuda` → `burn/cuda`; all add `burn/dispatch`.
 
-The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise Flex. Burn is 0.21; code only names backends through `backend.rs` aliases (tests use `InferBackend`). CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners). Running a CUDA build needs the CUDA toolkit (NVRTC, via `/usr/local/cuda` or `CUDA_PATH`) no newer than the driver. `backend::check_device()` runs a test kernel before training/inference and turns the usual failures into one readable error.
+- Never use `Default::default()` for a device: use `backend::device()` (Dispatch) or `backend::default_device::<B>()` in generic code (falls back to the default for non-Dispatch backends such as `ComputeBackendBf16 = Cuda<bf16>`, used for bf16 training when CUDA is selected).
+- `backend::is_cpu_device(device)` decides whether quantized weights use the host decode kernel.
+- Running the CUDA backend needs the CUDA toolkit (NVRTC, via `/usr/local/cuda` or `CUDA_PATH`) no newer than the driver; otherwise it's skipped. CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners).
 
 ### Data directories
 

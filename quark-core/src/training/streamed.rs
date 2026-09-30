@@ -403,7 +403,7 @@ impl<AB: AutodiffBackend> StreamedTrainer<AB> {
             let n: usize = shape.iter().product();
             // The optimizer always runs in f32 (on the f32 compute backend), even
             // when the model computes in bf16.
-            let f32_device: Device<ComputeBackend> = Default::default();
+            let f32_device: Device<ComputeBackend> = crate::backend::device();
             let to_f32 = |d: TensorData| -> Result<Tensor<ComputeBackend, 1>> {
                 let v = d.convert::<f32>().to_vec::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
                 Ok(Tensor::from_data(TensorData::new(v, [n]), &f32_device))
@@ -573,7 +573,7 @@ pub(crate) fn run_streamed<AB: AutodiffBackend>(
             StreamedTrainer::<AB>::restore_into(&store, base_checkpoint, &model_config, false)?;
         } else {
             use burn::record::Recorder;
-            let device: Device<Inner<AB>> = Default::default();
+            let device: Device<Inner<AB>> = crate::backend::default_device::<Inner<AB>>();
             let record = crate::checkpoint::CheckpointRecorder::new()
                 .load(base_checkpoint.with_extension(""), &device)
                 .with_context(|| format!("loading {}", base_checkpoint.display()))?;
@@ -591,7 +591,7 @@ pub(crate) fn run_streamed<AB: AutodiffBackend>(
     }
 
     phase("Initialising model…");
-    let device: Device<AB> = Default::default();
+    let device: Device<AB> = crate::backend::default_device::<AB>();
     <AB as Backend>::seed(&device, config.seed);
     let optim = StreamedOptim {
         kind: config.optimizer,
@@ -774,7 +774,7 @@ mod tests {
 
     /// One in-memory step (full autodiff + Burn AdamW, no clipping) for reference.
     fn reference_step(model: QuarkModel<AB>, batches: &[DataBatch], hyper: &AdamWConfig, lr: f64) -> (QuarkModel<AB>, f32) {
-        let device = Default::default();
+        let device = crate::backend::device();
         let mut accumulator = GradientsAccumulator::new();
         let mut loss_sum = 0.0;
         for batch in batches {
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn streamed_step_matches_in_memory_step() {
         let cfg = cfg();
-        let device = Default::default();
+        let device = crate::backend::device();
         <AB as Backend>::seed(&device, 3);
         let dir = temp("equiv");
         let hyper = AdamWConfig { weight_decay: 0.1, ..AdamWConfig::default() };
@@ -854,7 +854,7 @@ mod tests {
         // The saved checkpoint loads as a normal model.
         let ckpt = dir.join("checkpoint-1");
         trainer.save_checkpoint(&ckpt).unwrap();
-        let (_, loaded) = load_sharded::<crate::backend::InferBackend>(&ckpt, &Default::default()).unwrap();
+        let (_, loaded) = load_sharded::<crate::backend::InferBackend>(&ckpt, &crate::backend::device()).unwrap();
         assert_eq!(loaded.num_params(), cfg.param_count() as usize);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -864,7 +864,7 @@ mod tests {
         let cfg = cfg();
         let batches = micro_batches();
         for kind in [OptimizerKind::AdamW, OptimizerKind::AdamWCompact, OptimizerKind::Adafactor] {
-            let device = Default::default();
+            let device = crate::backend::device();
             <AB as Backend>::seed(&device, 5);
             let dir = temp(&format!("{kind:?}"));
             let store = TensorStore::new(dir.join("store"), 64 << 10).unwrap();

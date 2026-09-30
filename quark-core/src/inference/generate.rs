@@ -158,7 +158,7 @@ mod tests {
             moe_layer_freq: 2,
             tie_word_embeddings: false,
         };
-        let device = Default::default();
+        let device = crate::backend::device();
         let model = QuarkModel::<TestBackend>::new(&cfg, &device);
         let config = GenerateConfig {
             prompt_ids: (10..22).collect(), // longer than the window

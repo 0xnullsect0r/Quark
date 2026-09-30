@@ -33,13 +33,13 @@ jobs:
             libssl-dev
 
       - name: Build
-        run: cargo build --release --package quark-gui --features backend-cpu
+        run: cargo build --release --package quark-gui --features "backend-cpu backend-wgpu backend-cuda"
 
       - name: Build Quark Chat
-        run: cargo build --release --package quark-chat --features backend-cpu
+        run: cargo build --release --package quark-chat --features "backend-cpu backend-wgpu backend-cuda"
 
       - name: Build Quark Code
-        run: cargo build --release --package quark-code --features backend-cpu
+        run: cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
 
       - name: Rename binary
         run: cp target/release/quark quark-linux-amd64
@@ -106,13 +106,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"
+        run: cargo build --release --package quark-gui --no-default-features --features "backend-cpu backend-wgpu"
 
       - name: Build Quark Chat
-        run: cargo build --release --package quark-chat --features "backend-cpu backend-wgpu"
+        run: cargo build --release --package quark-chat --no-default-features --features "backend-cpu backend-wgpu"
 
       - name: Build Quark Code
-        run: cargo build --release --package quark-code --features "backend-cpu backend-wgpu"
+        run: cargo build --release --package quark-code --no-default-features --features "backend-cpu backend-wgpu"
 
       - name: Rename binary
         run: cp target/release/quark quark-macos-aarch64
@@ -170,13 +170,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --package quark-gui --features backend-cpu
+        run: cargo build --release --package quark-gui --features "backend-cpu backend-wgpu backend-cuda"
 
       - name: Build Quark Chat
-        run: cargo build --release --package quark-chat --features backend-cpu
+        run: cargo build --release --package quark-chat --features "backend-cpu backend-wgpu backend-cuda"
 
       - name: Build Quark Code
-        run: cargo build --release --package quark-code --features backend-cpu
+        run: cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
 
       - name: Rename binary
         run: cp target/release/quark.exe quark-windows-amd64.exe

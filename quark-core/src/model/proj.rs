@@ -279,13 +279,9 @@ pub struct QuantParams<B: Backend> {
     pub out_features: usize,
 }
 
-/// Whether quantized weights stay in host memory (CPU backend) rather than on
-/// the compute device.
-pub const HOST_QUANT: bool = !cfg!(any(feature = "backend-cuda", feature = "backend-wgpu"));
-
 impl<B: Backend> QuantParams<B> {
     pub fn from_host(q: HostQuant, device: &B::Device) -> Self {
-        Self::from_host_with(q, device, HOST_QUANT)
+        Self::from_host_with(q, device, crate::backend::is_cpu_device(device))
     }
 
     /// `keep_on_host` selects the CPU (host kernel) or device (bitwise unpack)
@@ -399,7 +395,7 @@ mod tests {
     use crate::backend::InferBackend as B;
 
     fn dense(inf: usize, outf: usize) -> (Proj<B>, Vec<f32>) {
-        let device = Default::default();
+        let device = crate::backend::device();
         let p = Proj::<B>::new(inf, outf, &device);
         let w: Vec<f32> = p.weight.val().into_data().to_vec().unwrap();
         (p, w)
@@ -420,7 +416,7 @@ mod tests {
 
     #[test]
     fn quantized_forward_matches_dequantized_dense() {
-        let device = Default::default();
+        let device = crate::backend::device();
         let (p, w) = dense(64, 24);
         for format in [QuantFormat::Q4, QuantFormat::Q8] {
             let q = HostQuant::quantize(format, &w, 64, 24);

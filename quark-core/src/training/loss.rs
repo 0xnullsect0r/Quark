@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn padding_is_excluded_from_the_mean() {
-        let device = Default::default();
+        let device = crate::backend::device();
         // rows [0, 2], [1, 1], [3, 0] with targets 1, 0, 0
         let logits = Tensor::<B, 2>::from_data(TensorData::new(vec![0.0f32, 2.0, 1.0, 1.0, 3.0, 0.0], [3, 2]), &device);
         let targets = Tensor::<B, 1, Int>::from_data(TensorData::new(vec![1i32, 0, 0], [3]), &device);

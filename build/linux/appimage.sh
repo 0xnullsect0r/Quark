@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 # build/linux/appimage.sh — Build Quark AppImages for Linux
 # Requires: appimagetool (https://github.com/AppImage/AppImageKit/releases)
-# Usage: bash build/linux/appimage.sh [cpu|cuda]
+# Usage: bash build/linux/appimage.sh
+# One binary with every backend (CUDA, wgpu/Vulkan, CPU), picked at runtime.
 set -euo pipefail
 
-BUILD_TYPE="${1:-cpu}"
-VERSION="0.1.0"
+VERSION="${VERSION:-2.0.0}"
 APP_NAME="Quark"
+FEATURES="backend-cpu backend-wgpu backend-cuda"
+SUFFIX="linux-amd64"
 
-if [ "$BUILD_TYPE" = "cuda" ]; then
-  FEATURES="backend-cpu backend-cuda"
-  SUFFIX="linux-cuda-amd64"
-else
-  FEATURES="backend-cpu"
-  SUFFIX="linux-cpu-amd64"
-fi
-
-echo "==> Building Quark (${BUILD_TYPE}) …"
+echo "==> Building Quark …"
 cargo build --release --package quark-gui --features "$FEATURES"
 cargo build --release --package quark-chat --features "$FEATURES"
 cargo build --release --package quark-code --features "$FEATURES"

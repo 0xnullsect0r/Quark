@@ -9,9 +9,9 @@ repository.workspace = true
 
 [features]
 default = ["backend-cpu"]
-backend-cpu  = ["burn/flex"]
-backend-cuda = ["burn/cuda", "nvml-wrapper"]
-backend-wgpu = ["burn/wgpu"]
+backend-cpu  = ["burn/flex", "burn/dispatch"]
+backend-cuda = ["burn/cuda", "burn/dispatch", "nvml-wrapper"]
+backend-wgpu = ["burn/wgpu", "burn/dispatch"]
 
 [dependencies]
 burn          = { workspace = true, features = ["autodiff", "std", "store"] }
