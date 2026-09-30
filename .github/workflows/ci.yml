@@ -69,8 +69,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Compile-only: hosted runners have no GPU. burn-cuda loads the CUDA
-        # driver at runtime, so no toolkit is needed to build.
+        # Compile-only: hosted runners have no GPU. Building the CUDA backend
+        # needs no toolkit; running it does (NVRTC compiles kernels at runtime).
         backend: [backend-wgpu, backend-cuda]
     steps:
       - uses: actions/checkout@v4

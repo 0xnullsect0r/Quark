@@ -218,6 +218,7 @@ pub fn start_training(
                 .map(String::as_str)
                 .or_else(|| panic.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
+            let msg = crate::backend::explain_device_error(msg);
             let _ = panic_tx.send(TrainingEvent::Error(format!("Training crashed: {msg}")));
         }
     });
@@ -236,6 +237,10 @@ fn dispatch_training(
     tx: MetricsSender,
     stop: Arc<AtomicBool>,
 ) {
+    if let Err(e) = crate::backend::check_device() {
+        let _ = tx.send(TrainingEvent::Error(e.to_string()));
+        return;
+    }
     if !config.precision.is_supported() {
         let _ = tx.send(TrainingEvent::Log(format!(
             "⚠  {:?} training needs a CUDA build — using F32",

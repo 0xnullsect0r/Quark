@@ -107,7 +107,7 @@ The Burn backend is selected at compile time via Cargo features:
 - `backend-wgpu` → `burn/wgpu` (Metal on macOS, Vulkan/WGPU elsewhere)
 - `backend-cuda` → `burn/cuda` (NVIDIA sm_70+)
 
-The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise Flex. Burn is 0.21; code only names backends through `backend.rs` aliases (tests use `InferBackend`). CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners).
+The backend is chosen at compile time (`quark-core/src/backend.rs`): CUDA if `backend-cuda` is enabled, otherwise WGPU if `backend-wgpu` is, otherwise Flex. Burn is 0.21; code only names backends through `backend.rs` aliases (tests use `InferBackend`). CI clippy-checks the wgpu and CUDA builds (compile only; no GPU on hosted runners). Running a CUDA build needs the CUDA toolkit (NVRTC, via `/usr/local/cuda` or `CUDA_PATH`) no newer than the driver. `backend::check_device()` runs a test kernel before training/inference and turns the usual failures into one readable error.
 
 ### Data directories
 

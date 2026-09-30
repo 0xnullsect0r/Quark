@@ -126,6 +126,7 @@ fn main() -> Result<()> {
             if let Some(seq) = value("--seq") {
                 cfg.max_position_embeddings = seq.parse()?;
             }
+            quark_core::backend::check_device()?;
             let steps: u64 = value("--steps").map(|v| v.parse()).transpose()?.unwrap_or(3);
             if flag("--layer-only") {
                 bench::layer(&cfg)?;

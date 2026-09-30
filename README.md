@@ -382,13 +382,21 @@ cargo build --release --package quark-gui --features backend-cpu
 # GPU — WGPU/Metal (macOS & Linux)
 cargo build --release --package quark-gui --features "backend-cpu backend-wgpu"
 
-# GPU — CUDA (NVIDIA)
+# GPU — CUDA (NVIDIA; needs the CUDA toolkit at runtime, see below)
 cargo build --release --package quark-gui --features "backend-cpu backend-cuda"
 
 # Build companion CLIs
 cargo build --release --package quark-chat --features backend-cpu
 cargo build --release --package quark-code --features backend-cpu
 ```
+
+**CUDA runtime requirements.** A CUDA build compiles without the CUDA toolkit, but it needs the
+toolkit to run: Burn compiles GPU kernels at runtime with NVRTC. It looks in `/usr/local/cuda`
+unless `CUDA_PATH` is set (Arch installs to `/opt/cuda`). The toolkit must not be newer than
+your driver: `nvcc --version` must be ≤ the "CUDA Version" shown by `nvidia-smi`. Otherwise
+kernels fail with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Update the driver and reboot, or point
+`CUDA_PATH` at an older toolkit, then delete `~/.cache/cubecl`. A wgpu build (Vulkan) runs on
+NVIDIA without the toolkit.
 
 Binaries are written to `target/release/`:
 - `quark` — GUI application
