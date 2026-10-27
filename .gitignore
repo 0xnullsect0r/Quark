@@ -6,3 +6,5 @@ Cargo.lock
 installer/arch/pkg/
 installer/arch/src/
 installer/arch/*.pkg.tar.*
+installer/arch/quark/
+installer/arch/*.pkg.tar.zst
