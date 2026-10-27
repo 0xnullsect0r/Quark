@@ -1,19 +1,19 @@
 //! Project context scanner: produces AGENTS.md describing the codebase.
 
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Summary of a project's structure.
 #[derive(Debug, Default)]
 pub struct ProjectContext {
-    pub name:        String,
-    pub root:        PathBuf,
-    pub languages:   HashMap<String, usize>, // extension → file count
-    pub top_files:   Vec<PathBuf>,           // up to 20 notable files
-    pub has_git:     bool,
-    pub readme:      Option<String>,
-    pub cargo_toml:  Option<String>,
+    pub name: String,
+    pub root: PathBuf,
+    pub languages: HashMap<String, usize>, // extension → file count
+    pub top_files: Vec<PathBuf>,           // up to 20 notable files
+    pub has_git: bool,
+    pub readme: Option<String>,
+    pub cargo_toml: Option<String>,
     pub package_json: Option<String>,
 }
 
@@ -21,9 +21,11 @@ impl ProjectContext {
     /// Scan the project at `root` and return a context summary.
     pub fn scan(root: &Path) -> Self {
         let mut ctx = ProjectContext {
-            root:   root.to_path_buf(),
-            name:   root.file_name().map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "project".into()),
+            root: root.to_path_buf(),
+            name: root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".into()),
             has_git: root.join(".git").exists(),
             ..Default::default()
         };
@@ -36,7 +38,7 @@ impl ProjectContext {
                 break;
             }
         }
-        ctx.cargo_toml   = std::fs::read_to_string(root.join("Cargo.toml")).ok();
+        ctx.cargo_toml = std::fs::read_to_string(root.join("Cargo.toml")).ok();
         ctx.package_json = std::fs::read_to_string(root.join("package.json")).ok();
 
         // Walk directory tree
@@ -113,24 +115,30 @@ impl ProjectContext {
 }
 
 fn walk(
-    dir:   &Path,
+    dir: &Path,
     langs: &mut HashMap<String, usize>,
     files: &mut Vec<(PathBuf, u64)>,
     depth: usize,
 ) {
-    if depth > 6 { return; }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || matches!(name, "target" | "node_modules" | "dist" | "build") {
+            if name.starts_with('.') || matches!(name, "target" | "node_modules" | "dist" | "build")
+            {
                 continue;
             }
         }
         if path.is_dir() {
             walk(&path, langs, files, depth + 1);
         } else {
-            let ext = path.extension()
+            let ext = path
+                .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_lowercase();
@@ -139,9 +147,25 @@ fn walk(
             }
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             // Only track source files
-            if matches!(ext.as_str(),
-                "rs" | "py" | "ts" | "js" | "tsx" | "jsx" | "go" | "java" |
-                "c" | "cpp" | "h" | "hpp" | "cs" | "rb" | "swift" | "kt" | "toml" | "json"
+            if matches!(
+                ext.as_str(),
+                "rs" | "py"
+                    | "ts"
+                    | "js"
+                    | "tsx"
+                    | "jsx"
+                    | "go"
+                    | "java"
+                    | "c"
+                    | "cpp"
+                    | "h"
+                    | "hpp"
+                    | "cs"
+                    | "rb"
+                    | "swift"
+                    | "kt"
+                    | "toml"
+                    | "json"
             ) {
                 files.push((path, size));
             }

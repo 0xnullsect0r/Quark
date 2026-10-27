@@ -1,9 +1,9 @@
 //! Application state for Quark Code.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use quark_core::inference::InferenceEngine;
 use quark_core::mcp::McpConfig;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ─── Mode ─────────────────────────────────────────────────────────────────────
 
@@ -18,7 +18,7 @@ pub enum Mode {
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Mode::Plan  => write!(f, "PLAN"),
+            Mode::Plan => write!(f, "PLAN"),
             Mode::Build => write!(f, "BUILD"),
         }
     }
@@ -27,19 +27,44 @@ impl std::fmt::Display for Mode {
 // ─── Message ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Role { User, Assistant, Tool, System }
+pub enum Role {
+    User,
+    Assistant,
+    Tool,
+    System,
+}
 
 #[derive(Debug, Clone)]
 pub struct Message {
-    pub role:    Role,
+    pub role: Role,
     pub content: String,
 }
 
 impl Message {
-    pub fn user(s: impl Into<String>)       -> Self { Self { role: Role::User,      content: s.into() } }
-    pub fn assistant(s: impl Into<String>)  -> Self { Self { role: Role::Assistant, content: s.into() } }
-    pub fn tool(s: impl Into<String>)       -> Self { Self { role: Role::Tool,      content: s.into() } }
-    pub fn system_msg(s: impl Into<String>) -> Self { Self { role: Role::System,    content: s.into() } }
+    pub fn user(s: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: s.into(),
+        }
+    }
+    pub fn assistant(s: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: s.into(),
+        }
+    }
+    pub fn tool(s: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: s.into(),
+        }
+    }
+    pub fn system_msg(s: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: s.into(),
+        }
+    }
 }
 
 // ─── File change (undo/redo) ──────────────────────────────────────────────────
@@ -47,41 +72,40 @@ impl Message {
 /// A recorded change to a single file.
 #[derive(Debug, Clone)]
 pub struct FileChange {
-    pub path:   PathBuf,
+    pub path: PathBuf,
     /// Content before the change (`None` if the file was created).
     pub before: Option<String>,
     /// Content after the change (`None` if the file was deleted).
-    pub after:  Option<String>,
+    pub after: Option<String>,
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 pub struct App {
     // ── UI state ──────────────────────────────────────────────────────────
-    pub mode:        Mode,
-    pub input:       String,
+    pub mode: Mode,
+    pub input: String,
     /// Cursor position within `input` (byte index).
-    pub cursor_pos:  usize,
-    pub scroll:      usize,
+    pub cursor_pos: usize,
+    pub scroll: usize,
     pub should_quit: bool,
 
     // ── Conversation ──────────────────────────────────────────────────────
     pub messages: Vec<Message>,
 
     // ── Model / config ────────────────────────────────────────────────────
-    pub model_name:    String,
+    pub model_name: String,
     pub system_prompt: String,
-    pub mcp_cfg:       McpConfig,
-    pub model_loaded:  bool,
-    pub engine:        Option<Arc<InferenceEngine>>,
+    pub mcp_cfg: McpConfig,
+    pub engine: Arc<InferenceEngine>,
     /// Streaming: tokens arrive here from the background generate thread.
-    pub stream_buf:    String,
-    pub generating:    bool,
+    pub stream_buf: String,
+    pub generating: bool,
 
     // ── Project ───────────────────────────────────────────────────────────
     pub project_root: PathBuf,
     /// Contents of AGENTS.md if it exists.
-    pub agents_md:    Option<String>,
+    pub agents_md: Option<String>,
 
     // ── Undo/redo ─────────────────────────────────────────────────────────
     /// Each entry is a batch of changes that can be undone atomically.
@@ -94,33 +118,31 @@ pub struct App {
 
 impl App {
     pub fn new(
-        model_name:    String,
+        model_name: String,
         system_prompt: String,
-        mcp_cfg:       McpConfig,
-        model_loaded:  bool,
-        engine:        Option<Arc<InferenceEngine>>,
-        project_root:  PathBuf,
+        mcp_cfg: McpConfig,
+        engine: Arc<InferenceEngine>,
+        project_root: PathBuf,
     ) -> Self {
         let agents_md = load_agents_md(&project_root);
         let mut app = Self {
-            mode:         Mode::Build,
-            input:        String::new(),
-            cursor_pos:   0,
-            scroll:       0,
-            should_quit:  false,
-            messages:     Vec::new(),
+            mode: Mode::Build,
+            input: String::new(),
+            cursor_pos: 0,
+            scroll: 0,
+            should_quit: false,
+            messages: Vec::new(),
             model_name,
             system_prompt,
             mcp_cfg,
-            model_loaded,
             engine,
-            stream_buf:   String::new(),
-            generating:   false,
+            stream_buf: String::new(),
+            generating: false,
             project_root,
             agents_md,
-            undo_stack:   Vec::new(),
-            redo_stack:   Vec::new(),
-            status_msg:   String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            status_msg: String::new(),
         };
 
         // Welcome message
@@ -129,17 +151,19 @@ impl App {
     }
 
     fn push_system(&mut self) {
-        let loaded_str = if self.model_loaded { "✓ loaded" } else { "⚠ not loaded — run inference after training" };
-        let agents = if self.agents_md.is_some() { "✓ AGENTS.md found" } else { "run /init to analyse project" };
+        let agents = if self.agents_md.is_some() {
+            "✓ AGENTS.md found"
+        } else {
+            "run /init to analyse project"
+        };
         self.messages.push(Message::system_msg(format!(
-            "Quark Code  ·  model: {} ({})  ·  project: {}  ·  {}",
+            "Quark Code  ·  model: {} (✓ loaded)  ·  project: {}  ·  {}",
             self.model_name,
-            loaded_str,
             self.project_root.display(),
             agents,
         )));
         self.messages.push(Message::system_msg(
-            "Tab → toggle Plan/Build mode   /help for commands   Ctrl+C to quit"
+            "Tab → toggle Plan/Build mode   /help for commands   Ctrl+C to quit",
         ));
     }
 
@@ -226,8 +250,12 @@ impl App {
 
     // ── Scroll ────────────────────────────────────────────────────────────────
 
-    pub fn scroll_up(&mut self)   { self.scroll = self.scroll.saturating_sub(3); }
-    pub fn scroll_down(&mut self) { self.scroll += 3; }
+    pub fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(3);
+    }
+    pub fn scroll_down(&mut self) {
+        self.scroll += 3;
+    }
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = usize::MAX; // clamped in render
     }

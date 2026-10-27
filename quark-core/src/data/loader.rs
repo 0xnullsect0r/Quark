@@ -71,6 +71,37 @@ impl TextLoader {
     }
 }
 
+/// Call `f` with every document of `path` in turn without holding the file in
+/// memory: each non-empty line of a `.jsonl` file (its `"text"` field when
+/// present), or the whole of any other file.
+pub fn for_each_document(path: &Path, f: &mut dyn FnMut(String) -> Result<()>) -> Result<()> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext == "jsonl" {
+        let file = File::open(path)?;
+        for line in BufReader::with_capacity(1 << 20, file).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                f(extract_text_field(trimmed))?;
+            }
+        }
+    } else {
+        let content = std::fs::read_to_string(path)?;
+        if !content.trim().is_empty() {
+            f(content)?;
+        }
+    }
+    Ok(())
+}
+
+/// All `.txt` / `.jsonl` files under `dir`, recursively, in a stable order.
+pub fn corpus_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

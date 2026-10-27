@@ -16,10 +16,9 @@ use burn::{
 };
 
 use crate::checkpoint::CheckpointRecorder;
-use crate::data::batch::{DataBatch, collate_batch};
-use crate::data::loader::TextLoader;
-use crate::data::packing::pack_sequences;
+use crate::data::batch::DataBatch;
 use crate::data::sft::{collate_sft, load_conversations, tokenize_conversation};
+use crate::data::token_cache::{BatchSet, TokenCache};
 use crate::memory::{budget::HardwareBudget, tier::TierConfig};
 use crate::model::QuarkModel;
 use crate::model::config::QuarkConfig;
@@ -85,6 +84,9 @@ pub struct TrainerConfig {
     /// Optimizer used when offloading (the in-memory trainer uses AdamW).
     #[serde(default)]
     pub optimizer: crate::training::optim::OptimizerKind,
+    /// How many of the newest checkpoints to keep in `output_dir`.
+    #[serde(default = "default_keep_checkpoints")]
+    pub keep_checkpoints: usize,
 }
 
 /// Whether to train in memory or streamed through RAM/disk.
@@ -116,6 +118,10 @@ pub const FINE_TUNE_LR: f64 = 5e-5;
 
 fn default_true() -> bool {
     true
+}
+
+fn default_keep_checkpoints() -> usize {
+    2
 }
 
 /// Numeric precision for training compute. Checkpoints are always saved in
@@ -168,6 +174,7 @@ impl Default for TrainerConfig {
             mode: TrainingMode::Pretrain,
             offload: OffloadMode::Auto,
             optimizer: crate::training::optim::OptimizerKind::AdamW,
+            keep_checkpoints: 2,
         }
     }
 }
@@ -341,6 +348,9 @@ fn run_training_loop<AB: AutodiffBackend>(
     );
     log!("   Output: {}", config.output_dir.display());
 
+    // The cosine schedule spans the whole run.
+    config.schedule.max_steps = config.max_steps;
+
     // ── Load tokenizer ────────────────────────────────────────────────────────
     phase!("Loading tokenizer…");
     let tok_path = tokenizer_path.unwrap_or_else(|| {
@@ -391,7 +401,7 @@ fn run_training_loop<AB: AutodiffBackend>(
     }
 
     // ── Load and tokenize training data ───────────────────────────────────────
-    let mut batches = match &config.mode {
+    let (batches, eval_batches) = match &config.mode {
         TrainingMode::FineTune { .. } => {
             match sft_batches(&corpus_files, &tokenizer, &model_config, &config, &tx) {
                 Ok(b) => b,
@@ -399,27 +409,20 @@ fn run_training_loop<AB: AutodiffBackend>(
             }
         }
         TrainingMode::Pretrain if corpus_files.is_empty() => {
-            log!("⚠  No corpus files provided — running demo loop with random inputs");
-            vec![]
+            bail!("No corpus files: add .txt / .jsonl files in the Dataset tab (or pass --corpus)")
         }
         TrainingMode::Pretrain => {
-            match pretrain_batches(corpus_files, &tokenizer, &model_config, &config, &tx) {
+            let loaded =
+                pretrain_batches(corpus_files, &tokenizer, &tok_path, &model_config, &config, &tx);
+            match loaded {
                 Ok(b) => b,
                 Err(e) => bail!("{e}"),
             }
         }
     };
 
-    // Hold out ~1% of batches for evaluation once there is enough data.
-    let eval_batches = if batches.len() >= 20 {
-        let n_eval = (batches.len() / 100).max(1);
-        batches.split_off(batches.len() - n_eval)
-    } else {
-        Vec::new()
-    };
-
     log!(
-        "   {} training batches ready ({} held out for eval)",
+        "   {} training batches per epoch ({} held out for eval)",
         batches.len(),
         eval_batches.len()
     );
@@ -474,15 +477,14 @@ fn run_training_loop<AB: AutodiffBackend>(
     log!("   Model initialised on {:?}", device);
 
     let mut step = 0u64;
+    let mut resumed_from = None;
     if let Some((path, saved_step)) = resume_from {
         match CheckpointRecorder::new().load(path.with_extension(""), &device) {
             Ok(record) => {
                 model = model.load_record(record);
                 step = saved_step;
-                log!(
-                    "↻  Resumed from {} (step {saved_step}); optimiser state starts fresh",
-                    path.display()
-                );
+                log!("↻  Resumed from {} (step {saved_step})", path.display());
+                resumed_from = Some(path);
             }
             Err(e) => log!("⚠  Could not resume from {}: {e} — starting fresh", path.display()),
         }
@@ -514,6 +516,23 @@ fn run_training_loop<AB: AutodiffBackend>(
 
     // ── Initialise optimiser ──────────────────────────────────────────────────
     let mut optim = config.adamw.to_burn_config().init();
+    if let Some(ckpt) = &resumed_from {
+        let optim_path = optimizer_path(ckpt);
+        if optim_path.exists() {
+            match CheckpointRecorder::new().load(optim_path.with_extension(""), &device) {
+                Ok(record) => {
+                    optim = optim.load_record(record);
+                    log!("   Optimizer state restored from {}", optim_path.display());
+                }
+                Err(e) => log!(
+                    "⚠  Could not load optimizer state {}: {e} — starting it fresh",
+                    optim_path.display()
+                ),
+            }
+        } else {
+            log!("   No optimizer state next to the checkpoint — starting it fresh");
+        }
+    }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     phase!("Training…");
@@ -535,26 +554,16 @@ fn run_training_loop<AB: AutodiffBackend>(
         let mut accumulator = GradientsAccumulator::new();
         let mut step_loss = 0.0f32;
 
-        for micro in 0..accum_steps {
+        for _ in 0..accum_steps {
             // ── Get next batch ────────────────────────────────────────────────
-            let (input_ids, label_ids, n_tokens) = if total_batches > 0 {
-                if batch_idx >= total_batches {
-                    batch_idx = 0;
-                    epoch += 1;
-                    log!("━━  Epoch {} started", epoch + 1);
-                }
-                let batch = &batches[batch_idx];
-                batch_idx += 1;
-                batch_tensors::<AB>(batch, &device)
-            } else {
-                demo_batch::<AB>(
-                    config.batch_size,
-                    model_config.max_position_embeddings.min(64),
-                    vocab_size,
-                    step as usize * accum_steps + micro,
-                    &device,
-                )
-            };
+            if batch_idx >= total_batches {
+                batch_idx = 0;
+                epoch += 1;
+                log!("━━  Epoch {} started", epoch + 1);
+            }
+            let batch = batches.get(batch_idx, epoch);
+            batch_idx += 1;
+            let (input_ids, label_ids, n_tokens) = batch_tensors::<AB>(&batch, &device);
             tokens_seen += n_tokens;
 
             // ── Forward + backward ────────────────────────────────────────────
@@ -628,7 +637,7 @@ fn run_training_loop<AB: AutodiffBackend>(
             && config.save_every_steps > 0
             && step.is_multiple_of(config.save_every_steps)
         {
-            save_burn_checkpoint(&model, &config.output_dir, step, &tx);
+            save_checkpoint(&model, &optim, &config, step, &tx);
         }
     }
 
@@ -641,52 +650,62 @@ fn run_training_loop<AB: AutodiffBackend>(
         phase!("Complete!");
     }
 
-    save_burn_checkpoint(&model, &config.output_dir, step, &tx);
+    save_checkpoint(&model, &optim, &config, step, &tx);
     let _ = tx.send(TrainingEvent::Done);
 }
 
 // ── Data helpers ──────────────────────────────────────────────────────────────
 
-/// Raw text → packed next-token-prediction batches.
+/// Raw text → windows of a token cache on disk (built on the first run,
+/// reused after), visited in a new order every epoch, with the last ~1% of
+/// batches held out for evaluation.
 fn pretrain_batches(
     corpus_files: Vec<PathBuf>,
     tokenizer: &QuarkTokenizer,
+    tokenizer_path: &Path,
     model_config: &QuarkConfig,
     config: &TrainerConfig,
     tx: &MetricsSender,
-) -> Result<Vec<DataBatch>, String> {
+) -> Result<(BatchSet, Vec<DataBatch>), String> {
     let log = |msg: String| {
         let _ = tx.send(TrainingEvent::Log(msg));
     };
-    let _ = tx.send(TrainingEvent::Phase("Loading corpus…".into()));
-    log(format!("   Loading {} corpus file(s)…", corpus_files.len()));
+    let _ = tx.send(TrainingEvent::Phase("Tokenizing corpus…".into()));
+    let cache = TokenCache::open_or_build(
+        &corpus_files,
+        tokenizer_path,
+        tokenizer,
+        &config.output_dir.join("tokens"),
+        &log,
+    )
+    .map_err(|e| format!("Corpus tokenization failed: {e:#}"))?;
 
-    let loader = TextLoader::new(corpus_files, model_config.max_position_embeddings);
-    let texts = loader.load_texts().map_err(|e| format!("Corpus load failed: {e}"))?;
-    log(format!("   Loaded {} documents", texts.len()));
-
-    let _ = tx.send(TrainingEvent::Phase("Tokenizing…".into()));
-    let token_seqs: Vec<Vec<u32>> = texts
-        .iter()
-        .filter_map(|text| tokenizer.encode(text).ok())
-        .filter(|ids| !ids.is_empty())
-        .collect();
-    log(format!("   Tokenized {} sequences", token_seqs.len()));
-
-    let packed = pack_sequences(token_seqs, model_config.max_position_embeddings);
-    log(format!(
-        "   Packed into {} chunks of {} tokens",
-        packed.len(),
-        model_config.max_position_embeddings
-    ));
-    if packed.is_empty() {
-        return Err("No training tokens after packing. Check your corpus files.".into());
+    let seq_len = model_config.max_position_embeddings;
+    let batch_size = config.batch_size.max(1);
+    let n_windows = cache.num_windows(seq_len);
+    if n_windows < batch_size {
+        return Err(format!(
+            "Corpus too small: {} tokens give {n_windows} window(s) of {seq_len}, \
+             but one batch needs {batch_size}",
+            cache.len()
+        ));
     }
+    // Hold out ~1% of batches for evaluation once there is enough data.
+    let n_batches = n_windows / batch_size;
+    let n_eval = if n_batches >= 20 { (n_batches / 100).max(1) } else { 0 };
+    let split = (n_batches - n_eval) * batch_size;
+    log(format!(
+        "   {n_windows} windows of {seq_len} tokens: {:.1}M training tokens per epoch",
+        (split * seq_len) as f64 / 1e6
+    ));
 
-    Ok(packed
-        .chunks(config.batch_size.max(1))
-        .map(|chunk| collate_batch(chunk.to_vec(), PAD_ID))
-        .collect())
+    let cache = Arc::new(cache);
+    let train =
+        BatchSet::windows(cache.clone(), (0..split as u32).collect(), seq_len, batch_size, config.seed);
+    let held_out = (split as u32..n_windows as u32).collect();
+    let eval = BatchSet::windows(cache, held_out, seq_len, batch_size, config.seed)
+        .take(MAX_EVAL_BATCHES);
+    Ok((train, eval))
 }
 
 /// Chat conversations (JSONL) → shuffled fine-tuning batches that train only
@@ -697,7 +716,7 @@ fn sft_batches(
     model_config: &QuarkConfig,
     config: &TrainerConfig,
     tx: &MetricsSender,
-) -> Result<Vec<DataBatch>, String> {
+) -> Result<(BatchSet, Vec<DataBatch>), String> {
     use rand::{SeedableRng, seq::SliceRandom};
 
     let log = |msg: String| {
@@ -740,7 +759,16 @@ fn sft_batches(
     }
 
     examples.shuffle(&mut rand::rngs::StdRng::seed_from_u64(config.seed));
-    Ok(examples.chunks(config.batch_size.max(1)).map(|c| collate_sft(c, PAD_ID)).collect())
+    let mut batches: Vec<DataBatch> =
+        examples.chunks(config.batch_size.max(1)).map(|c| collate_sft(c, PAD_ID)).collect();
+    // Hold out ~1% of batches for evaluation once there is enough data.
+    let eval = if batches.len() >= 20 {
+        let n_eval = (batches.len() / 100).max(1);
+        batches.split_off(batches.len() - n_eval)
+    } else {
+        Vec::new()
+    };
+    Ok((BatchSet::InMemory(batches), eval))
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -827,24 +855,6 @@ pub(crate) fn batch_tensors<B: Backend>(
     )
 }
 
-/// Deterministic synthetic batch used when no corpus is provided.
-fn demo_batch<B: Backend>(
-    batch_size: usize,
-    seq: usize,
-    vocab_size: usize,
-    offset: usize,
-    device: &B::Device,
-) -> (Tensor<B, 2, Int>, Tensor<B, 2, Int>, u64) {
-    let n = batch_size * seq;
-    let ids: Vec<i32> = (0..n).map(|i| ((offset * n + i) % vocab_size) as i32).collect();
-    let lbl: Vec<i32> = (0..n).map(|i| ((offset * n + i + 1) % vocab_size) as i32).collect();
-    (
-        Tensor::from_data(TensorData::new(ids, [batch_size, seq]), device),
-        Tensor::from_data(TensorData::new(lbl, [batch_size, seq]), device),
-        n as u64,
-    )
-}
-
 /// Mean cross-entropy over (up to `MAX_EVAL_BATCHES`) held-out batches.
 fn evaluate<B: Backend>(model: &QuarkModel<B>, batches: &[DataBatch], device: &B::Device) -> f32 {
     let used = &batches[..batches.len().min(MAX_EVAL_BATCHES)];
@@ -883,22 +893,71 @@ fn find_resumable_checkpoint(dir: &Path, model_config: &QuarkConfig) -> Option<(
         .max_by_key(|(_, step)| *step)
 }
 
-fn save_burn_checkpoint<B: Backend>(
-    model: &QuarkModel<B>,
-    output_dir: &std::path::Path,
+/// `optim-N.bin` next to `checkpoint-N.bin`.
+fn optimizer_path(checkpoint: &Path) -> PathBuf {
+    let name = checkpoint.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    checkpoint.with_file_name(name.replacen("checkpoint-", "optim-", 1))
+}
+
+/// Save `checkpoint-N.bin` and the optimizer state `optim-N.bin`, then drop
+/// all but the newest `keep_checkpoints`.
+fn save_checkpoint<AB, O>(
+    model: &QuarkModel<AB>,
+    optim: &O,
+    config: &TrainerConfig,
     step: u64,
     tx: &MetricsSender,
-) {
+) where
+    AB: AutodiffBackend,
+    O: Optimizer<QuarkModel<AB>, AB>,
+{
     macro_rules! log {
         ($($t:tt)*) => {{ let _ = tx.send(TrainingEvent::Log(format!($($t)*))); }};
     }
 
     // The recorder appends ".bin" automatically.
-    let stem = output_dir.join(format!("checkpoint-{step}"));
-
+    let stem = config.output_dir.join(format!("checkpoint-{step}"));
     let record = model.clone().into_record();
     match CheckpointRecorder::new().record(record, stem.clone()) {
         Ok(_) => log!("💾  Checkpoint saved → {}.bin", stem.display()),
-        Err(e) => log!("⚠  Checkpoint save failed: {e}"),
+        Err(e) => {
+            log!("⚠  Checkpoint save failed: {e}");
+            return;
+        }
     }
+    let optim_stem = config.output_dir.join(format!("optim-{step}"));
+    if let Err(e) = CheckpointRecorder::new().record(optim.to_record(), optim_stem) {
+        log!("⚠  Optimizer state save failed: {e}");
+    }
+    let keep = config.keep_checkpoints.max(1);
+    for old in prune_checkpoints(&config.output_dir, keep) {
+        log!("   Removed old checkpoint {} (keeping the last {keep})", old.display());
+    }
+}
+
+/// Delete all but the newest `keep` `checkpoint-N.bin` files in `dir` (and
+/// their optimizer state); returns what was removed.
+fn prune_checkpoints(dir: &Path, keep: usize) -> Vec<PathBuf> {
+    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let name = path.file_name()?.to_str()?;
+                let step = name.strip_prefix("checkpoint-")?.strip_suffix(".bin")?.parse().ok()?;
+                Some((step, path))
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    let n_old = found.len().saturating_sub(keep);
+    found
+        .into_iter()
+        .take(n_old)
+        .map(|(_, path)| {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(optimizer_path(&path));
+            path
+        })
+        .collect()
 }

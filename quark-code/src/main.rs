@@ -1,14 +1,18 @@
 //! quark-code — terminal AI coding agent powered by a bundled Quark model.
 //!
 //! Usage:
-//!   quark-code [--allow-shell] [project_dir]
+//!   quark-code [--model <bundle-dir>] [--plan] [--allow-shell] [project_dir]
+//!
+//! `--plan` starts in Plan mode (the model explains changes but cannot apply
+//! them); the default is Build mode.
 //!
 //! `run_shell` is disabled unless `--allow-shell` is passed or `model/mcp.json`
 //! enables it.
 //!
-//! Looks for model files in a `model/` directory next to the executable
-//! (set by quark-gui's Export panel).  Falls back to a demo/stub mode if
-//! no model is found.
+//! The model is loaded from `--model <bundle-dir>` or, by default, from a
+//! `model/` directory next to the executable (written by quark-gui's Export
+//! tab or `quark-cli export`).  Without a loadable model quark-code exits with
+//! an error: there is no fallback mode.
 //!
 //! Features:
 //! - Full TUI (ratatui + crossterm) with Plan/Build mode toggle
@@ -29,11 +33,11 @@ mod context;
 mod tools;
 mod tui;
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use anyhow::Result;
 use quark_core::inference::InferenceEngine;
 use quark_core::mcp::McpConfig;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() -> Result<()> {
     // Initialise tracing (suppress most output; TUI owns the screen)
@@ -42,16 +46,26 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // ── Command-line flags ─────────────────────────────────────────────────
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag_value = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+    };
+
     // ── Locate model directory ─────────────────────────────────────────────
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let model_dir = exe_dir.join("model");
+    let model_dir = flag_value("--model")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| exe_dir.join("model"));
 
     // ── Load config from model/config.json ────────────────────────────────
     let config_path = model_dir.join("config.json");
-    let model_name  = if config_path.exists() {
+    let model_name = if config_path.exists() {
         let txt = std::fs::read_to_string(&config_path).unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
         v["name"].as_str().unwrap_or("Quark").to_owned()
@@ -67,13 +81,13 @@ fn main() -> Result<()> {
     } else {
         // Default: file tools on; shell stays off unless --allow-shell is passed
         McpConfig {
-            read_file:    true,
-            write_file:   true,
-            list_dir:     true,
+            read_file: true,
+            write_file: true,
+            list_dir: true,
             search_files: true,
-            get_cwd:      true,
-            run_shell:    false,
-            working_dir:  std::env::current_dir().unwrap_or_else(|_| exe_dir.clone()),
+            get_cwd: true,
+            run_shell: false,
+            working_dir: std::env::current_dir().unwrap_or_else(|_| exe_dir.clone()),
         }
     };
 
@@ -85,16 +99,15 @@ fn main() -> Result<()> {
         DEFAULT_SYSTEM_PROMPT.to_owned()
     };
 
-    // ── Command-line flags ─────────────────────────────────────────────────
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--allow-shell") {
         mcp_cfg.run_shell = true;
     }
 
-    // ── Project directory (first non-flag arg or cwd) ─────────────────────
+    // ── Project directory (first positional arg or cwd) ───────────────────
+    let model_flag_value = flag_value("--model");
     let project_root = args
         .iter()
-        .find(|a| !a.starts_with("--"))
+        .find(|a| !a.starts_with("--") && Some(*a) != model_flag_value)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
@@ -104,28 +117,27 @@ fn main() -> Result<()> {
     // Point MCP working_dir at the project root
     mcp_cfg.working_dir = project_root.clone();
 
-    // ── Load inference engine if a model is bundled ───────────────────────
-    let engine: Option<Arc<InferenceEngine>> = match InferenceEngine::load_bundle(&model_dir) {
-        Ok(e) => Some(Arc::new(e)),
+    // ── Load inference engine ─────────────────────────────────────────────
+    let engine = match InferenceEngine::load_bundle(&model_dir) {
+        Ok(e) => Arc::new(e),
         Err(e) => {
             if has_bundled_model(&model_dir) {
-                eprintln!("Warning: model load failed: {e:#}");
+                eprintln!(
+                    "quark-code: model in {} failed to load: {e:#}",
+                    model_dir.display()
+                );
+            } else {
+                eprintln!("{}", no_model_message(&model_dir));
             }
-            None
+            std::process::exit(2);
         }
     };
 
-    let model_loaded = engine.is_some();
-
     // ── Build App state ────────────────────────────────────────────────────
-    let app = app::App::new(
-        model_name,
-        system_prompt,
-        mcp_cfg,
-        model_loaded,
-        engine,
-        project_root,
-    );
+    let mut app = app::App::new(model_name, system_prompt, mcp_cfg, engine, project_root);
+    if args.iter().any(|a| a == "--plan") {
+        app.mode = app::Mode::Plan;
+    }
 
     // ── Run TUI ────────────────────────────────────────────────────────────
     tui::run(app).map_err(|e| anyhow::anyhow!("TUI error: {e}"))
@@ -149,4 +161,19 @@ Prefer small, targeted edits. After making changes, summarise what was done.";
 
 fn has_bundled_model(model_dir: &std::path::Path) -> bool {
     quark_core::checkpoint::export::find_bundled_model(model_dir).is_some()
+}
+
+/// What to do when no model bundle is present.
+fn no_model_message(model_dir: &std::path::Path) -> String {
+    format!(
+        "quark-code: no model found in {}\n\n\
+         quark-code needs a trained Quark model to run. To get one:\n\
+           1. Train a model in the Quark GUI (Training tab), then export it from\n\
+              the Export tab — or run: quark-cli export <checkpoint> <bundle-dir>\n\
+           2. Start quark-code with: quark-code --model <bundle-dir>\n\
+              (a bundle is a directory holding checkpoint/ (or checkpoint.bin),\n\
+              config.json and tokenizer.json)\n\n\
+         Without --model, quark-code looks for a model/ directory next to the executable.",
+        model_dir.display()
+    )
 }

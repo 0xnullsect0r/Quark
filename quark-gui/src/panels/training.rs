@@ -314,8 +314,17 @@ impl TrainingPanel {
                             ui.label(&self.phase);
                         }
                     } else {
-                        let ready = !self.finetune
-                            || (self.base_checkpoint.is_some() && !self.chat_files.is_empty());
+                        let (ready, why_not) = if self.finetune {
+                            (
+                                self.base_checkpoint.is_some() && !self.chat_files.is_empty(),
+                                "Choose a base checkpoint and chat files",
+                            )
+                        } else {
+                            (
+                                !dataset_panel.corpus_files().is_empty(),
+                                "Add .txt / .jsonl corpus files in the Dataset tab first",
+                            )
+                        };
                         if ui
                             .add_enabled(
                                 ready,
@@ -325,7 +334,7 @@ impl TrainingPanel {
                                         .strong(),
                                 ),
                             )
-                            .on_disabled_hover_text("Choose a base checkpoint and chat files")
+                            .on_disabled_hover_text(why_not)
                             .clicked()
                         {
                             self.loss_history.clear();
@@ -630,6 +639,16 @@ impl TrainingPanel {
                                     .range(1..=10000u64)
                                     .speed(50.0),
                                 );
+                                ui.end_row();
+
+                                ui.label("Keep checkpoints");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.trainer_config.keep_checkpoints,
+                                    )
+                                    .range(1..=100usize),
+                                )
+                                .on_hover_text("Older checkpoints are deleted as new ones are saved");
                                 ui.end_row();
 
                                 ui.label("Gradient checkpointing");

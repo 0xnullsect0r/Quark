@@ -111,9 +111,11 @@ fn train_load_generate_and_resume() {
     assert!(!run.evals.is_empty(), "no eval events");
     assert!(run.evals.iter().all(|(_, l)| l.is_finite()));
 
-    for f in ["config.json", "tokenizer.json", "checkpoint-10.bin", "checkpoint-30.bin"] {
+    for f in ["config.json", "tokenizer.json", "checkpoint-20.bin", "checkpoint-30.bin", "optim-30.bin"] {
         assert!(out.join(f).exists(), "missing {f}");
     }
+    assert!(!out.join("checkpoint-10.bin").exists(), "only the last 2 checkpoints are kept");
+    assert!(out.join("tokens").read_dir().unwrap().count() == 2, "token cache (.bin + .json)");
 
     // ── Load for inference ───────────────────────────────────────────────────
     let ckpt = out.join("checkpoint-30.bin");
@@ -132,6 +134,8 @@ fn train_load_generate_and_resume() {
     let (_handle, rx) = start_training(tiny_config(), resume_cfg, vec![corpus], Some(tokenizer));
     let resumed = collect(rx);
     assert!(resumed.logs.iter().any(|l| l.contains("Resumed")), "{:#?}", resumed.logs);
+    assert!(resumed.logs.iter().any(|l| l.contains("Optimizer state restored")), "{:#?}", resumed.logs);
+    assert!(resumed.logs.iter().any(|l| l.contains("Reusing tokenized corpus")), "{:#?}", resumed.logs);
     assert_eq!(resumed.metrics.first().unwrap().step, 31);
     assert_eq!(resumed.metrics.len(), 5);
 

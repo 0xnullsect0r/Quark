@@ -1,5 +1,5 @@
-//! Agent loop: builds prompts, calls inference (or stub), runs tool calls and
-//! feeds their results back to the model until it answers without tools.
+//! Agent loop: builds prompts, calls inference, runs tool calls and feeds
+//! their results back to the model until it answers without tools.
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -18,8 +18,15 @@ pub struct StreamHandle {
 
 pub enum AgentEvent {
     Token(String),
-    ToolCall { name: String, preview: String },
-    ToolResult { name: String, ok: bool, preview: String },
+    ToolCall {
+        name: String,
+        preview: String,
+    },
+    ToolResult {
+        name: String,
+        ok: bool,
+        preview: String,
+    },
     FileChanged(FileChange),
     /// Text of an intermediate round (the one that issued tool calls).
     Segment(String),
@@ -32,16 +39,20 @@ pub enum AgentEvent {
 /// Kick off an agent turn in a background thread.
 /// The caller should drain `StreamHandle::rx` every UI frame.
 pub fn start_turn(app: &App) -> StreamHandle {
-    let mcp_cfg       = app.mcp_cfg.clone();
+    let mcp_cfg = app.mcp_cfg.clone();
     let system_prompt = build_system_prompt(app);
-    let history       = build_history(app);
-    let mode          = app.mode;
-    let engine        = app.engine.clone();
+    let history = build_history(app);
+    let mode = app.mode;
+    let engine = app.engine.clone();
 
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        run_agent_turn(tx, system_prompt, history, mcp_cfg, mode, engine);
+        let mut generate =
+            |system_prompt: &str, history: &[ChatMessage], tx: &mpsc::Sender<AgentEvent>| {
+                generate_streamed(&engine, system_prompt, history, tx)
+            };
+        run_agent_turn(tx, system_prompt, history, mcp_cfg, mode, &mut generate);
     });
 
     StreamHandle { rx }
@@ -55,12 +66,24 @@ fn build_system_prompt(app: &App) -> String {
     s.push_str("You have access to these tools. Call them using XML tags:\n");
     s.push_str("<tool_call>{\"tool\": \"TOOL_NAME\", ...args}</tool_call>\n\n");
     s.push_str("### File Tools\n");
-    if app.mcp_cfg.read_file   { s.push_str("- read_file(path) — read file contents\n"); }
-    if app.mcp_cfg.write_file  { s.push_str("- write_file(path, content) — create or overwrite a file\n"); }
-    if app.mcp_cfg.list_dir    { s.push_str("- list_dir(path?) — list directory\n"); }
-    if app.mcp_cfg.search_files { s.push_str("- search_files(pattern, path?) — find files by name\n"); }
-    if app.mcp_cfg.get_cwd     { s.push_str("- get_cwd() — current working directory\n"); }
-    if app.mcp_cfg.run_shell   { s.push_str("- run_shell(command) — run shell command\n"); }
+    if app.mcp_cfg.read_file {
+        s.push_str("- read_file(path) — read file contents\n");
+    }
+    if app.mcp_cfg.write_file {
+        s.push_str("- write_file(path, content) — create or overwrite a file\n");
+    }
+    if app.mcp_cfg.list_dir {
+        s.push_str("- list_dir(path?) — list directory\n");
+    }
+    if app.mcp_cfg.search_files {
+        s.push_str("- search_files(pattern, path?) — find files by name\n");
+    }
+    if app.mcp_cfg.get_cwd {
+        s.push_str("- get_cwd() — current working directory\n");
+    }
+    if app.mcp_cfg.run_shell {
+        s.push_str("- run_shell(command) — run shell command\n");
+    }
     s.push_str("- read_lines(path, start, end) — read specific lines\n");
     s.push_str("- write_lines(path, content) — write file content\n");
     s.push_str("- grep_code(pattern, path?) — search code with grep\n");
@@ -87,7 +110,8 @@ fn build_system_prompt(app: &App) -> String {
 /// Recent conversation (without the system prompt) in the shared chat format.
 fn build_history(app: &App) -> Vec<ChatMessage> {
     // Last N messages for context (keep it reasonable)
-    let recent: Vec<&Message> = app.messages
+    let recent: Vec<&Message> = app
+        .messages
         .iter()
         .filter(|m| m.role != crate::app::Role::System)
         .rev()
@@ -99,10 +123,10 @@ fn build_history(app: &App) -> Vec<ChatMessage> {
         .rev()
         .map(|msg| {
             let role = match msg.role {
-                crate::app::Role::User      => ChatRole::User,
+                crate::app::Role::User => ChatRole::User,
                 crate::app::Role::Assistant => ChatRole::Assistant,
-                crate::app::Role::Tool      => ChatRole::Tool,
-                crate::app::Role::System    => unreachable!("filtered above"),
+                crate::app::Role::Tool => ChatRole::Tool,
+                crate::app::Role::System => unreachable!("filtered above"),
             };
             ChatMessage::new(role, msg.content.as_str())
         })
@@ -124,13 +148,18 @@ fn is_mutating_tool(name: &str) -> bool {
     )
 }
 
+/// Produces the model's reply for one round: the system prompt, the
+/// transcript so far, and the channel for streamed tokens.
+type Generate<'a> =
+    dyn FnMut(&str, &[ChatMessage], &mpsc::Sender<AgentEvent>) -> anyhow::Result<String> + 'a;
+
 fn run_agent_turn(
-    tx:             mpsc::Sender<AgentEvent>,
-    system_prompt:  String,
-    mut history:    Vec<ChatMessage>,
-    mcp_cfg:        McpConfig,
-    mode:           Mode,
-    engine:         Option<std::sync::Arc<quark_core::inference::InferenceEngine>>,
+    tx: mpsc::Sender<AgentEvent>,
+    system_prompt: String,
+    mut history: Vec<ChatMessage>,
+    mcp_cfg: McpConfig,
+    mode: Mode,
+    generate: &mut Generate<'_>,
 ) {
     // Each round appends the model's reply and the tool results to `history`
     // and asks the model again.
@@ -138,22 +167,11 @@ fn run_agent_turn(
 
     for round in 0..MAX_TOOL_ROUNDS {
         // ── Generate response ────────────────────────────────────────────────
-        response = match &engine {
-            Some(engine) => match generate_streamed(engine, &system_prompt, &history, &tx) {
-                Ok(text) => text,
-                Err(e) => {
-                    let _ = tx.send(AgentEvent::Error(format!("Inference error: {e}")));
-                    return;
-                }
-            },
-            None => {
-                let text = generate_stub_response(&render_prompt(&history), &mcp_cfg);
-                // Stream word-by-word for a typing feel.
-                for word in text.split_inclusive(' ') {
-                    let _ = tx.send(AgentEvent::Token(word.to_owned()));
-                    std::thread::sleep(std::time::Duration::from_millis(8));
-                }
-                text
+        response = match generate(&system_prompt, &history, &tx) {
+            Ok(text) => text,
+            Err(e) => {
+                let _ = tx.send(AgentEvent::Error(format!("Inference error: {e}")));
+                return;
             }
         };
 
@@ -169,7 +187,7 @@ fn run_agent_turn(
         for call in &calls {
             let preview = format!("{} {:?}", call.tool, call.args);
             let _ = tx.send(AgentEvent::ToolCall {
-                name:    call.tool.clone(),
+                name: call.tool.clone(),
                 preview,
             });
 
@@ -179,8 +197,8 @@ fn run_agent_turn(
             }
 
             let _ = tx.send(AgentEvent::ToolResult {
-                name:    result.tool.clone(),
-                ok:      result.ok,
+                name: result.tool.clone(),
+                ok: result.ok,
                 preview: result.content.chars().take(300).collect(),
             });
 
@@ -188,11 +206,6 @@ fn run_agent_turn(
             results.push(ChatMessage::tool_result(&ToolResult { content, ..result }));
         }
 
-        // The stub can't read tool results, so a second round would repeat itself.
-        if engine.is_none() {
-            response.clear();
-            break;
-        }
         if round + 1 == MAX_TOOL_ROUNDS {
             response = format!("(stopped after {MAX_TOOL_ROUNDS} tool rounds)");
             break;
@@ -210,8 +223,8 @@ fn run_agent_turn(
 fn run_tool(call: &ToolCall, mode: Mode, cfg: &McpConfig) -> (ToolResult, Option<FileChange>) {
     if mode == Mode::Plan && is_mutating_tool(&call.tool) {
         let blocked = ToolResult {
-            tool:    call.tool.clone(),
-            ok:      false,
+            tool: call.tool.clone(),
+            ok: false,
             content: "blocked: Plan mode is read-only (switch with /build)".into(),
         };
         return (blocked, None);
@@ -219,17 +232,21 @@ fn run_tool(call: &ToolCall, mode: Mode, cfg: &McpConfig) -> (ToolResult, Option
     // Snapshot before-state for undo if write tool
     let before = snapshot_before(call, cfg);
     let result = execute_extended(call, cfg);
-    let change = if result.ok { build_file_change(call, before, cfg) } else { None };
+    let change = if result.ok {
+        build_file_change(call, before, cfg)
+    } else {
+        None
+    };
     (result, change)
 }
 
 /// Run the model on `system_prompt` + `transcript`, forwarding text pieces to
 /// the UI as they are generated.
 fn generate_streamed(
-    engine:        &quark_core::inference::InferenceEngine,
+    engine: &quark_core::inference::InferenceEngine,
     system_prompt: &str,
-    history:       &[ChatMessage],
-    tx:            &mpsc::Sender<AgentEvent>,
+    history: &[ChatMessage],
+    tx: &mpsc::Sender<AgentEvent>,
 ) -> anyhow::Result<String> {
     let mut messages = vec![ChatMessage::system(system_prompt)];
     messages.extend_from_slice(history);
@@ -249,71 +266,6 @@ fn generate_streamed(
     })
 }
 
-// ─── Inference stub ───────────────────────────────────────────────────────────
-
-/// Generate a heuristic response demonstrating tool use without a real model.
-fn generate_stub_response(prompt: &str, _cfg: &McpConfig) -> String {
-    let prompt_lower = prompt.to_lowercase();
-
-    // Try to be helpful based on keywords
-    if prompt_lower.contains("git status") || prompt_lower.contains("what changed") {
-        r#"Let me check the current git status for you.
-<tool_call>{"tool":"git_status"}</tool_call>
-
-I'll also check the recent commit history.
-<tool_call>{"tool":"git_log","n":5}</tool_call>"#.to_owned()
-    } else if prompt_lower.contains("read") || prompt_lower.contains("show") || prompt_lower.contains("what is in") {
-        // Try to extract a filename
-        let file = extract_likely_path(prompt).unwrap_or("src/main.rs".to_owned());
-        format!(
-            r#"Let me read that file for you.
-<tool_call>{{"tool":"read_file","path":"{file}"}}</tool_call>"#
-        )
-    } else if prompt_lower.contains("list") || prompt_lower.contains("files") || prompt_lower.contains("directory") {
-        r#"Let me list the project structure.
-<tool_call>{"tool":"list_dir","path":"."}</tool_call>"#.to_owned()
-    } else if prompt_lower.contains("search") || prompt_lower.contains("find") || prompt_lower.contains("where is") {
-        let pattern = extract_search_pattern(prompt);
-        format!(
-            r#"Searching the codebase for that pattern.
-<tool_call>{{"tool":"grep_code","pattern":"{pattern}"}}</tool_call>"#
-        )
-    } else {
-        format!(
-            "I'm running in stub mode — model weights are not yet loaded. \
-            Once you train a model in Quark GUI and export it with `quark-code`, \
-            I'll respond intelligently to: \"{}\"\n\n\
-            In the meantime, try commands like:\n\
-            - `/init` — analyse this project\n\
-            - `/plan` — switch to plan mode\n\
-            - `/build` — switch to build mode\n\
-            - `@src/main.rs explain this file`",
-            prompt.lines().last().unwrap_or("").trim()
-        )
-    }
-}
-
-fn extract_likely_path(prompt: &str) -> Option<String> {
-    for word in prompt.split_whitespace() {
-        let w = word.trim_matches(|c| c == '\'' || c == '"' || c == '`');
-        if (w.contains('/') || w.contains('.')) && !w.starts_with("http") {
-            return Some(w.to_owned());
-        }
-    }
-    None
-}
-
-fn extract_search_pattern(prompt: &str) -> String {
-    // Very naive: grab the last quoted or backtick string
-    for delim in &['"', '\'', '`'] {
-        let s: Vec<&str> = prompt.split(*delim).collect();
-        if s.len() >= 3 {
-            return s[1].to_owned();
-        }
-    }
-    "fn ".to_owned()
-}
-
 // ─── Undo helpers ─────────────────────────────────────────────────────────────
 
 fn snapshot_before(call: &ToolCall, cfg: &McpConfig) -> Option<String> {
@@ -327,7 +279,11 @@ fn snapshot_before(call: &ToolCall, cfg: &McpConfig) -> Option<String> {
     }
 }
 
-fn build_file_change(call: &ToolCall, before: Option<String>, cfg: &McpConfig) -> Option<FileChange> {
+fn build_file_change(
+    call: &ToolCall,
+    before: Option<String>,
+    cfg: &McpConfig,
+) -> Option<FileChange> {
     let path = call.args.get("path")?.as_str()?;
     match call.tool.as_str() {
         "write_file" | "write_lines" | "apply_diff" => {
@@ -352,17 +308,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("hello.txt"), "hi").unwrap();
-        McpConfig { working_dir: dir, ..McpConfig::default() }
+        McpConfig {
+            working_dir: dir,
+            ..McpConfig::default()
+        }
     }
 
     fn write_call() -> ToolCall {
         let args = serde_json::json!({ "path": "new.txt", "content": "x" });
-        ToolCall { tool: "write_file".into(), args }
+        ToolCall {
+            tool: "write_file".into(),
+            args,
+        }
     }
 
     #[test]
     fn plan_mode_blocks_writes() {
-        let cfg = McpConfig { write_file: true, ..temp_cfg("plan") };
+        let cfg = McpConfig {
+            write_file: true,
+            ..temp_cfg("plan")
+        };
         let (result, change) = run_tool(&write_call(), Mode::Plan, &cfg);
         assert!(!result.ok);
         assert!(change.is_none());
@@ -371,7 +336,10 @@ mod tests {
 
     #[test]
     fn build_mode_writes_and_records_change() {
-        let cfg = McpConfig { write_file: true, ..temp_cfg("build") };
+        let cfg = McpConfig {
+            write_file: true,
+            ..temp_cfg("build")
+        };
         let (result, change) = run_tool(&write_call(), Mode::Build, &cfg);
         assert!(result.ok, "{}", result.content);
         let change = change.expect("file change recorded");
@@ -379,24 +347,75 @@ mod tests {
         assert_eq!(change.after.as_deref(), Some("x"));
     }
 
+    /// A scripted "model": one reply per round, in order.
+    fn scripted(
+        replies: Vec<&'static str>,
+    ) -> impl FnMut(&str, &[ChatMessage], &mpsc::Sender<AgentEvent>) -> anyhow::Result<String> {
+        let mut replies = replies.into_iter();
+        move |_, _, tx| {
+            let text = replies.next().unwrap_or("done");
+            let _ = tx.send(AgentEvent::Token(text.to_owned()));
+            Ok(text.to_owned())
+        }
+    }
+
     #[test]
-    fn stub_turn_runs_tools_and_finishes() {
-        let cfg = McpConfig { list_dir: true, ..temp_cfg("stub") };
+    fn turn_runs_tools_feeds_results_back_and_finishes() {
+        let cfg = McpConfig {
+            list_dir: true,
+            ..temp_cfg("turn")
+        };
         let (tx, rx) = mpsc::channel();
+        let mut generate = scripted(vec![
+            "Let me look.\n<tool_call>{\"tool\":\"list_dir\",\"path\":\".\"}</tool_call>",
+            "The directory holds hello.txt.",
+        ]);
         run_agent_turn(
             tx,
             String::new(),
             vec![ChatMessage::user("list the files")],
             cfg,
             Mode::Build,
-            None,
+            &mut generate,
         );
         let events: Vec<AgentEvent> = rx.into_iter().collect();
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "list_dir")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "list_dir")));
         assert!(events.iter().any(|e| matches!(
             e,
             AgentEvent::ToolResult { ok: true, preview, .. } if preview.contains("hello.txt")
         )));
-        assert!(matches!(events.last(), Some(AgentEvent::Done(_))));
+        assert!(
+            matches!(events.iter().find(|e| matches!(e, AgentEvent::Segment(_))), Some(AgentEvent::Segment(t)) if t.starts_with("Let me look."))
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Done(t)) if t == "The directory holds hello.txt.")
+        );
+    }
+
+    #[test]
+    fn turn_stops_after_max_tool_rounds() {
+        let cfg = McpConfig {
+            list_dir: true,
+            ..temp_cfg("rounds")
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut rounds = 0usize;
+        let mut generate = |_: &str, _: &[ChatMessage], _: &mpsc::Sender<AgentEvent>| {
+            rounds += 1;
+            Ok("<tool_call>{\"tool\":\"list_dir\",\"path\":\".\"}</tool_call>".to_owned())
+        };
+        run_agent_turn(
+            tx,
+            String::new(),
+            vec![ChatMessage::user("loop")],
+            cfg,
+            Mode::Build,
+            &mut generate,
+        );
+        let events: Vec<AgentEvent> = rx.into_iter().collect();
+        assert_eq!(rounds, MAX_TOOL_ROUNDS);
+        assert!(matches!(events.last(), Some(AgentEvent::Done(t)) if t.contains("stopped after")));
     }
 }

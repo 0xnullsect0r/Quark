@@ -1,3 +1,8 @@
 /target/
 **/*.rs.bk
 Cargo.lock
+
+# makepkg output
+installer/arch/pkg/
+installer/arch/src/
+installer/arch/*.pkg.tar.*

@@ -503,9 +503,6 @@ impl<IB: Backend> GradAccumulator<IB> {
 
 // ── Training run (called from `trainer::run_training_loop`) ─────────────────
 
-/// Checkpoints kept by a streamed run (they can be tens of GB each).
-const KEEP_CHECKPOINTS: usize = 2;
-
 /// Offload directory: `TrainerConfig::tier.disk_offload_path`, relative to the
 /// output directory unless absolute.
 pub fn offload_dir(config: &crate::training::trainer::TrainerConfig) -> std::path::PathBuf {
@@ -518,11 +515,12 @@ pub fn offload_dir(config: &crate::training::trainer::TrainerConfig) -> std::pat
 pub(crate) fn run_streamed<AB: AutodiffBackend>(
     model_config: QuarkConfig,
     config: &crate::training::trainer::TrainerConfig,
-    batches: Vec<DataBatch>,
+    batches: crate::data::token_cache::BatchSet,
     eval_batches: Vec<DataBatch>,
     tx: &crate::training::metrics::MetricsSender,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
+    anyhow::ensure!(!batches.is_empty(), "no training batches");
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
@@ -601,21 +599,6 @@ pub(crate) fn run_streamed<AB: AutodiffBackend>(
     let mut trainer = StreamedTrainer::<AB>::new(model_config.clone(), store, acts, device, optim, step)?;
     log(format!("   Optimizer: {:?}", config.optimizer));
 
-    // Synthetic data when no corpus was given (matches the in-memory demo loop).
-    let batches = if batches.is_empty() {
-        let seq = model_config.max_position_embeddings.min(64);
-        (0..8)
-            .map(|k| {
-                let seqs = (0..config.batch_size.max(1))
-                    .map(|r| (0..seq).map(|t| ((k * 131 + r * 17 + t) % model_config.vocab_size) as u32).collect())
-                    .collect();
-                crate::data::batch::collate_batch(seqs, PAD_ID)
-            })
-            .collect()
-    } else {
-        batches
-    };
-
     // ── loop ─────────────────────────────────────────────────────────────────
     phase("Training (offloaded)…");
     let accum = config.grad_accum_steps.max(1);
@@ -629,7 +612,8 @@ pub(crate) fn run_streamed<AB: AutodiffBackend>(
         s.stats().read_bytes.load(std::sync::atomic::Ordering::Relaxed)
             + s.stats().write_bytes.load(std::sync::atomic::Ordering::Relaxed)
     };
-    // Existing sharded checkpoints count towards KEEP_CHECKPOINTS.
+    // Existing sharded checkpoints count towards `keep_checkpoints`.
+    let keep = config.keep_checkpoints.max(1);
     let mut saved: Vec<std::path::PathBuf> = {
         let mut existing: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&config.output_dir)
             .map(|rd| {
@@ -654,10 +638,10 @@ pub(crate) fn run_streamed<AB: AutodiffBackend>(
         }
         log(format!("💾  Checkpoint saved → {}", dir.display()));
         saved.push(dir);
-        while saved.len() > KEEP_CHECKPOINTS {
+        while saved.len() > keep {
             let old = saved.remove(0);
             let _ = std::fs::remove_dir_all(&old);
-            log(format!("   Removed old checkpoint {} (keeping the last {KEEP_CHECKPOINTS})", old.display()));
+            log(format!("   Removed old checkpoint {} (keeping the last {keep})", old.display()));
         }
         Ok(())
     };
@@ -671,7 +655,7 @@ pub(crate) fn run_streamed<AB: AutodiffBackend>(
                     log(format!("━━  Epoch {} started", epoch + 1));
                 }
                 cursor += 1;
-                batches[cursor - 1].clone()
+                batches.get(cursor - 1, epoch)
             })
             .collect();
         let lr = config.schedule.get_lr(trainer.step);

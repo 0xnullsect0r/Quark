@@ -7,8 +7,10 @@ pub mod packing;
 pub mod pile;
 pub mod sft;
 pub mod stats;
+pub mod token_cache;
 
 pub use batch::{collate_batch, DataBatch};
+pub use token_cache::{BatchSet, TokenCache};
 pub use hf_downloader::{
     detect_python, hf_datasets, hf_stop_file, start_hf_build, HfConfig, HfDataset,
     HfDatasetCategory, HfMessage, HfPersistConfig,

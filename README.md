@@ -68,19 +68,23 @@ sudo rpm -i quark-0.1.0-1.x86_64.rpm
 sudo dnf localinstall quark-0.1.0-1.x86_64.rpm
 ```
 
-### Linux — Arch (AUR / makepkg)
+### Linux — Arch (AUR)
 
 ```bash
-# Clone the PKGBUILD from this repo, then:
+yay -S quark          # or: paru -S quark
+```
+
+The [`quark`](https://aur.archlinux.org/packages/quark) package builds the
+tagged release from source with every backend (CUDA, Vulkan via wgpu, CPU);
+the fastest one that works is picked at run time. Install `cuda` (optional
+dependency) to train and run on an NVIDIA GPU with bf16.
+
+To build the current `main` instead, use the `quark-git` PKGBUILD in this repo:
+
+```bash
 cd installer/arch
 makepkg -si
 ```
-
-`makepkg` clones the latest Quark source from GitHub and compiles it locally
-with `cargo build --release --features backend-cpu`. The package is named
-`quark-git` (AUR convention for packages built from git).
-
-> Once Quark is on the AUR, you can also use an AUR helper: `yay -S quark-git`
 
 ### Linux — Raw binary
 
@@ -186,12 +190,37 @@ Run `quark-cli bench 10b --layer-only` (or `quark-cli bench small`) to measure y
 ## Training Guide
 
 1. **Configure** — open the **Config** panel and pick a preset. Start with **Quark Tiny** to check that everything works, then move to **Small** on a GPU.
-2. **Load data** — open **Dataset**, click **Add Files/Folder** and point Quark at your code corpus. Quark will tokenize and pack sequences automatically.
+2. **Load data** — open **Dataset**, click **Add Files/Folder** and point Quark at your code corpus (`.txt` / `.jsonl` with a `"text"` field; downloaded datasets are picked up automatically). On the first run the corpus is tokenized once, in parallel, into `<output>/tokens/` on disk; training reads windows straight from that file, so a corpus of any size trains in constant RAM. Later runs on the same corpus and tokenizer reuse it.
 3. **Set resource limits** — open **Settings** and drag the VRAM / RAM / CPU sliders to leave headroom for other applications.
 4. **Start training** — open **Training** and click **▶ Start**. Quark runs the training loop on a background thread; the UI stays responsive.
-5. **Monitor** — watch the loss curve converge. The ETA and tokens/sec update in real time. Checkpoints auto-save every N steps (configurable).
+5. **Monitor** — watch the loss curve converge. The ETA and tokens/sec update in real time. Checkpoints auto-save every N steps (configurable) together with the optimizer state, and only the newest few are kept (**Keep checkpoints**). If the run is interrupted, press **▶ Start** again with the same output folder: it resumes from the newest checkpoint.
 6. **Fine-tune for chat and tools** — a pretrained model only continues text. To make it answer questions and use `quark-code`'s tools, fine-tune it on conversations (next section).
 7. **Chat** — load a checkpoint in **Checkpoints**, then open **Chat**.
+
+### Headless training (`quark-cli`)
+
+The same tokenizer and training code runs from a terminal, which is the way to
+leave a long run going on a machine (or over SSH):
+
+```bash
+# 1. A 32k BPE tokenizer from your corpus (a file or a folder of .txt / .jsonl)
+quark-cli tokenizer ~/.quark/datasets/tokenizer.json ~/.quark/datasets
+
+# 2. Train. Resumable: re-run the same command to continue from the newest checkpoint.
+quark-cli train small ~/.quark/datasets --out ~/.quark/checkpoints/small \
+    --tokenizer ~/.quark/datasets/tokenizer.json \
+    --steps 20000 --batch 4 --accum 8 --save-every 500 --bf16
+
+# 3. Try it
+quark-cli infer ~/.quark/checkpoints/small/checkpoint-20000.bin "fn main() {" --raw
+```
+
+Presets: `tiny`, `small`, `1b`, `3b`, `7b`, `10b`, `20b`, `30b`. Useful flags:
+`--seq N` (context length), `--lr X`, `--eval-every N`, `--keep N` checkpoints,
+`--offload auto|on|off` (stream the model through RAM/disk; `auto` does so
+when it doesn't fit), `--finetune <base-checkpoint>` for chat SFT on `.jsonl`
+conversations, and `QUARK_BACKEND=cuda|wgpu|cpu` to force a backend.
+`--bf16` needs the CUDA backend.
 
 ### Chat & tool-use fine-tuning
 
@@ -221,7 +250,7 @@ In the **Training** tab, choose **Fine-tune on chat data**, pick a base `checkpo
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | Learning rate | 3e-4 | Cosine decay with linear warmup |
-| Warmup steps | 200 | |
+| Warmup steps | 100 | |
 | Batch size | 4 | Effective batch = batch × grad_accum |
 | Grad accumulation | 8 | |
 | Max seq length | 2048 | |

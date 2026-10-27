@@ -13,29 +13,29 @@ use quark_core::mcp::{execute_tool, McpConfig, ToolCall, ToolResult};
 pub fn execute_extended(call: &ToolCall, cfg: &McpConfig) -> ToolResult {
     match call.tool.as_str() {
         // Git tools
-        "git_status"  => git_tool(cfg, &["status", "--short"]),
-        "git_diff"    => {
-            let file = call.args.get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+        "git_status" => git_tool(cfg, &["status", "--short"]),
+        "git_diff" => {
+            let file = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             if file.is_empty() {
                 git_tool(cfg, &["diff"])
             } else {
                 git_tool(cfg, &["diff", "--", file])
             }
         }
-        "git_log"     => {
-            let n = call.args.get("n")
+        "git_log" => {
+            let n = call
+                .args
+                .get("n")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10)
                 .to_string();
             git_tool(cfg, &["log", "--oneline", &format!("-{n}")])
         }
-        "git_add"     => {
+        "git_add" => {
             let path = get_str(&call.args, "path");
             git_tool(cfg, &["add", if path.is_empty() { "." } else { &path }])
         }
-        "git_commit"  => {
+        "git_commit" => {
             let msg = get_str(&call.args, "message");
             if msg.is_empty() {
                 err_result(&call.tool, "message arg required")
@@ -43,38 +43,43 @@ pub fn execute_extended(call: &ToolCall, cfg: &McpConfig) -> ToolResult {
                 git_tool(cfg, &["commit", "-m", &msg])
             }
         }
-        "git_branch"  => git_tool(cfg, &["branch", "--show-current"]),
+        "git_branch" => git_tool(cfg, &["branch", "--show-current"]),
 
         // Code analysis
-        "grep_code"   => {
+        "grep_code" => {
             let pattern = get_str(&call.args, "pattern");
-            let path    = get_str(&call.args, "path");
+            let path = get_str(&call.args, "path");
             if pattern.is_empty() {
                 err_result(&call.tool, "pattern arg required")
             } else {
                 grep_code(cfg, &pattern, if path.is_empty() { "." } else { &path })
             }
         }
-        "find_files"  => {
+        "find_files" => {
             let pattern = get_str(&call.args, "pattern");
             find_files(cfg, &pattern)
         }
-        "read_lines"  => {
-            let path  = get_str(&call.args, "path");
+        "read_lines" => {
+            let path = get_str(&call.args, "path");
             let start = call.args.get("start").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let end   = call.args.get("end").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+            let end = call
+                .args
+                .get("end")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX) as usize;
             read_lines(cfg, &path, start, end)
         }
-        "write_lines" | "apply_diff" if !cfg.write_file => {
-            err_result(&call.tool, "tool is disabled (write_file is off in MCP config)")
-        }
+        "write_lines" | "apply_diff" if !cfg.write_file => err_result(
+            &call.tool,
+            "tool is disabled (write_file is off in MCP config)",
+        ),
         "write_lines" => {
-            let path    = get_str(&call.args, "path");
+            let path = get_str(&call.args, "path");
             let content = get_str(&call.args, "content");
             write_file_checked(cfg, &path, &content)
         }
-        "apply_diff"  => {
-            let path  = get_str(&call.args, "path");
+        "apply_diff" => {
+            let path = get_str(&call.args, "path");
             let patch = get_str(&call.args, "patch");
             apply_patch(cfg, &path, &patch)
         }
@@ -99,8 +104,12 @@ fn git_tool(cfg: &McpConfig, args: &[&str]) -> ToolResult {
             let content = if stdout.is_empty() { stderr } else { stdout };
             ToolResult {
                 tool: format!("git {}", args.join(" ")),
-                ok:      out.status.success(),
-                content: if content.is_empty() { "(no output)".into() } else { content },
+                ok: out.status.success(),
+                content: if content.is_empty() {
+                    "(no output)".into()
+                } else {
+                    content
+                },
             }
         }
         Err(e) => err_result(&format!("git {}", args.join(" ")), &e.to_string()),
@@ -111,20 +120,34 @@ fn git_tool(cfg: &McpConfig, args: &[&str]) -> ToolResult {
 
 fn grep_code(cfg: &McpConfig, pattern: &str, path: &str) -> ToolResult {
     let full = cfg.working_dir.join(path);
-    let out  = Command::new("grep")
-        .args(["-rn", "--include=*.rs", "--include=*.py", "--include=*.ts",
-               "--include=*.js", "--include=*.go", "--include=*.java",
-               "--include=*.c", "--include=*.cpp", "--include=*.h",
-               "-e", pattern])
+    let out = Command::new("grep")
+        .args([
+            "-rn",
+            "--include=*.rs",
+            "--include=*.py",
+            "--include=*.ts",
+            "--include=*.js",
+            "--include=*.go",
+            "--include=*.java",
+            "--include=*.c",
+            "--include=*.cpp",
+            "--include=*.h",
+            "-e",
+            pattern,
+        ])
         .arg(full)
         .output();
     match out {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout).into_owned();
             ToolResult {
-                tool:    "grep_code".into(),
-                ok:      true,
-                content: if s.is_empty() { "No matches found.".into() } else { s },
+                tool: "grep_code".into(),
+                ok: true,
+                content: if s.is_empty() {
+                    "No matches found.".into()
+                } else {
+                    s
+                },
             }
         }
         Err(e) => err_result("grep_code", &e.to_string()),
@@ -138,8 +161,8 @@ fn find_files(cfg: &McpConfig, pattern: &str) -> ToolResult {
     find_recursive(root, root, pattern, &mut results, 0);
     results.sort();
     ToolResult {
-        tool:    "find_files".into(),
-        ok:      true,
+        tool: "find_files".into(),
+        ok: true,
         content: if results.is_empty() {
             "No files matched.".into()
         } else {
@@ -149,13 +172,19 @@ fn find_files(cfg: &McpConfig, pattern: &str) -> ToolResult {
 }
 
 fn find_recursive(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<String>, depth: usize) {
-    if depth > 8 { return; }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         // Skip hidden dirs and common noise
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with('.') || name == "target" || name == "node_modules" { continue; }
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
         }
         if path.is_dir() {
             find_recursive(root, &path, pattern, out, depth + 1);
@@ -177,8 +206,10 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 
 fn glob_match_inner(p: &[char], n: &[char]) -> bool {
     match (p.first(), n.first()) {
-        (None, None)     => true,
-        (Some('*'), _)   => glob_match_inner(&p[1..], n) || (!n.is_empty() && glob_match_inner(p, &n[1..])),
+        (None, None) => true,
+        (Some('*'), _) => {
+            glob_match_inner(&p[1..], n) || (!n.is_empty() && glob_match_inner(p, &n[1..]))
+        }
         (Some('?'), Some(_)) => glob_match_inner(&p[1..], &n[1..]),
         (Some(a), Some(b)) if a == b => glob_match_inner(&p[1..], &n[1..]),
         _ => false,
@@ -203,10 +234,10 @@ fn read_lines(cfg: &McpConfig, path: &str, start: usize, end: usize) -> ToolResu
                 content.clone()
             };
             let shown_start = s + 1;
-            let shown_end   = e;
+            let shown_end = e;
             ToolResult {
-                tool:    "read_lines".into(),
-                ok:      true,
+                tool: "read_lines".into(),
+                ok: true,
                 content: format!("// {path} lines {shown_start}–{shown_end}\n{slice}"),
             }
         }
@@ -223,7 +254,11 @@ fn write_file_checked(cfg: &McpConfig, path: &str, content: &str) -> ToolResult 
         let _ = std::fs::create_dir_all(parent);
     }
     match std::fs::write(&full, content) {
-        Ok(_)  => ToolResult { tool: "write_lines".into(), ok: true, content: format!("Wrote {path}") },
+        Ok(_) => ToolResult {
+            tool: "write_lines".into(),
+            ok: true,
+            content: format!("Wrote {path}"),
+        },
         Err(e) => err_result("write_lines", &e.to_string()),
     }
 }
@@ -275,7 +310,11 @@ fn get_str(args: &serde_json::Value, key: &str) -> String {
 }
 
 pub fn err_result(tool: &str, msg: &str) -> ToolResult {
-    ToolResult { tool: tool.into(), ok: false, content: msg.into() }
+    ToolResult {
+        tool: tool.into(),
+        ok: false,
+        content: msg.into(),
+    }
 }
 
 // ─── Context expansion: @file mentions ───────────────────────────────────────
@@ -287,9 +326,7 @@ pub fn expand_mentions(input: &str, working_dir: &Path) -> String {
         if let Some(rel) = word.strip_prefix('@') {
             let path = working_dir.join(rel);
             if let Ok(content) = std::fs::read_to_string(&path) {
-                result.push_str(&format!(
-                    "\n<file path=\"{rel}\">\n{content}\n</file>\n"
-                ));
+                result.push_str(&format!("\n<file path=\"{rel}\">\n{content}\n</file>\n"));
             } else {
                 result.push_str(word);
             }
@@ -309,7 +346,11 @@ mod tests {
     fn write_lines_respects_write_flag() {
         let dir = std::env::temp_dir().join(format!("quark-tools-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = McpConfig { write_file: false, working_dir: dir.clone(), ..McpConfig::default() };
+        let cfg = McpConfig {
+            write_file: false,
+            working_dir: dir.clone(),
+            ..McpConfig::default()
+        };
         let call = ToolCall {
             tool: "write_lines".into(),
             args: serde_json::json!({ "path": "blocked.txt", "content": "x" }),
