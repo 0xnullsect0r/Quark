@@ -41,6 +41,9 @@ jobs:
       - name: Build Quark Code
         run: cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
 
+      - name: Build Quark CLI
+        run: cargo build --release --package quark-cli --features "backend-cpu backend-wgpu backend-cuda"
+
       - name: Rename binary
         run: cp target/release/quark quark-linux-amd64
 
@@ -49,6 +52,9 @@ jobs:
 
       - name: Rename quark-code binary
         run: cp target/release/quark-code quark-code-linux-amd64
+
+      - name: Rename quark-cli binary
+        run: cp target/release/quark-cli quark-cli-linux-amd64
 
       - name: Build .deb package
         run: |
@@ -77,6 +83,11 @@ jobs:
         with:
           name: quark-code-linux-amd64
           path: quark-code-linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-cli-linux-amd64
+          path: quark-cli-linux-amd64
 
       - uses: actions/upload-artifact@v4
         with:
@@ -114,6 +125,9 @@ jobs:
       - name: Build Quark Code
         run: cargo build --release --package quark-code --no-default-features --features "backend-cpu backend-wgpu"
 
+      - name: Build Quark CLI
+        run: cargo build --release --package quark-cli --no-default-features --features "backend-cpu backend-wgpu"
+
       - name: Rename binary
         run: cp target/release/quark quark-macos-aarch64
 
@@ -122,6 +136,9 @@ jobs:
 
       - name: Rename quark-code binary
         run: cp target/release/quark-code quark-code-macos-aarch64
+
+      - name: Rename quark-cli binary
+        run: cp target/release/quark-cli quark-cli-macos-aarch64
 
       - name: Build macOS bundle and DMG
         if: runner.os == 'macOS'
@@ -151,6 +168,11 @@ jobs:
           name: quark-code-macos-aarch64
           path: quark-code-macos-aarch64
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-cli-macos-aarch64
+          path: quark-cli-macos-aarch64
+
   build-windows:
     name: Build Windows (amd64)
     runs-on: windows-latest
@@ -178,6 +200,9 @@ jobs:
       - name: Build Quark Code
         run: cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
 
+      - name: Build Quark CLI
+        run: cargo build --release --package quark-cli --features "backend-cpu backend-wgpu backend-cuda"
+
       - name: Rename binary
         run: cp target/release/quark.exe quark-windows-amd64.exe
 
@@ -186,6 +211,9 @@ jobs:
 
       - name: Rename quark-code binary
         run: cp target/release/quark-code.exe quark-code-windows-amd64.exe
+
+      - name: Rename quark-cli binary
+        run: cp target/release/quark-cli.exe quark-cli-windows-amd64.exe
 
       - name: Build NSIS installer
         if: runner.os == 'Windows'
@@ -219,6 +247,11 @@ jobs:
           name: quark-code-windows-amd64
           path: quark-code-windows-amd64.exe
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quark-cli-windows-amd64
+          path: quark-cli-windows-amd64.exe
+
   create-release:
     name: Create GitHub Release
     needs: [build-linux, build-macos, build-windows]
@@ -236,14 +269,17 @@ jobs:
             quark-linux-amd64
             quark-chat-linux-amd64
             quark-code-linux-amd64
+            quark-cli-linux-amd64
             quark_*.deb
             quark-*.rpm
             quark-macos-aarch64
             quark-chat-macos-aarch64
             quark-code-macos-aarch64
+            quark-cli-macos-aarch64
             quark-windows-amd64.exe
             quark-chat-windows-amd64.exe
             quark-code-windows-amd64.exe
+            quark-cli-windows-amd64.exe
           generate_release_notes: true
 
   aur-publish:

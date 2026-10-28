@@ -14,7 +14,7 @@ optdepends=(
   'cuda: fastest backend on NVIDIA GPUs (toolkit must not be newer than the driver)'
   'vulkan-driver: GPU acceleration on AMD, Intel and NVIDIA via Vulkan'
 )
-provides=('quark' 'quark-chat' 'quark-code')
+provides=('quark' 'quark-chat' 'quark-code' 'quark-cli')
 conflicts=('quark-git' 'quark-bin')
 # Disable LTO: ring 0.17's hand-written C/ASM sources are compiled by the `cc`
 # crate inside ring's build.rs.  Arch's system LTO injects -flto=auto into
@@ -42,6 +42,7 @@ package() {
   install -Dm755 target/release/quark      "${pkgdir}/usr/bin/quark"
   install -Dm755 target/release/quark-chat "${pkgdir}/usr/bin/quark-chat"
   install -Dm755 target/release/quark-code "${pkgdir}/usr/bin/quark-code"
+  install -Dm755 target/release/quark-cli  "${pkgdir}/usr/bin/quark-cli"
 
   install -Dm644 /dev/stdin "${pkgdir}/usr/share/applications/quark.desktop" << 'DESKTOP'
 [Desktop Entry]

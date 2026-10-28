@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # build/linux/deb.sh — Build a .deb package for Quark on Debian/Ubuntu
-# Assumes all three binaries have already been built with:
+# Assumes all four binaries have already been built with:
 #   cargo build --release --package quark-gui --features "backend-cpu backend-wgpu backend-cuda"
 #   cargo build --release --package quark-chat --features "backend-cpu backend-wgpu backend-cuda"
 #   cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
+#   cargo build --release --package quark-cli --features "backend-cpu backend-wgpu backend-cuda"
 # Usage: bash build/linux/deb.sh
 set -euo pipefail
 
@@ -24,6 +25,7 @@ mkdir -p "${PKG_DIR}/usr/share/doc/${PKG_NAME}"
 install -m 755 "${TARGET_DIR}/quark"       "${PKG_DIR}/usr/bin/quark"
 install -m 755 "${TARGET_DIR}/quark-chat"  "${PKG_DIR}/usr/bin/quark-chat"
 install -m 755 "${TARGET_DIR}/quark-code"  "${PKG_DIR}/usr/bin/quark-code"
+install -m 755 "${TARGET_DIR}/quark-cli"   "${PKG_DIR}/usr/bin/quark-cli"
 
 # Desktop entry for the GUI
 cat > "${PKG_DIR}/usr/share/applications/quark.desktop" << 'DESKTOP'

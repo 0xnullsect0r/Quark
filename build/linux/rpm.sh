@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # build/linux/rpm.sh — Build a .rpm package for Quark on Fedora/RHEL/openSUSE
-# Assumes all three binaries have already been built with:
+# Assumes all four binaries have already been built with:
 #   cargo build --release --package quark-gui --features "backend-cpu backend-wgpu backend-cuda"
 #   cargo build --release --package quark-chat --features "backend-cpu backend-wgpu backend-cuda"
 #   cargo build --release --package quark-code --features "backend-cpu backend-wgpu backend-cuda"
+#   cargo build --release --package quark-cli --features "backend-cpu backend-wgpu backend-cuda"
 # Requires: rpm-build
 # Usage: bash build/linux/rpm.sh
 set -euo pipefail
@@ -20,6 +21,7 @@ mkdir -p "${RPMBUILD_DIR}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 cp "${TARGET_DIR}/quark"      "${RPMBUILD_DIR}/BUILD/quark"
 cp "${TARGET_DIR}/quark-chat" "${RPMBUILD_DIR}/BUILD/quark-chat"
 cp "${TARGET_DIR}/quark-code" "${RPMBUILD_DIR}/BUILD/quark-code"
+cp "${TARGET_DIR}/quark-cli"  "${RPMBUILD_DIR}/BUILD/quark-cli"
 
 # Desktop entry
 cat > "${RPMBUILD_DIR}/BUILD/quark.desktop" << 'DESKTOP'

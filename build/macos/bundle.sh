@@ -26,6 +26,8 @@ cp "${TARGET_DIR}/quark-chat" "${APP_DIR}/Contents/MacOS/quark-chat"
 chmod +x "${APP_DIR}/Contents/MacOS/quark-chat"
 cp "${TARGET_DIR}/quark-code" "${APP_DIR}/Contents/MacOS/quark-code"
 chmod +x "${APP_DIR}/Contents/MacOS/quark-code"
+cp "${TARGET_DIR}/quark-cli" "${APP_DIR}/Contents/MacOS/quark-cli"
+chmod +x "${APP_DIR}/Contents/MacOS/quark-cli"
 
 # Icon
 if [ -f "assets/quark.icns" ]; then
@@ -66,6 +68,7 @@ ln -sf /Applications "$STAGING/Applications"
 # Also ship the companion CLIs as standalone binaries in the DMG root
 cp "${TARGET_DIR}/quark-chat" "$STAGING/quark-chat"
 cp "${TARGET_DIR}/quark-code" "$STAGING/quark-code"
+cp "${TARGET_DIR}/quark-cli" "$STAGING/quark-cli"
 
 hdiutil create -volname "Quark ${VERSION}" \
   -srcfolder "$STAGING" \

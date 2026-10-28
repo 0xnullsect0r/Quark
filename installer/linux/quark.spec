@@ -32,6 +32,7 @@ mkdir -p %{buildroot}%{_datadir}/applications
 install -m 755 %{_builddir}/quark       %{buildroot}%{_bindir}/quark
 install -m 755 %{_builddir}/quark-chat  %{buildroot}%{_bindir}/quark-chat
 install -m 755 %{_builddir}/quark-code  %{buildroot}%{_bindir}/quark-code
+install -m 755 %{_builddir}/quark-cli   %{buildroot}%{_bindir}/quark-cli
 
 install -m 644 %{_builddir}/quark.desktop %{buildroot}%{_datadir}/applications/quark.desktop
 
@@ -49,6 +50,7 @@ fi
 %{_bindir}/quark
 %{_bindir}/quark-chat
 %{_bindir}/quark-code
+%{_bindir}/quark-cli
 %{_datadir}/applications/quark.desktop
 
 %changelog

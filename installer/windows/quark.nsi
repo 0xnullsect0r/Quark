@@ -13,6 +13,7 @@
 !define APP_EXE       "quark.exe"
 !define APP_CHAT_EXE  "quark-chat.exe"
 !define APP_CODE_EXE  "quark-code.exe"
+!define APP_CLI_EXE   "quark-cli.exe"
 !define INSTALL_DIR   "$PROGRAMFILES64\Quark"
 !define UNINST_KEY    "Software\Microsoft\Windows\CurrentVersion\Uninstall\Quark"
 
@@ -56,7 +57,7 @@ Unicode True
 ;--------------------------------
 LangString DESC_SecCore   ${LANG_ENGLISH} "Quark GUI — the main LLM training and inference application. Required."
 LangString DESC_SecChat   ${LANG_ENGLISH} "quark-chat — lightweight terminal REPL for chatting with a trained model."
-LangString DESC_SecCode   ${LANG_ENGLISH} "quark-code — AI coding agent (like Claude Code). Adds quark-code to your PATH."
+LangString DESC_SecCode   ${LANG_ENGLISH} "quark-code — AI coding agent (like Claude Code), and quark-cli for headless training. Adds both to your PATH."
 LangString DESC_SecShortcuts ${LANG_ENGLISH} "Create Start Menu and Desktop shortcuts for Quark."
 
 ;--------------------------------
@@ -105,6 +106,7 @@ SectionEnd
 Section "Quark Code (AI coding agent + PATH)" SecCode
   SetOutPath "$INSTDIR"
   File "..\..\target\release\${APP_CODE_EXE}"
+  File "..\..\target\release\${APP_CLI_EXE}"
   ; Add install dir to system PATH (idempotent via EnvVarUpdate)
   ${EnvVarUpdate} $0 "PATH" "A" "HKLM" "$INSTDIR"
   SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
@@ -139,6 +141,7 @@ Section "Uninstall"
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\${APP_CHAT_EXE}"
   Delete "$INSTDIR\${APP_CODE_EXE}"
+  Delete "$INSTDIR\${APP_CLI_EXE}"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\README.txt"
   Delete "$INSTDIR\uninstall.exe"
