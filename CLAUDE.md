@@ -93,7 +93,7 @@ The model emits tool calls as `<tool_call>{"tool":"name",...}</tool_call>` XML i
 
 `start_turn()` spawns a background thread that:
 1. Builds a system prompt injecting available tools, current mode (Plan/Build), and `AGENTS.md` context
-2. Runs inference with the loaded `InferenceEngine` and streams real tokens as `AgentEvent::Token`, falling back to a keyword-matching stub (`generate_stub_response`) when no model is bundled
+2. Runs inference with the loaded `InferenceEngine` and streams tokens as `AgentEvent::Token` (the generator is a closure, so tests script it). There is no fallback: without a loadable model (`--model <bundle-dir>` or `model/` next to the executable) quark-code exits with an error
 3. Parses tool calls, executes them, emits `FileChanged` events for undo tracking, and feeds `<tool_result>` blocks back to the model for up to `MAX_TOOL_ROUNDS` rounds
 
 Plan mode blocks mutating tools (`is_mutating_tool`) in code, not just in the prompt. Build mode allows full filesystem access. `run_shell` is off unless `--allow-shell` is passed or `mcp.json` enables it.
