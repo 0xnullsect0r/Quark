@@ -255,6 +255,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # all tags, to compare versions
 
       - name: Get version
         id: version
@@ -263,8 +265,18 @@ jobs:
           VERSION_NO_V="${VERSION#v}"
           echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
           echo "VERSION_NO_V=${VERSION_NO_V}" >> $GITHUB_OUTPUT
+          # Release runs for different tags finish in any order: only the newest
+          # stable tag may publish, so an older run can't overwrite a newer package.
+          NEWEST=$(git tag --list 'v*' --sort=-v:refname | grep -vE -- '-(alpha|beta|rc)' | head -1)
+          if [ "$VERSION" = "$NEWEST" ]; then
+            echo "PUBLISH=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::Skipping AUR: ${VERSION} is older than ${NEWEST}"
+            echo "PUBLISH=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Compute sha256sum of source tarball
+        if: steps.version.outputs.PUBLISH == 'true'
         id: sha256
         run: |
           VERSION_NO_V="${{ steps.version.outputs.VERSION_NO_V }}"
@@ -273,6 +285,7 @@ jobs:
           echo "SHA256=${SHA}" >> $GITHUB_OUTPUT
 
       - name: Update PKGBUILD
+        if: steps.version.outputs.PUBLISH == 'true'
         run: |
           VERSION_NO_V="${{ steps.version.outputs.VERSION_NO_V }}"
           SHA256="${{ steps.sha256.outputs.SHA256 }}"
@@ -281,6 +294,7 @@ jobs:
           sed -i "s/^sha256sums=.*/sha256sums=('${SHA256}')/" installer/arch/stable/PKGBUILD
 
       - name: Publish to AUR
+        if: steps.version.outputs.PUBLISH == 'true'
         uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
         with:
           pkgname: quark
